@@ -18,7 +18,8 @@
  *    LaunchDarkly, the key is referenced in the code, and a vN variation is
  *    referenced (quoted) in a file that evaluates the flag.
  *  - `metric_event_keys`        → every event-backed metric's event key has an
- *    emitter (`track(...)` call) in the code.
+ *    emitter (`track(...)` call) in the code — except Sentry integration event
+ *    keys (ADR 0014), which are fed by Sentry→LD, not track().
  *  - `tests_last_run`           → the last real `run_tests` execution at this
  *    handoff was green.
  */
@@ -26,6 +27,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { LdResourceWriter } from "./anthropic/ldWriter.js";
+import { SENTRY_INTEGRATION_EVENT_KEYS } from "./sentryMetrics.js";
 
 export interface HandoffCheck {
   /** Stable check id, e.g. "flag-exists-in-ld", "flag-wired-in-code". */
@@ -172,6 +174,14 @@ export function buildHandoffVerifier(opts: HandoffVerifierOptions): HandoffVerif
     // ---- Metric instrumentation claims (metrics-author handoff) ------------
     if (t.metric_event_keys) {
       for (const eventKey of t.metric_event_keys.split(",").filter(Boolean)) {
+        // Sentry→LD integration events are not LD track() emitters (ADR 0014).
+        if (SENTRY_INTEGRATION_EVENT_KEYS.has(eventKey)) {
+          passed.push({
+            name: "metric-event-instrumented",
+            detail: `event '${eventKey}' is Sentry-integration-backed (no track() emitter required)`,
+          });
+          continue;
+        }
         const emitters = filesContaining(opts.sandboxRoot, eventKey);
         check(
           emitters.length > 0,
@@ -182,6 +192,18 @@ export function buildHandoffVerifier(opts: HandoffVerifierOptions): HandoffVerif
             `rewrite the emitter to pass the literal string — deterministic verification and LaunchDarkly code references both need greppable literals`,
         );
       }
+    }
+
+    // ---- Sentry launchdarklyContext (when Sentry path was chosen) ----------
+    if (t.sentry_guardrail === "true") {
+      const ctxFiles = filesContaining(opts.sandboxRoot, "launchdarklyContext");
+      check(
+        ctxFiles.length > 0,
+        "sentry-launchdarkly-context",
+        `launchdarklyContext set in ${ctxFiles.slice(0, 2).join(", ")}`,
+        `sentry_guardrail=true but no 'launchdarklyContext' string in the checkout — ` +
+          `the LD↔Sentry metrics integration ignores error events without that exact Sentry custom context name`,
+      );
     }
 
     // ---- Test execution claims (testing handoff) ---------------------------

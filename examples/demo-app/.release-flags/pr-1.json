@@ -9,7 +9,7 @@
       { "allocation": 20000, "durationMillis": 300000 },
       { "allocation": 100000, "durationMillis": 300000 }
     ],
-    "metricKeys": ["api-errors"]
+    "metricKeys": ["sentry-errors-binary", "api-errors"]
   },
   "releaseIntent": {
     "_instructions": "Human approver: edit freely. action: auto (release on deploy) | hold (do not release yet) | manual (a human runs the release). Structured fields execute; anything else goes in notes (an agent will structure it on the PR for your review). Blank fields = default auto-release on deploy. prerequisites: [{\"flagKey\": \"flag-xyz\", \"variation\": \"on\"}]. notBefore: YYYY-MM-DD. reference: ticket/doc URL.",

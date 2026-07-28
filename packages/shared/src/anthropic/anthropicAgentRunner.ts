@@ -20,7 +20,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { AgentNodeRequest, AgentNodeResult, AgentRunner, AgentStatus } from "../agentRunner.js";
-import { SpanKind, SpanStatusCode, aiTracer, setGenAiAttributes } from "../observability.js";
+import { startAiSpan } from "../observability.js";
 import type { KnowledgeGraph } from "../graph/schema.js";
 import { type RelatedRepo, RelatedReposClient } from "../github/relatedRepos.js";
 import type { LdResourceWriter } from "./ldWriter.js";
@@ -48,6 +48,11 @@ export function modeNote(caps: ToolCapabilities): string {
   if (caps.queryGraph) {
     lines.push(
       "You have `query_dependencies` — the estate's knowledge graph (service call edges observed from LaunchDarkly telemetry + flag→code wrap points). Call it with NO arguments EARLY to get this PR's blast radius (changed services, dependent services at risk, upstream contracts, flags already on the changed code) and let it inform your classification and risk_score. Treat any entry in its `gaps` list as UNKNOWN coverage — a thin graph is never evidence of low impact.",
+    );
+  }
+  if (caps.querySentry) {
+    lines.push(
+      "You have `query_sentry` — a Sentry estate picture (top issues, error volume, whether recent errors carry `launchdarklyContext`, dual-export hints for otel*). Call it EARLY when choosing error killswitches or when the repo has Sentry. It does not create LD metrics; attach sentry-errors-* / otel* via list_metrics + write_manifest. Never treat Sentry Explore aggregates as guarded-release backings (ADR 0015).",
     );
   }
   if (caps.queryRepos) {
@@ -121,7 +126,7 @@ const NODE_CAPABILITIES: Record<string, ToolCapabilities> = {
   "autofactory-flag-testing": { createFlag: false, createMetric: false, editFiles: true },
   // The metrics author creates LD metrics and instruments the event (track()) that
   // feeds them — so it needs create_metric AND edit_files (+ manifest updates).
-  "autofactory-metrics-author": { createFlag: false, createMetric: true, editFiles: true, writeManifest: true, readDocs: true, queryGraph: true },
+  "autofactory-metrics-author": { createFlag: false, createMetric: true, editFiles: true, writeManifest: true, readDocs: true, queryGraph: true, querySentry: true },
   // The reviewer is read-only but verifies LaunchDarkly semantics — docs access
   // lets it check claims against the source instead of trusting the chain.
   "autofactory-code-reviewer": { createFlag: false, createMetric: false, editFiles: false, readDocs: true },
@@ -160,6 +165,7 @@ export const CAP_EDIT_FILES = "edit_files";
 export const CAP_WRITE_MANIFEST = "write_manifest";
 export const CAP_STEWARD_MANIFEST = "steward_manifest";
 export const CAP_QUERY_GRAPH = "query_graph";
+export const CAP_QUERY_SENTRY = "query_sentry";
 export const CAP_READ_DOCS = "read_docs";
 export const CAP_QUERY_REPOS = "query_repos";
 
@@ -182,6 +188,7 @@ export function resolveGrant(
         writeManifest: capabilities.includes(CAP_WRITE_MANIFEST),
         stewardManifest: capabilities.includes(CAP_STEWARD_MANIFEST),
         queryGraph: capabilities.includes(CAP_QUERY_GRAPH),
+        querySentry: capabilities.includes(CAP_QUERY_SENTRY),
         readDocs: capabilities.includes(CAP_READ_DOCS),
         queryRepos: capabilities.includes(CAP_QUERY_REPOS),
       },
@@ -251,6 +258,8 @@ export class AnthropicAgentRunner implements AgentRunner {
       stewardManifest: grant.stewardManifest === true && this.opts.codeChangesEnabled === true,
       // Read-only; globally enabled by the presence of a composed graph (KG flag).
       queryGraph: grant.queryGraph === true && this.opts.knowledgeGraph !== undefined,
+      // Read-only; soft when SENTRY_* unset (estate picture returns available:false).
+      querySentry: grant.querySentry === true,
       // Read-only; no global gate (fetch failures degrade inside the tool).
       readDocs: grant.readDocs === true,
       // Read-only; globally enabled by a registered relatedRepos list + a token.
@@ -262,7 +271,7 @@ export class AnthropicAgentRunner implements AgentRunner {
     // Per-node diagnostic: makes a renamed/added agent that silently lost its
     // grant (source "none", read-only) visible in the run logs.
     console.log(
-      `[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} queryRepos=${grant.queryRepos === true} → effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} queryRepos=${caps.queryRepos === true}`,
+      `[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} querySentry=${grant.querySentry === true} queryRepos=${grant.queryRepos === true} → effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} querySentry=${caps.querySentry === true} queryRepos=${caps.queryRepos === true}`,
     );
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : undefined;
 
@@ -308,10 +317,8 @@ export class AnthropicAgentRunner implements AgentRunner {
     let outputTokens = 0;
     const started = Date.now();
 
-    // Emit a gen_ai span for LD LLM Observability (parity with the Cursor runner),
-    // so every provider's agent runs show up in LLM Observability, not just Cursor.
-    // No-op tracer when observability isn't enabled.
-    const span = aiTracer().startSpan(`chat ${req.configKey}`, { kind: SpanKind.CLIENT });
+    // Dual-write gen_ai span: LD LLM Observability (OTel) + Sentry AI monitoring.
+    const span = startAiSpan(`chat ${req.configKey}`, { op: "gen_ai.chat" });
 
     try {
       for (let turn = 0; turn < maxTurns; turn++) {
@@ -386,7 +393,7 @@ export class AnthropicAgentRunner implements AgentRunner {
       status = "failed";
       finalText = e instanceof Error ? e.message : String(e);
       req.tracker?.trackError();
-      if (e instanceof Error) span.recordException(e);
+      span.recordException(e);
     } finally {
       req.tracker?.trackDuration(Date.now() - started);
       // Tool-invocation telemetry (AI Config monitoring's tool dimension).
@@ -400,10 +407,10 @@ export class AnthropicAgentRunner implements AgentRunner {
       if (inputTokens || outputTokens) {
         req.tracker?.trackTokens({ input: inputTokens, output: outputTokens, total: inputTokens + outputTokens });
       }
-      // Record the gen_ai attributes + status on the observability span, then end it.
-      setGenAiAttributes(span, {
+      span.setGenAi({
         provider: "anthropic",
         requestModel: model,
+        agentName: req.configKey,
         ...(req.tracker ? { tracker: req.tracker } : {}),
         prompt: req.prompt,
         output: finalText,
@@ -411,8 +418,7 @@ export class AnthropicAgentRunner implements AgentRunner {
           ? { usage: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens } }
           : {}),
       });
-      span.setStatus({ code: status === "completed" ? SpanStatusCode.OK : SpanStatusCode.ERROR });
-      span.end();
+      span.end(status === "completed" ? "ok" : "error");
     }
 
     return {

@@ -34,6 +34,9 @@ export interface ProvisionResult {
   graphsExisting: string[];
   flagsCreated: string[];
   flagsExisting: string[];
+  /** APP-project metrics (config/agentcontrol/metrics/) created / found. */
+  metricsCreated: string[];
+  metricsExisting: string[];
 }
 
 /** A tool-definition file (config/agentcontrol/tools/<key>.json), in the
@@ -316,6 +319,62 @@ async function provisionFlag(ld: LdClient, flag: FlagFile, result: ProvisionResu
   }
 }
 
+/**
+ * Shared APP-project metric definition (config/agentcontrol/metrics/*.json).
+ * Written to LD_APP_PROJECT_KEY via a separate LdClient — never the factory project.
+ */
+export interface MetricFile {
+  key: string;
+  name?: string;
+  description?: string;
+  kind?: string;
+  eventKey?: string;
+  isNumeric?: boolean;
+  successCriteria?: string;
+  randomizationUnits?: string[];
+  tags?: string[];
+  unit?: string;
+  unitAggregationType?: string;
+}
+
+/** Create a shared metric in the APP project if absent (idempotent). */
+async function provisionMetric(appLd: LdClient, metric: MetricFile, result: ProvisionResult, dryRun: boolean): Promise<void> {
+  try {
+    // Existence via create with 409-as-ok (same pattern as runtime ldWriter).
+    if (dryRun) {
+      const list = await appLd.listMetrics<{ items?: Array<{ key: string }> }>(200);
+      if ((list.data.items ?? []).some((m) => m.key === metric.key)) {
+        result.metricsExisting.push(metric.key);
+      } else {
+        result.metricsCreated.push(metric.key);
+      }
+      return;
+    }
+    const body: Record<string, unknown> = {
+      key: metric.key,
+      name: metric.name ?? metric.key,
+      ...(metric.description ? { description: metric.description } : {}),
+      kind: metric.kind ?? "custom",
+      ...(metric.eventKey ? { eventKey: metric.eventKey } : {}),
+      isNumeric: metric.isNumeric ?? false,
+      ...(metric.successCriteria ? { successCriteria: metric.successCriteria } : {}),
+      randomizationUnits: metric.randomizationUnits ?? ["user"],
+      tags: metric.tags ?? ["auto-factory"],
+      ...(metric.unit ? { unit: metric.unit } : {}),
+      ...(metric.unitAggregationType ? { unitAggregationType: metric.unitAggregationType } : {}),
+    };
+    const res = await appLd.createMetric(body);
+    if (res.status === 409) {
+      result.metricsExisting.push(metric.key);
+    } else {
+      result.metricsCreated.push(metric.key);
+    }
+  } catch (e) {
+    const err = e as LdApiError;
+    result.failures.push({ resource: `metric ${metric.key}`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
+  }
+}
+
 export interface ProvisionOptions {
   /** Directory of AI-config JSON files. */
   aiConfigsDir: string;
@@ -333,6 +392,16 @@ export interface ProvisionOptions {
    * the flags — provisioned for both `provision` and `seed`.
    */
   toolsDir?: string;
+  /**
+   * Directory of shared APP-project metric defs (ADR 0014 Sentry guardrails).
+   * Default `config/agentcontrol/metrics`. Provisioned into `appLd`, not factory.
+   */
+  metricsDir?: string;
+  /**
+   * LdClient for the APP / data-plane project. Required to provision shared
+   * metrics (sentry-errors*). When omitted, metrics are skipped with a log.
+   */
+  appLd?: LdClient;
   /** When true, perform reads only — report what would be created without writing. */
   dryRun?: boolean;
 }
@@ -342,6 +411,7 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
     configsCreated: [], configsExisting: [], variationsCreated: 0, variationsExisting: 0,
     toolsStripped: [], toolsCreated: [], toolsExisting: [],
     failures: [], graphsCreated: [], graphsExisting: [], flagsCreated: [], flagsExisting: [],
+    metricsCreated: [], metricsExisting: [],
   };
   const dryRun = opts.dryRun ?? false;
   const toolsDir = opts.toolsDir ?? "config/agentcontrol/tools";
@@ -374,6 +444,20 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
   for (const file of listJson(opts.flagsDir ?? "config/agentcontrol/flags")) {
     const flag = JSON.parse(readFileSync(file, "utf8")) as FlagFile;
     await provisionFlag(ld, flag, result, dryRun);
+  }
+  // Shared APP metrics (Sentry-backed guardrails). Separate project.
+  const metricsDir = opts.metricsDir ?? "config/agentcontrol/metrics";
+  const metricFiles = listJson(metricsDir);
+  if (metricFiles.length > 0 && opts.appLd) {
+    for (const file of metricFiles) {
+      const metric = JSON.parse(readFileSync(file, "utf8")) as MetricFile;
+      await provisionMetric(opts.appLd, metric, result, dryRun);
+    }
+  } else if (metricFiles.length > 0 && opts.metricsDir) {
+    // Caller explicitly asked for a metrics dir but didn't pass appLd.
+    console.warn(
+      `[provision] ${metricFiles.length} metric def(s) in ${metricsDir} skipped — pass appLd (LD_APP_PROJECT_KEY) to provision APP metrics`,
+    );
   }
   return result;
 }

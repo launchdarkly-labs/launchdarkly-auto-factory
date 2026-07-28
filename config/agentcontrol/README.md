@@ -61,6 +61,14 @@ the graph live from LaunchDarkly at run time**; this file is what gets
 provisioned, not what gets executed, so graph changes must be made in LD (or
 re-provisioned into a fresh project) to take effect.
 
+## metrics/
+
+Shared **APP-project** metric definitions (ADR 0014). Provisioned into
+`LD_APP_PROJECT_KEY` (not the factory project) by `npm run bridge -- provision|upgrade`.
+Today: `sentry-errors-binary` and `sentry-errors-count` — fed by the
+LaunchDarkly↔Sentry metrics integration on event key `sentry-errors`. Metrics-
+author reuses these as the error killswitch when the target app has Sentry.
+
 ## Canonical agent tags
 
 Agents drive routing and approval by emitting tags (via `tag_conversation`).
@@ -82,7 +90,8 @@ the registry, the graph, and the instructions all agree.
 | `review_approved` | code-reviewer | `"approve"`/`"approved"`/`"true"`: the change is approved |
 | `metrics_created` | metrics-author | `"true"` if any metric was created/reused (set automatically by `create_metric`) |
 | `metric_keys` | metrics-author | comma-separated metric keys attached (set automatically by `create_metric`) |
-| `metric_event_keys` | metrics-author | comma-separated event keys of event-backed metrics (set automatically by `create_metric`; the deterministic handoff shim greps the code for an emitter of each) |
+| `metric_event_keys` | metrics-author | comma-separated event keys of event-backed metrics (set automatically by `create_metric`; the deterministic handoff shim greps the code for an emitter of each; Sentry integration key `sentry-errors` is exempt) |
+| `sentry_guardrail` | metrics-author | `"true"` when a shared Sentry-backed LD metric was attached as the error killswitch — verifier checks for `launchdarklyContext` in the checkout (ADR 0014) |
 | `tests_last_run` | flag-testing | `pass`/`fail` — outcome of the last real `run_tests` execution (set automatically by `run_tests`; a `fail` at handoff mechanically fails the run) |
 | `risk_level` | code-reviewer | `low` / `medium` / `high`; categorical companion to `risk_score` (fallback mapping when the score is missing) |
 | `risk_score` | research-planner | numeric `0.0`–`1.0`; in `risk-threshold` approval mode, steps gate when it meets the `auto-factory-risk-threshold` flag (fail-closed when absent) |
@@ -120,6 +129,9 @@ Anthropic provider:
   dependency queries over the per-run knowledge graph. Read-only; only offered
   when the `auto-factory-knowledge-graph` flag enabled graph composition for
   the run, so a grant on a flag-off run is inert.
+- `"query_sentry"`: the `query_sentry` tool (ADR 0015) — Sentry estate picture
+  (issues, error volume, `launchdarklyContext` gap, dual-export hints). Soft when
+  SENTRY_* env is unset (`available: false`).
 - `"read_docs"`: the `read_ld_docs` tool — LaunchDarkly docs pages fetched as
   markdown (the docs site serves `.md` for any page; `llms.txt` is the
   directory). Allowlisted to launchdarkly.com/docs, size-capped, budgeted at 8
@@ -132,7 +144,7 @@ omits `capabilities`, the runner falls back to a built-in per-config-key map
 node has no inbound edge, so this is its only grant path; `autofactory-manifest-steward`:
 steward_manifest; `autofactory-flag-implementer`: create_flag+flag_state+edit_files+
 write_manifest+read_docs; `autofactory-flag-testing`: edit_files;
-`autofactory-metrics-author`: create_metric+edit_files+write_manifest+read_docs;
+`autofactory-metrics-author`: create_metric+edit_files+write_manifest+read_docs+query_graph+query_sentry;
 `autofactory-code-reviewer`: read_docs);
 everything else is read-only. Grants are always intersected with the global
 `ENABLE_FLAG_CREATION` / `ENABLE_CODE_CHANGES` toggles.

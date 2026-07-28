@@ -93,6 +93,10 @@ export interface UpgradeOptions {
   flagsDir?: string;
   /** Tools-library definitions dir. Default `config/agentcontrol/tools`. */
   toolsDir?: string;
+  /** Shared APP metrics dir. Default `config/agentcontrol/metrics`. */
+  metricsDir?: string;
+  /** APP-project client for shared metrics (ADR 0014). */
+  appLd?: LdClient;
   dryRun?: boolean;
 }
 

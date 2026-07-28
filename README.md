@@ -25,7 +25,15 @@ end-to-end against a live demo repo. Not a product.
   diffs `.release-flags/` between the deployed SHA and the previous one, and starts a
   guarded release for each new manifest (turning the flag on atomically). It then monitors
   the release to a terminal state: completed, reverted by a guardrail metric, or stopped.
+  When Sentry is wired (ADR 0014), shared `sentry-errors-*` metrics can killswitch the
+  rollout; on `reverted`, Beacon can start Seer Autofix (`BEACON_SEER_AUTOFIX`).
 - **Phase 3 (flag cleanup):** out of scope; existing LaunchDarkly functionality.
+
+Sentry layer (optional): [ADR 0014](docs/adr/0014-sentry-guardrails-and-agent-monitoring.md) —
+app error killswitches via the LD↔Sentry metrics integration, factory LLM traces in Sentry
+AI agent monitoring, Seer on revert. [ADR 0015](docs/adr/0015-sentry-estate-and-dual-export.md) —
+Metrics Author `query_sentry` estate picture at author time; dual-export so the same spans
+reach Sentry **and** LD (Sentry does not OTLP-export outbound; `otel*` / KG still need LD o11y).
 
 Node-by-node detail with the exact mechanics: [docs/pipeline-overview.html](docs/pipeline-overview.html).
 Design history: [docs/adr/](docs/adr/).
@@ -34,16 +42,17 @@ Design history: [docs/adr/](docs/adr/).
 
 | Path | What it is |
 |------|------------|
-| `packages/shared/` | LD clients (REST + native SDK), the `AgentRunner` provider seam, the Anthropic / Vega / Cursor runners and agent tools, LLM-observability spans, the release adapter, and the provider-agnostic Phase 1 orchestration (graph walk + approval) |
+| `packages/shared/` | LD clients (REST + native SDK), the `AgentRunner` provider seam, the Anthropic / Vega / Cursor runners and agent tools, LLM-observability spans (LD + Sentry AI monitoring), the release adapter, and the provider-agnostic Phase 1 orchestration (graph walk + approval) |
 | `packages/phase1-resource-factory/` | Phase 1 front end #1 (GitHub Action): code; its drop-in workflow lives in `bootstrap/github-action-template/` |
 | `packages/phase1-cursor-extension/` | Phase 1 front end #2 (Cursor/VS Code extension): working-tree edits from the editor, calls Anthropic directly |
 | `bootstrap/cursor-automation/` | Phase 1 front end #3 (native Cursor automation): a drop-in `.cursor/` rule + command + MCP config; runs in Cursor's own agent (local prototype) |
 | `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code skill that drives it lives in `bootstrap/claude-code/` |
-| `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor) |
-| `packages/config-bridge/` | CLI that provisions/syncs the agent configs and graph between LD projects |
+| `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor, optional Seer Autofix on revert) |
+| `packages/config-bridge/` | CLI that provisions/syncs the agent configs, graph, operational flags, and shared APP metrics between LD projects |
 | `config/agentcontrol/ai-configs/` | The six agent + two judge definitions (instructions live here and in LD) |
 | `config/agentcontrol/tools/` | The agents' tool definitions (descriptions + schemas), provisioned into LaunchDarkly's tools library and attached per variation — editable in the LD UI; execution stays in code (ADR 0011) |
 | `config/agentcontrol/graphs/` | The agent graph: chain order, routing conditions, per-agent write capabilities |
+| `config/agentcontrol/metrics/` | Shared APP-project metrics (Sentry-backed `sentry-errors-*` guardrails, ADR 0014) |
 | `bootstrap/` | One-command setup, plus the drop-in front-end templates (GitHub Action workflow, Cursor automation) |
 | `examples/demo-app/` | Local sandbox the agents run against in dry-run mode |
 | `docs/` | Pipeline overview, ADRs, design docs |

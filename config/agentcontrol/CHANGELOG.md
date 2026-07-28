@@ -15,6 +15,46 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-07-24 (Sentry estate bridge — ADR 0015)
+
+### ✅ Metrics author: `query_sentry` + dual-export guidance
+- **Why:** Sentry is ingest-only for OTel; estates need an author-time picture
+  and dual-export so LD `otel*` / KG still work alongside Sentry APM.
+- **Tool:** `query_sentry` (REST estate client) — issues, error volume,
+  `launchdarklyContext` coverage, dual-export gap hints. Soft when creds absent.
+- **Graph / grant:** metrics-author edge + fallback include `query_sentry`.
+- **Instructions:** call `query_sentry` before choosing killswitches; attach
+  `sentry-errors-*` for errors; prefer `otel*` via `list_metrics` when LD o11y
+  is present; never invent guardrails from Sentry aggregate-only stats; ensure
+  full Sentry baseline + dual-export / LD flag-in-span when LD o11y is present.
+
+### ✅ Shared Seer issue matcher
+- Beacon Seer reuses `findRelatedIssue` from `@auto-factory/shared` (same as
+  estate client).
+
+## 2026-07-24 (Sentry layer — ADR 0014)
+
+### ✅ Metrics author: Sentry as error killswitch
+- **Why:** LaunchDarkly's official Sentry→LD metrics integration feeds guarded
+  rollouts from production errors; feature-scoped `track()` error events are
+  redundant when Sentry is present and miss attribution without
+  `launchdarklyContext`.
+- **Instructions:** detect Sentry → reuse `sentry-errors-binary` /
+  `sentry-errors-count` via `list_metrics`, instrument exact context name
+  `launchdarklyContext`, tag `sentry_guardrail=true` (M13). Latency/business
+  stay LD `track()` / trace metrics.
+- **Config:** `config/agentcontrol/metrics/` provisioned into the APP project;
+  tag registry + handoff verifier updated.
+
+### ✅ Factory LLM observability → Sentry AI monitoring (dual-write)
+- Runtime: `SENTRY_DSN` enables `@sentry/node` on Phase 1 runners; spans dual-
+  write with LD LLM Observability until `DISABLE_LD_OBSERVABILITY=true`.
+
+### ✅ Beacon Seer on revert
+- Runtime: `BEACON_SEER_AUTOFIX=true` → find Sentry issue → Autofix `open_pr`.
+
+---
+
 ## 2026-07-20 (provider-aware model routing)
 
 ### ✅ run.provider context attribute + provider-aware A/B rules

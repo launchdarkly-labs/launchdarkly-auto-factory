@@ -30,6 +30,7 @@ Flat `src/`:
 | `src/github.ts` | GitHub Contents API client (list/read `.release-flags/` at a SHA) |
 | `src/trigger.ts` | Resolve variations + rollout shape, execute via the shared release adapter |
 | `src/monitor.ts` | Poll a triggered release to a terminal state (completed / reverted / stopped) |
+| `src/seerAutofix.ts` | On `reverted`, optionally find a Sentry issue and start Seer Autofix (ADR 0014) |
 | `src/config.ts` | Load config from the YAML files + env |
 
 ## HTTP contract
@@ -69,6 +70,10 @@ detached from the HTTP request and never affects the release itself (which
 runs server-side in LaunchDarkly regardless). Re-delivered notifications are
 idempotent: a flag whose release is already running reports `already_running`
 and re-attaches monitoring instead of double-triggering.
+
+On `reverted`, when `BEACON_SEER_AUTOFIX=true` and Sentry credentials are set,
+Beacon searches for a related Sentry issue and starts Seer Autofix
+(`stopping_point: open_pr` by default) — see ADR 0014 / `src/seerAutofix.ts`.
 
 ## Config surface
 

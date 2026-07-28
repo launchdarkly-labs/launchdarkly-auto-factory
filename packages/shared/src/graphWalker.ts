@@ -22,6 +22,7 @@ import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker } from "@laun
 import type { AgentNodeResult, AgentRunner } from "./agentRunner.js";
 import type { HandoffVerification, HandoffVerifier } from "./handoffVerifier.js";
 import type { JudgeHook } from "./judges.js";
+import { startHandoffSpan } from "./observability.js";
 
 export interface NodeRun {
   configKey: string;
@@ -326,7 +327,18 @@ export async function walkGraph(
       }
     }
 
-    if (next) graphTracker?.trackHandoffSuccess(key, next);
+    if (next) {
+      graphTracker?.trackHandoffSuccess(key, next);
+      // Agent-chain handoff span for Sentry AI monitoring / LD o11y.
+      const handoff = startHandoffSpan(key, next);
+      handoff.setGenAi({
+        provider: "auto-factory",
+        requestModel: "graph-walker",
+        agentName: key,
+        operationName: "handoff",
+      });
+      handoff.end("ok");
+    }
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
   }

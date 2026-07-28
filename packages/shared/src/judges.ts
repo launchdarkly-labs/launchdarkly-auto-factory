@@ -32,7 +32,7 @@ import {
   type Runner,
   type RunnerResult,
 } from "@launchdarkly/server-sdk-ai";
-import { SpanKind, SpanStatusCode, aiTracer, setGenAiAttributes } from "./observability.js";
+import { startAiSpan } from "./observability.js";
 
 /** One structured single-shot completion, supplied per provider. */
 export interface JudgeCompletionRequest {
@@ -91,11 +91,9 @@ class CompletionJudgeRunner implements Runner {
 
   async run(input: string, outputType?: Record<string, unknown>): Promise<RunnerResult> {
     const system = (this.judgeCfg.messages ?? []).map((m) => m.content).join("\n\n");
-    // The judge's completion is an LLM call in its own right — emit a gen_ai
-    // span so judges appear in LLM Observability alongside the agents they
-    // score, correlated by the shared launchdarkly.run.id. This runner only
-    // executes when the judge sampled the run, so every span is a real call.
-    const span = aiTracer().startSpan(`judge ${this.spanMeta.judgeKey}`, { kind: SpanKind.CLIENT });
+    // Judge LLM call — dual-write gen_ai span (LD + Sentry), correlated by
+    // launchdarkly.run.id / gen_ai.conversation.id. Only runs when sampled.
+    const span = startAiSpan(`judge ${this.spanMeta.judgeKey}`, { op: "gen_ai.chat" });
     try {
       const r = await this.completion({
         ...(this.judgeCfg.model?.name ? { model: this.judgeCfg.model.name } : {}),
@@ -103,35 +101,29 @@ class CompletionJudgeRunner implements Runner {
         input,
         schema: outputType ?? {},
       });
-      setGenAiAttributes(span, {
+      span.setGenAi({
         provider: this.spanMeta.provider ?? "unknown",
         requestModel: this.judgeCfg.model?.name ?? "unknown",
+        agentName: this.spanMeta.judgeKey,
         prompt: `${system}\n\n${input}`,
         output: r.content,
         ...(r.tokens ? { usage: r.tokens } : {}),
       });
       // NOTE: no bare `launchdarkly.ai.judge` boolean — LD nests dotted keys,
       // so a scalar at `…ai.judge` collides with `…ai.judge.of` (verified live).
-      span.setAttributes({
+      span.otel.setAttributes({
         "launchdarkly.ai.config.key": this.spanMeta.judgeKey,
         "launchdarkly.ai.judge.of": this.spanMeta.judgedConfigKey,
       });
-      if (!r.success) {
-        span.setStatus({ code: SpanStatusCode.ERROR, message: "judge completion failed" });
-      }
+      span.end(r.success ? "ok" : "error", r.success ? undefined : "judge completion failed");
       return {
         content: r.content,
         ...(r.parsed ? { parsed: r.parsed } : {}),
         metrics: { success: r.success, ...(r.tokens ? { tokens: r.tokens } : {}) },
       };
     } catch (e) {
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: e instanceof Error ? e.message : String(e),
-      });
+      span.end("error", e instanceof Error ? e.message : String(e));
       throw e;
-    } finally {
-      span.end();
     }
   }
 }

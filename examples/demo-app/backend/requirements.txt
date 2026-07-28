@@ -1,3 +1,4 @@
 flask>=3.0
 gunicorn>=22.0
 launchdarkly-server-sdk>=9.0
+sentry-sdk[flask]>=2.0

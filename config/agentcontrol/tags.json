@@ -156,6 +156,16 @@
         "verifier"
       ],
       "description": "pass | fail — the outcome of the LAST real run_tests execution in a node's run. Set automatically by run_tests. The deterministic handoff shim fails the run if a node hands off with a red suite."
+    },
+    "sentry_guardrail": {
+      "producedBy": "autofactory-metrics-author",
+      "production": "llm",
+      "role": "informational",
+      "edges": [],
+      "readBy": [
+        "handoffVerifier"
+      ],
+      "description": "true when a Sentry-backed shared LD metric (sentry-errors*) was attached as the error killswitch. The handoff verifier checks that launchdarklyContext appears in the checkout (ADR 0014)."
     }
   }
 }

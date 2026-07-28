@@ -44,6 +44,7 @@ import {
   extractConfigStamp,
   getLdSdk,
   hasChangeToProcess,
+  initFactorySentry,
   interpretWalk,
   isGitRepo,
   loadDotEnv,
@@ -167,6 +168,8 @@ async function run(opts: CliOptions): Promise<number> {
   loadDotEnv();
   if (!process.env.LD_SDK_KEY) throw new UsageError("LD_SDK_KEY is not set (factory project server SDK key)");
   if (!process.env.LD_PROJECT_KEY) throw new UsageError("LD_PROJECT_KEY is not set (factory project key)");
+
+  await initFactorySentry({ serviceName: "auto-factory-phase1-cli" });
 
   const root = resolve(opts.root);
   if (!(await isGitRepo(root))) throw new UsageError(`'${root}' is not a git repository`);

@@ -18,6 +18,11 @@ import {
   type LdClient,
 } from "@auto-factory/shared";
 import { repointDependentPrerequisites } from "./repoint.js";
+import {
+  seerSettingsFromEnv,
+  triggerSeerOnRevert,
+  type RevertAutofixContext,
+} from "./seerAutofix.js";
 
 export interface MonitorSettings {
   enabled: boolean;
@@ -38,12 +43,16 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 /**
  * Resolve the active release's id for a flag (retrying briefly — the listing
  * is eventually consistent right after the start), then poll to completion.
+ *
+ * @param revertCtx Optional context for Seer Autofix when status is `reverted`
+ *   (repo, sha, variation). When omitted, Seer still runs with flag/env only.
  */
 export async function monitorTriggeredRelease(
   ld: LdClient,
   flagKey: string,
   environmentKey: string,
   settings: MonitorSettings,
+  revertCtx?: Partial<Omit<RevertAutofixContext, "flagKey" | "environmentKey">>,
 ): Promise<AutomatedRelease | null> {
   const tag = `[beacon] release ${flagKey}/${environmentKey}`;
   try {
@@ -73,6 +82,18 @@ export async function monitorTriggeredRelease(
       // reverted = a guardrail metric regressed and LD rolled the flag back;
       // monitoring_stopped = a human intervened. Both are end states for us.
       console.warn(`${tag}: ended ${final.status.toUpperCase()} (stage ${final.latestStageIndex})`);
+      if (final.status === "reverted") {
+        await triggerSeerOnRevert(
+          {
+            flagKey,
+            environmentKey,
+            ...(revertCtx?.repoFullName ? { repoFullName: revertCtx.repoFullName } : {}),
+            ...(revertCtx?.sha ? { sha: revertCtx.sha } : {}),
+            ...(revertCtx?.targetVariation ? { targetVariation: revertCtx.targetVariation } : {}),
+          },
+          seerSettingsFromEnv(),
+        );
+      }
     }
     return final;
   } catch (e) {

@@ -21,6 +21,7 @@ import type { KnowledgeGraph } from "../graph/schema.js";
 import { fileNodeId, flagNodeId, serviceNodeId } from "../graph/schema.js";
 import { blastRadius, neighbors } from "../graph/query.js";
 import type { RelatedReposClient } from "../github/relatedRepos.js";
+import { getEstatePicture } from "../sentry/sentryEstate.js";
 import { variationReleased, type LdResourceWriter, type MetricCategory } from "./ldWriter.js";
 import type { ReleaseFlagFile, Scope } from "../types.js";
 
@@ -177,7 +178,7 @@ const USE_EXISTING_FLAG_TOOL: AnthropicToolDef = {
 const CREATE_METRIC_TOOL: AnthropicToolDef = {
   name: "create_metric",
   description:
-    "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) — pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, …)` call on the path the flag wraps, via edit_file) so the metric has data once live. (2) TRACE-backed — pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span — see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
+    "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) — pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, …)` call on the path the flag wraps, via edit_file) so the metric has data once live — EXCEPTION: event_key `sentry-errors` is fed by the LD↔Sentry integration (no track() emitter). Prefer reusing provisioned `sentry-errors-binary` / `sentry-errors-count` via list_metrics when Sentry is present (ADR 0014). (2) TRACE-backed — pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span — see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
   input_schema: {
     type: "object",
     properties: {
@@ -274,6 +275,11 @@ export interface ToolCapabilities {
   stewardManifest?: boolean;
   /** Offer `query_dependencies` (needs a composed knowledge graph, ADR 0010). */
   queryGraph?: boolean;
+  /**
+   * Offer `query_sentry` (Sentry estate picture via REST — ADR 0015). Soft when
+   * SENTRY_* env is unset (returns available:false guidance).
+   */
+  querySentry?: boolean;
   /** Offer `read_ld_docs` (LaunchDarkly docs pages as markdown, allowlisted). */
   readDocs?: boolean;
   /** Offer `query_related_repos` (needs a registered relatedRepos list + GitHub token). */
@@ -362,6 +368,37 @@ const QUERY_DEPENDENCIES_TOOL: AnthropicToolDef = {
   },
 };
 
+const QUERY_SENTRY_TOOL: AnthropicToolDef = {
+  name: "query_sentry",
+  description:
+    "Query the Sentry estate picture for this app (ADR 0015): top unresolved issues, approximate error volume, whether recent errors carry launchdarklyContext (required for the LD↔Sentry metrics integration), and dual-export guidance for otel* latency guardrails. Call EARLY when the repo has Sentry or when choosing error killswitches. Does NOT create LaunchDarkly metrics — use list_metrics / create_metric / write_manifest for that. Sentry Explore aggregates alone are NEVER valid guarded-release backings. Soft-fails with available:false when SENTRY_AUTH_TOKEN / SENTRY_ORG / SENTRY_PROJECT are unset.",
+  input_schema: {
+    type: "object",
+    properties: {
+      window_hours: {
+        type: "number",
+        description: "Lookback window in hours (default 24).",
+      },
+      flag_key: {
+        type: "string",
+        description: "Flag key to bias issue search (usually from the Flag Implementer).",
+      },
+      query: {
+        type: "string",
+        description: "Optional extra Sentry issue/Discover query fragment.",
+      },
+      transaction: {
+        type: "string",
+        description: "Optional transaction/endpoint name to scope error stats.",
+      },
+      sha: {
+        type: "string",
+        description: "Optional release/deploy SHA for issue search.",
+      },
+    },
+  },
+};
+
 const QUERY_RELATED_REPOS_TOOL: AnthropicToolDef = {
   name: "query_related_repos",
   description:
@@ -419,6 +456,7 @@ export const SANDBOX_TOOL_DEFS: ReadonlyMap<string, AnthropicToolDef> = new Map(
     ...READONLY_TOOLS,
     READ_LD_DOCS_TOOL,
     QUERY_DEPENDENCIES_TOOL,
+    QUERY_SENTRY_TOOL,
     QUERY_RELATED_REPOS_TOOL,
     GET_FLAG_STATE_TOOL,
     CREATE_FLAG_TOOL,
@@ -483,6 +521,7 @@ export function buildSandboxTools(caps: ToolCapabilities): AnthropicToolDef[] {
   const tools = [...READONLY_TOOLS];
   if (caps.readDocs) tools.push(READ_LD_DOCS_TOOL);
   if (caps.queryGraph) tools.push(QUERY_DEPENDENCIES_TOOL);
+  if (caps.querySentry) tools.push(QUERY_SENTRY_TOOL);
   if (caps.queryRepos) tools.push(QUERY_RELATED_REPOS_TOOL);
   if (caps.flagState) tools.push(GET_FLAG_STATE_TOOL);
   if (caps.createFlag) tools.push(CREATE_FLAG_TOOL, ADD_VARIATION_TOOL, USE_EXISTING_FLAG_TOOL);
@@ -532,6 +571,9 @@ export const TOOL_OWNED_TAGS: ReadonlySet<string> = new Set([
   "metric_event_keys",
   "tests_last_run",
 ]);
+
+/** Event keys that must not require an in-repo track() emitter (ADR 0014). */
+const EXTERNAL_METRIC_EVENT_KEYS = new Set(["sentry-errors"]);
 
 /**
  * Executes tool calls against a fixed root directory, accumulating routing tags.
@@ -621,6 +663,8 @@ export class SandboxToolExecutor {
           return this.writeManifestTool(String(input.path ?? ""), input.manifest);
         case "query_dependencies":
           return this.queryDependencies(input);
+        case "query_sentry":
+          return await this.querySentry(input);
         case "query_related_repos":
           return await this.queryRelatedRepos(input);
         case "read_ld_docs":
@@ -639,6 +683,17 @@ export class SandboxToolExecutor {
     } catch (e) {
       return { content: e instanceof Error ? e.message : String(e), isError: true };
     }
+  }
+
+  private async querySentry(input: Record<string, unknown>): Promise<ToolExecResult> {
+    const picture = await getEstatePicture({
+      ...(input.window_hours != null ? { windowHours: Number(input.window_hours) } : {}),
+      ...(input.flag_key ? { flagKey: String(input.flag_key) } : {}),
+      ...(input.query ? { query: String(input.query) } : {}),
+      ...(input.transaction ? { transaction: String(input.transaction) } : {}),
+      ...(input.sha ? { sha: String(input.sha) } : {}),
+    });
+    return { content: JSON.stringify(picture, null, 2) };
   }
 
   /**
@@ -1062,8 +1117,9 @@ export class SandboxToolExecutor {
     if (!keys.includes(result.key)) keys.push(result.key);
     this.tags.metric_keys = keys.join(",");
     // Event-backed metrics also record their event key — the deterministic
-    // handoff shim greps the code for an emitter of each one.
-    if (input.event_key) {
+    // handoff shim greps the code for an emitter of each one. Skip Sentry
+    // integration event keys (ADR 0014) — those have no track() emitter.
+    if (input.event_key && !EXTERNAL_METRIC_EVENT_KEYS.has(String(input.event_key))) {
       const events = this.tags.metric_event_keys ? this.tags.metric_event_keys.split(",").filter(Boolean) : [];
       if (!events.includes(String(input.event_key))) events.push(String(input.event_key));
       this.tags.metric_event_keys = events.join(",");

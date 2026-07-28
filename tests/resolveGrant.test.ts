@@ -7,7 +7,7 @@ describe("resolveGrant", () => {
   it("uses edge capabilities when present (source=edge)", () => {
     const r = resolveGrant("anything", ["create_flag", "edit_files"]);
     assert.deepEqual(r.grant, {
-      createFlag: true, flagState: false, createMetric: false, editFiles: true, writeManifest: false, stewardManifest: false, queryGraph: false, readDocs: false, queryRepos: false,
+      createFlag: true, flagState: false, createMetric: false, editFiles: true, writeManifest: false, stewardManifest: false, queryGraph: false, querySentry: false, readDocs: false, queryRepos: false,
     });
     assert.equal(r.source, "edge");
   });
@@ -15,12 +15,18 @@ describe("resolveGrant", () => {
   it("maps create_metric / write_manifest / steward_manifest from the edge list", () => {
     const r = resolveGrant("anything", ["create_metric", "edit_files", "write_manifest"]);
     assert.deepEqual(r.grant, {
-      createFlag: false, flagState: false, createMetric: true, editFiles: true, writeManifest: true, stewardManifest: false, queryGraph: false, readDocs: false, queryRepos: false,
+      createFlag: false, flagState: false, createMetric: true, editFiles: true, writeManifest: true, stewardManifest: false, queryGraph: false, querySentry: false, readDocs: false, queryRepos: false,
     });
     const s = resolveGrant("anything", ["steward_manifest"]);
     assert.equal(s.grant.stewardManifest, true);
     assert.equal(s.grant.writeManifest, false);
     assert.equal(s.grant.editFiles, false);
+  });
+
+  it("maps query_sentry from the edge list", () => {
+    const r = resolveGrant("anything", ["query_sentry", "create_metric"]);
+    assert.equal(r.grant.querySentry, true);
+    assert.equal(r.grant.createMetric, true);
   });
 
   it("maps flag_state from the edge list", () => {
@@ -33,7 +39,7 @@ describe("resolveGrant", () => {
   it("an empty edge list grants nothing (still source=edge, overrides fallback)", () => {
     const r = resolveGrant("autofactory-flag-implementer", []);
     assert.deepEqual(r.grant, {
-      createFlag: false, flagState: false, createMetric: false, editFiles: false, writeManifest: false, stewardManifest: false, queryGraph: false, readDocs: false, queryRepos: false,
+      createFlag: false, flagState: false, createMetric: false, editFiles: false, writeManifest: false, stewardManifest: false, queryGraph: false, querySentry: false, readDocs: false, queryRepos: false,
     });
     assert.equal(r.source, "edge");
   });
@@ -53,6 +59,7 @@ describe("resolveGrant", () => {
     const metrics = resolveGrant("autofactory-metrics-author", undefined);
     assert.equal(metrics.grant.createMetric, true);
     assert.equal(metrics.grant.writeManifest, true);
+    assert.equal(metrics.grant.querySentry, true);
   });
 
   it("research (ROOT — no inbound edge) gets narrow write_manifest via fallback", () => {

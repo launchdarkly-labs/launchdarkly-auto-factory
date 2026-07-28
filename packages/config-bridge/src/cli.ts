@@ -24,7 +24,7 @@
  *       model choices, or extra live variations — drift there is reported.
  */
 
-import { LdClient, sourceConnection, targetConnection } from "@auto-factory/shared";
+import { LdClient, appConnection, sourceConnection, targetConnection } from "@auto-factory/shared";
 import { provision } from "./provision.js";
 import { seed } from "./seed.js";
 import { sync } from "./sync.js";
@@ -35,34 +35,50 @@ function flag(args: string[], name: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
+function tryAppLd(): LdClient | undefined {
+  try {
+    return new LdClient(appConnection());
+  } catch {
+    return undefined;
+  }
+}
+
+function logProvision(r: Awaited<ReturnType<typeof provision>>): void {
+  console.log(`Configs:    ${r.configsCreated.length} created, ${r.configsExisting.length} existing`);
+  console.log(`Variations: ${r.variationsCreated} created, ${r.variationsExisting} existing`);
+  console.log(`Graphs:     ${r.graphsCreated.length} created, ${r.graphsExisting.length} existing`);
+  console.log(`Flags:      ${r.flagsCreated.length} created, ${r.flagsExisting.length} existing`);
+  console.log(`Tools:      ${r.toolsCreated.length} created, ${r.toolsExisting.length} existing`);
+  console.log(`Metrics:    ${r.metricsCreated.length} created, ${r.metricsExisting.length} existing (APP project)`);
+  if (r.toolsStripped.length) {
+    console.log(`⚠ tools stripped from ${r.toolsStripped.length} variation(s) — our snapshots hold only tool/snippet references, not definitions, so re-attach them in LD if the provider needs them`);
+  }
+  if (r.failures.length) {
+    console.log(`✗ ${r.failures.length} failure(s):`);
+    for (const f of r.failures) console.log(`    ${f.resource} [${f.status}]: ${JSON.stringify(f.message)}`);
+    process.exitCode = 1;
+  } else {
+    console.log("Done.");
+  }
+}
+
 async function main(): Promise<void> {
   const [cmd, ...args] = process.argv.slice(2);
 
   if (cmd === "provision") {
     const ld = new LdClient(targetConnection());
+    const appLd = tryAppLd();
     const aiConfigsDir = flag(args, "ai-configs") ?? "config/agentcontrol/ai-configs";
     const graphsDir = flag(args, "graphs") ?? "config/agentcontrol/graphs";
     const flagsDir = flag(args, "flags") ?? "config/agentcontrol/flags";
     const toolsDir = flag(args, "tools") ?? "config/agentcontrol/tools";
+    const metricsDir = flag(args, "metrics") ?? "config/agentcontrol/metrics";
     const dryRun = args.includes("--dry-run");
     console.log(`Provisioning into project '${ld.projectKey}'${dryRun ? " (DRY RUN — no writes)" : ""}`);
-    console.log(`  ai-configs: ${aiConfigsDir}\n  graphs:     ${graphsDir}\n  flags:      ${flagsDir}\n  tools:      ${toolsDir}\n`);
-    const r = await provision(ld, { aiConfigsDir, graphsDir, flagsDir, toolsDir, dryRun });
-    console.log(`Configs:    ${r.configsCreated.length} created, ${r.configsExisting.length} existing`);
-    console.log(`Variations: ${r.variationsCreated} created, ${r.variationsExisting} existing`);
-    console.log(`Graphs:     ${r.graphsCreated.length} created, ${r.graphsExisting.length} existing`);
-    console.log(`Flags:      ${r.flagsCreated.length} created, ${r.flagsExisting.length} existing`);
-    console.log(`Tools:      ${r.toolsCreated.length} created, ${r.toolsExisting.length} existing`);
-    if (r.toolsStripped.length) {
-      console.log(`⚠ tools stripped from ${r.toolsStripped.length} variation(s) — our snapshots hold only tool/snippet references, not definitions, so re-attach them in LD if the provider needs them`);
-    }
-    if (r.failures.length) {
-      console.log(`✗ ${r.failures.length} failure(s):`);
-      for (const f of r.failures) console.log(`    ${f.resource} [${f.status}]: ${JSON.stringify(f.message)}`);
-      process.exitCode = 1;
-    } else {
-      console.log("Done.");
-    }
+    if (appLd) console.log(`  APP metrics → '${appLd.projectKey}'`);
+    console.log(`  ai-configs: ${aiConfigsDir}\n  graphs:     ${graphsDir}\n  flags:      ${flagsDir}\n  tools:      ${toolsDir}\n  metrics:    ${metricsDir}\n`);
+    const r = await provision(ld, { aiConfigsDir, graphsDir, flagsDir, toolsDir, metricsDir, appLd, dryRun });
+    logProvision(r);
     return;
   }
 
@@ -86,47 +102,36 @@ async function main(): Promise<void> {
     if (!srcConn) throw new Error("Source not configured — set LD_SOURCE_API_KEY / LD_SOURCE_BASE_URL / LD_SOURCE_PROJECT_KEY");
     const source = new LdClient(srcConn);
     const target = new LdClient(targetConnection());
+    const appLd = tryAppLd();
     const graphKeys = (flag(args, "graphs")?.split(",").map((t) => t.trim()).filter(Boolean)) ?? ["gha-auto-factory"];
     const stagingDir = flag(args, "staging") ?? ".agentcontrol-cache";
     const dryRun = args.includes("--dry-run");
     console.log(`Seeding from source '${source.projectKey}' → target '${target.projectKey}'${dryRun ? " (DRY RUN — no writes)" : ""}`);
     console.log(`  graphs:  ${graphKeys.join(", ")}\n  staging: ${stagingDir}\n`);
-    const r = await seed({ source, target, graphKeys, stagingDir, dryRun });
+    const r = await seed({ source, target, graphKeys, stagingDir, dryRun, appLd });
     console.log(`Pulled ${r.graphsPulled.length} graph(s), ${r.configsPulled.length} ai-config(s) into ${stagingDir}.`);
     if (!r.graphsPulled.length) {
       console.log("⚠ No graphs pulled from source — nothing to provision. Check --graphs and source project.");
     }
-    const p = r.provision;
-    console.log(`Configs:    ${p.configsCreated.length} created, ${p.configsExisting.length} existing`);
-    console.log(`Variations: ${p.variationsCreated} created, ${p.variationsExisting} existing`);
-    console.log(`Graphs:     ${p.graphsCreated.length} created, ${p.graphsExisting.length} existing`);
-    console.log(`Flags:      ${p.flagsCreated.length} created, ${p.flagsExisting.length} existing`);
-    console.log(`Tools:      ${p.toolsCreated.length} created, ${p.toolsExisting.length} existing`);
-    if (p.toolsStripped.length) {
-      console.log(`⚠ tools stripped from ${p.toolsStripped.length} variation(s) — re-attach in LD if the provider needs them`);
-    }
-    if (p.failures.length) {
-      console.log(`✗ ${p.failures.length} failure(s):`);
-      for (const f of p.failures) console.log(`    ${f.resource} [${f.status}]: ${JSON.stringify(f.message)}`);
-      process.exitCode = 1;
-    } else {
-      console.log("Done.");
-    }
+    logProvision(r.provision);
     return;
   }
 
   if (cmd === "upgrade") {
     const ld = new LdClient(targetConnection());
+    const appLd = tryAppLd();
     const aiConfigsDir = flag(args, "ai-configs") ?? "config/agentcontrol/ai-configs";
     const graphsDir = flag(args, "graphs") ?? "config/agentcontrol/graphs";
     const flagsDir = flag(args, "flags") ?? "config/agentcontrol/flags";
     const toolsDir = flag(args, "tools") ?? "config/agentcontrol/tools";
+    const metricsDir = flag(args, "metrics") ?? "config/agentcontrol/metrics";
     const dryRun = args.includes("--dry-run");
     console.log(`Upgrading project '${ld.projectKey}' to committed definitions${dryRun ? " (DRY RUN — no writes)" : ""}`);
+    if (appLd) console.log(`  APP metrics → '${appLd.projectKey}'`);
     console.log(`  ai-configs: ${aiConfigsDir}\n  graphs:     ${graphsDir}\n  flags:      ${flagsDir}\n`);
-    const r = await upgrade(ld, { aiConfigsDir, graphsDir, flagsDir, toolsDir, dryRun });
+    const r = await upgrade(ld, { aiConfigsDir, graphsDir, flagsDir, toolsDir, metricsDir, appLd, dryRun });
     const p = r.provision;
-    console.log(`Created:  ${p.configsCreated.length} config(s), ${p.variationsCreated} variation(s), ${p.graphsCreated.length} graph(s), ${p.flagsCreated.length} flag(s), ${p.toolsCreated.length} tool(s)`);
+    console.log(`Created:  ${p.configsCreated.length} config(s), ${p.variationsCreated} variation(s), ${p.graphsCreated.length} graph(s), ${p.flagsCreated.length} flag(s), ${p.toolsCreated.length} tool(s), ${p.metricsCreated.length} metric(s)`);
     console.log(`Updated:  ${r.variationsUpdated.length} variation(s), ${r.graphsUpdated.length} graph(s), ${r.toolsUpdated.length} tool definition(s)`);
     for (const v of r.variationsUpdated) console.log(`    ~ ${v}`);
     for (const g of r.graphsUpdated) console.log(`    ~ graph ${g}`);

@@ -118,6 +118,24 @@ describe("handoff shims — metric + test claims", () => {
     assert.match(bad?.failures[0]?.detail ?? "", /enable-x-success/);
   });
 
+  it("skips track() emitter check for Sentry integration event keys", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root });
+    const r = await verify({ configKey: "metrics", tags: { metric_event_keys: "sentry-errors" } });
+    assert.equal(r?.ok, true);
+    assert.ok(r?.passed.some((c) => c.name === "metric-event-instrumented"));
+  });
+
+  it("requires launchdarklyContext when sentry_guardrail=true", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root });
+    const bad = await verify({ configKey: "metrics", tags: { sentry_guardrail: "true" } });
+    assert.equal(bad?.ok, false);
+    assert.ok(bad?.failures.some((c) => c.name === "sentry-launchdarkly-context"));
+
+    write("app.py", `sentry_sdk.set_context("launchdarklyContext", {"key": "u"})\n`);
+    const ok = await verify({ configKey: "metrics", tags: { sentry_guardrail: "true" } });
+    assert.equal(ok?.ok, true);
+  });
+
   it("tests_last_run=fail fails the handoff; pass passes; absent applies no check", async () => {
     const verify = buildHandoffVerifier({ sandboxRoot: root });
     const fail = await verify({ configKey: "testing", tags: { tests_last_run: "fail" } });

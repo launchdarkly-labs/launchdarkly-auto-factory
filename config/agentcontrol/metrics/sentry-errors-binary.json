@@ -1,0 +1,11 @@
+{
+  "key": "sentry-errors-binary",
+  "name": "Sentry errors (users experiencing an error)",
+  "description": "Shared guarded-release killswitch fed by the LaunchDarkly↔Sentry metrics integration. Event key must match the integration's Metric event key (default sentry-errors). Lower is better. Apps must attach Sentry custom context launchdarklyContext with LD evaluation keys. Provisioned into the APP project only.",
+  "kind": "custom",
+  "eventKey": "sentry-errors",
+  "isNumeric": false,
+  "successCriteria": "LowerThanBaseline",
+  "randomizationUnits": ["user"],
+  "tags": ["auto-factory", "sentry", "guardrail", "killswitch"]
+}

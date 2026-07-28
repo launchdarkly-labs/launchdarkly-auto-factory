@@ -1,0 +1,30 @@
+{
+  "key": "query_sentry",
+  "name": "query_sentry",
+  "description": "Query the Sentry estate picture for this app (ADR 0015): top unresolved issues, approximate error volume, whether recent errors carry launchdarklyContext (required for the LD↔Sentry metrics integration), and dual-export guidance for otel* latency guardrails. Call EARLY when the repo has Sentry or when choosing error killswitches. Does NOT create LaunchDarkly metrics — use list_metrics / create_metric / write_manifest for that. Sentry Explore aggregates alone are NEVER valid guarded-release backings. Soft-fails with available:false when SENTRY_AUTH_TOKEN / SENTRY_ORG / SENTRY_PROJECT are unset.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "window_hours": {
+        "type": "number",
+        "description": "Lookback window in hours (default 24)."
+      },
+      "flag_key": {
+        "type": "string",
+        "description": "Flag key to bias issue search (usually from the Flag Implementer)."
+      },
+      "query": {
+        "type": "string",
+        "description": "Optional extra Sentry issue/Discover query fragment."
+      },
+      "transaction": {
+        "type": "string",
+        "description": "Optional transaction/endpoint name to scope error stats."
+      },
+      "sha": {
+        "type": "string",
+        "description": "Optional release/deploy SHA for issue search."
+      }
+    }
+  }
+}

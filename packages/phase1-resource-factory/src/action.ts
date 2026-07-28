@@ -43,6 +43,7 @@ import {
   getLdSdk,
   interpretWalk,
   intentIsDefault,
+  initFactorySentry,
   loadRelatedRepos,
   normalizeReleaseIntent,
   pipelineContext,
@@ -387,6 +388,9 @@ async function detectConfigDrift(graphKey: string): Promise<string | undefined> 
 async function main(): Promise<void> {
   mapActionInputs();
   const context = assemblePrContext();
+
+  // Sentry AI agent monitoring for factory runners (ADR 0014). No-op without DSN.
+  await initFactorySentry({ serviceName: "auto-factory-phase1-gha" });
 
   // Native LaunchDarkly: server SDK (flag eval) + AI SDK (graph + agent configs).
   const { ldClient, aiClient } = await getLdSdk();

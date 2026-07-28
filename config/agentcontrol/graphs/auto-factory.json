@@ -75,7 +75,8 @@
           "edit_files",
           "write_manifest",
           "read_docs",
-          "query_graph"
+          "query_graph",
+          "query_sentry"
         ],
         "require_tags": {
           "flag_ready": "true"

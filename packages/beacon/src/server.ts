@@ -48,7 +48,11 @@ export interface BeaconDeps {
   gh?: GitHubClient;
   /** Hook fired when a release is started (or found already running); the
    *  default monitors it to a terminal state. Injectable for tests. */
-  onReleaseStarted?: (flagKey: string, environmentKey: string) => void;
+  onReleaseStarted?: (
+    flagKey: string,
+    environmentKey: string,
+    ctx?: { repoFullName?: string; sha?: string; targetVariation?: string },
+  ) => void;
 }
 
 /** Constant-time secret comparison (hashed first to equalize lengths). */
@@ -73,11 +77,11 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
   const monitorSettings = monitorSettingsFromEnv();
   const onReleaseStarted =
     deps.onReleaseStarted ??
-    ((flagKey: string, environmentKey: string): void => {
+    ((flagKey: string, environmentKey: string, ctx?): void => {
       if (!monitorSettings.enabled) return;
       // Detached on purpose: a guarded release runs for minutes-to-days; the
       // notification response must not wait on it.
-      void monitorTriggeredRelease(ld, flagKey, environmentKey, monitorSettings);
+      void monitorTriggeredRelease(ld, flagKey, environmentKey, monitorSettings, ctx);
     });
 
   async function handleDeploy(n: DeployNotification): Promise<{ status: number; body: unknown }> {
@@ -144,14 +148,22 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         const active = await findActiveRelease(ld, flag.flagKey, n.environment).catch(() => null);
         if (active) {
           outcomes.push({ flag: flag.flagKey, scope, action: "already_running", detail: { releaseId: active.id } });
-          onReleaseStarted(flag.flagKey, n.environment); // re-attach monitoring (e.g. after a Beacon restart)
+          onReleaseStarted(flag.flagKey, n.environment, {
+            repoFullName: `${service.repo.owner}/${service.repo.name}`,
+            sha: n.sha,
+            ...(flag.targetVariation ? { targetVariation: flag.targetVariation } : {}),
+          }); // re-attach monitoring (e.g. after a Beacon restart)
           continue;
         }
         const result = await triggerRelease(ld, flag, n.environment);
         // Only staged rollouts get release monitoring: "held"/"noop" started
         // nothing, "prerequisites"/"immediate" have no automated release to watch.
         if (result.method === "progressive" || result.method === "guarded") {
-          onReleaseStarted(flag.flagKey, n.environment);
+          onReleaseStarted(flag.flagKey, n.environment, {
+            repoFullName: `${service.repo.owner}/${service.repo.name}`,
+            sha: n.sha,
+            ...(flag.targetVariation ? { targetVariation: flag.targetVariation } : {}),
+          });
         }
         // An immediate release moves the fallthrough right here — re-point any
         // auto-factory children pinned on the previous variation (staged
