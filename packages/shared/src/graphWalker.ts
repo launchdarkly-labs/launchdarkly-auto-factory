@@ -193,6 +193,17 @@ export type WalkEvent =
   | { type: "loop-exhausted"; info: LoopExhaustedInfo }
   | { type: "awaiting-approval"; node: string };
 
+/** Human-readable one-liner describing why a loop did not converge. */
+export function describeLoopExhausted(info: LoopExhaustedInfo): string {
+  if (info.reason === "run-cap") {
+    return `loop did not converge at '${info.node}': the run hit the total-node-run cap — likely an untagged cycle in the graph.`;
+  }
+  const edges = info.exhausted
+    .map((e) => `edge → ${e.target} spent its budget (${e.traversals}/${e.maxVisits} traversals)`)
+    .join("; ");
+  return `loop did not converge at '${info.node}'; ${edges}. The chain could not advance within budget.`;
+}
+
 /** All key/value pairs in `cond` are present and equal in `tags`. */
 function tagsMatch(tags: Record<string, string>, cond: Record<string, string>): boolean {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
@@ -429,7 +440,7 @@ export async function walkGraph(
     // the same tracker. Defensive: a judge problem must never break the walk.
     if (judgeHook) {
       try {
-        await judgeHook({ configKey: key, cfg, input: prompt, output, tracker });
+        await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
       } catch (e) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
       }

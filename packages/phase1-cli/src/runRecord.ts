@@ -17,10 +17,41 @@ import { isAbsolute, join, resolve } from "node:path";
 
 export type RunOutcome = "approved" | "noop" | "rejected" | "incomplete" | "verification-failed";
 
+/**
+ * Map a completed walk + verdict to the recorded outcome. Pure and unit-tested
+ * because this mapping is safety-critical: a non-converged loop MUST record as
+ * `"incomplete"` (NOT a new outcome value), so pre-push hooks deployed before
+ * loop support — which block on `"incomplete"` — keep prompting instead of
+ * failing open. The `loopExhausted` discriminator is carried separately on the
+ * record for richer messaging in updated hooks.
+ */
+export function deriveOutcome(input: {
+  verificationFailed: boolean;
+  loopExhausted: boolean;
+  apply: boolean;
+  noop: boolean;
+  incomplete: boolean;
+}): RunOutcome {
+  if (input.verificationFailed) return "verification-failed";
+  if (input.loopExhausted) return "incomplete";
+  if (input.apply) return "approved";
+  if (input.noop) return "noop";
+  if (input.incomplete) return "incomplete";
+  return "rejected";
+}
+
 export interface RunRecord {
   branch?: string;
   head?: string;
   outcome: RunOutcome;
+  /**
+   * True when the run stopped on a non-converged loop. The `outcome` stays
+   * `"incomplete"` for back-compat (deployed hooks block on that); this flag
+   * lets updated tooling message it specifically.
+   */
+  loopExhausted?: boolean;
+  /** Resources (e.g. flag keys) left orphaned by a re-plan across iterations. */
+  orphanedResources?: string[];
   flagKey?: string;
   manifest?: string;
   at: string;

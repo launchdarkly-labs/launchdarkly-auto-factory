@@ -9,6 +9,8 @@ const verdict = (o: Partial<WalkVerdict> = {}): WalkVerdict => ({
   reviewApproved: false,
   hasVerdict: false,
   skipFlagging: false,
+  inconsistentSkip: false,
+  orphanedFlagKeys: [],
   ...o,
 });
 
@@ -42,6 +44,22 @@ describe("decideApproval (verdict-only — approvals happen pre-execution via ga
     assert.equal(d.incomplete, false);
     assert.doesNotMatch(d.reason, /reject/i);
   });
+
+  it("inconsistentSkip → INCOMPLETE, NOT a clean no-op (false-green guard)", () => {
+    // skip_flagging + a flag was really created in an earlier iteration.
+    const d = decideApproval(verdict({ skipFlagging: true, inconsistentSkip: true }));
+    assert.equal(d.incomplete, true);
+    assert.equal(d.noop, false);
+    assert.equal(d.apply, false);
+    assert.match(d.reason, /orphan/i);
+  });
+
+  it("orphanedFlagKeys → INCOMPLETE even if the reviewer approved", () => {
+    const d = decideApproval(verdict({ hasVerdict: true, reviewApproved: true, orphanedFlagKeys: ["flag-old"] }));
+    assert.equal(d.incomplete, true);
+    assert.equal(d.apply, false);
+    assert.match(d.reason, /flag-old/);
+  });
 });
 
 describe("interpretWalk", () => {
@@ -73,5 +91,26 @@ describe("interpretWalk", () => {
   it("reads skip_flagging", () => {
     assert.equal(interpretWalk({ skip_flagging: "true" }).skipFlagging, true);
     assert.equal(interpretWalk({}).skipFlagging, false);
+  });
+
+  it("flags an inconsistent skip: skip_flagging set but inventory shows a created flag", () => {
+    // Routing says "no flag needed" but the never-rewound inventory has one.
+    const v = interpretWalk({ skip_flagging: "true" }, { flag_created: "true", flag_key: "flag-x" });
+    assert.equal(v.inconsistentSkip, true);
+  });
+
+  it("does NOT flag inconsistency when no flag was created", () => {
+    assert.equal(interpretWalk({ skip_flagging: "true" }, {}).inconsistentSkip, false);
+  });
+
+  it("detects a flag orphaned across iterations (earlier flag_key differs from final)", () => {
+    const runs = [{ tags: { flag_key: "flag-old" } }, { tags: { flag_key: "flag-new" } }];
+    const v = interpretWalk({}, { flag_key: "flag-new" }, runs);
+    assert.deepEqual(v.orphanedFlagKeys, ["flag-old"]);
+  });
+
+  it("no orphan when every iteration used the same flag_key", () => {
+    const runs = [{ tags: { flag_key: "flag-x" } }, { tags: { flag_key: "flag-x" } }];
+    assert.deepEqual(interpretWalk({}, { flag_key: "flag-x" }, runs).orphanedFlagKeys, []);
   });
 });

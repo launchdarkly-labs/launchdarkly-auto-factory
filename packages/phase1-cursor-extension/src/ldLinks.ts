@@ -30,12 +30,16 @@ export function metricUrl(project: string, metricKey: string): string {
   return `${appBaseUrl()}/${project}/metrics/${encodeURIComponent(metricKey)}/details`;
 }
 
-/** Build links for whatever the agents recorded in the routing tags. */
-export function buildCreatedLinks(project: string, tags: Record<string, string>): CreatedLinks {
+/**
+ * Build links from the created-resource inventory (WalkResult.inventory) — the
+ * never-rewound record, so a loop rewind can't erase links to resources that
+ * really exist.
+ */
+export function buildCreatedLinks(project: string, inventory: Record<string, string>): CreatedLinks {
   const links: CreatedLinks = { metrics: [] };
-  if (tags.flag_key) links.flag = { key: tags.flag_key, url: flagUrl(project, tags.flag_key) };
-  if (tags.metric_keys) {
-    for (const key of tags.metric_keys.split(",").map((k) => k.trim()).filter(Boolean)) {
+  if (inventory.flag_key) links.flag = { key: inventory.flag_key, url: flagUrl(project, inventory.flag_key) };
+  if (inventory.metric_keys) {
+    for (const key of inventory.metric_keys.split(",").map((k) => k.trim()).filter(Boolean)) {
       links.metrics.push({ key, url: metricUrl(project, key) });
     }
   }

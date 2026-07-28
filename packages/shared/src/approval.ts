@@ -48,12 +48,40 @@ export interface WalkVerdict {
   risk?: RiskLevel;
   /** The research planner declared no flag is needed (Rule F11). */
   skipFlagging: boolean;
+  /**
+   * `skip_flagging` is set, but the inventory shows a flag was actually created
+   * in an earlier loop iteration — the final state abandons a real resource.
+   * Never a clean no-op; reported as incomplete so a human cleans it up.
+   */
+  inconsistentSkip: boolean;
+  /**
+   * Flag keys created in earlier iterations that differ from the final flag —
+   * orphaned in LaunchDarkly by a re-plan that switched flags. Empty when none.
+   */
+  orphanedFlagKeys: string[];
 }
 
 /** Turn the reviewer's verdict into the run's reported outcome. */
 export function decideApproval(verdict: WalkVerdict): ApprovalDecision {
   const base = { apply: false, noop: false, incomplete: false };
 
+  // False-green guards (loop reworks): a prior iteration created a resource the
+  // final state abandons. These MUST precede skip_flagging/approve so a rewound
+  // routing tag can never let a run report success over an orphaned flag.
+  if (verdict.inconsistentSkip) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: "INCOMPLETE — a flag was created in an earlier iteration but the run now reports no flag needed (orphaned resource — clean up in LaunchDarkly)",
+    };
+  }
+  if (verdict.orphanedFlagKeys.length > 0) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: `INCOMPLETE — an earlier iteration created a different flag (${verdict.orphanedFlagKeys.join(", ")}) than the final one (orphaned — clean up in LaunchDarkly)`,
+    };
+  }
   if (verdict.skipFlagging) {
     return { ...base, noop: true, reason: "no flag needed — nothing to review" };
   }
@@ -73,7 +101,13 @@ export function decideApproval(verdict: WalkVerdict): ApprovalDecision {
  * additional keys are LEGACY fallbacks kept only for resilience against older
  * config variations.
  */
-export function interpretWalk(tags: Record<string, string>): WalkVerdict {
+export function interpretWalk(
+  tags: Record<string, string>,
+  /** The never-rewound created-resource inventory (WalkResult.inventory). */
+  inventory: Record<string, string> = {},
+  /** Per-node runs, used to detect a flag orphaned by a re-plan across iterations. */
+  runs: ReadonlyArray<{ tags: Record<string, string> }> = [],
+): WalkVerdict {
   const rawDecision = (
     tags.review_approved ?? // canonical
     tags.review_decision ?? // legacy
@@ -91,5 +125,21 @@ export function interpretWalk(tags: Record<string, string>): WalkVerdict {
   const risk: RiskLevel | undefined =
     rawRisk === "low" || rawRisk === "medium" || rawRisk === "high" ? rawRisk : undefined;
   const skipFlagging = (tags.skip_flagging ?? "").toLowerCase() === "true";
-  return { reviewApproved, hasVerdict, risk, skipFlagging };
+
+  // False-green detection over the never-rewound inventory + run history.
+  const flagWasCreated =
+    inventory.flag_created?.toLowerCase() === "true" ||
+    inventory.flag_ready?.toLowerCase() === "true" ||
+    Boolean(inventory.flag_key);
+  const inconsistentSkip = skipFlagging && flagWasCreated;
+  const finalFlagKey = inventory.flag_key;
+  const orphanedFlagKeys = [
+    ...new Set(
+      runs
+        .map((r) => r.tags.flag_key)
+        .filter((k): k is string => Boolean(k) && k !== finalFlagKey),
+    ),
+  ];
+
+  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys };
 }

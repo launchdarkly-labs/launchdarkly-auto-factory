@@ -5,7 +5,7 @@
  * VS Code dependency and stays testable.
  */
 
-import type { ApprovalDecision, NodeRun } from "@auto-factory/shared";
+import type { ApprovalDecision, LoopExhaustedInfo, NodeRun } from "@auto-factory/shared";
 
 /** The five Phase 1 agents, in chain order, with display labels for the UI. */
 export const NODE_SEQUENCE: ReadonlyArray<{ key: string; title: string; blurb: string }> = [
@@ -24,11 +24,15 @@ export interface RunResult {
   runs: NodeRun[];
   skipped: string[];
   tags: Record<string, string>;
+  /** Never-rewound created-resource inventory — the source for links. */
+  inventory: Record<string, string>;
   decision: ApprovalDecision;
   mode: string;
   provider: string;
   /** Set when the run stopped at an approval gate (the user declined to proceed). */
   pendingApproval?: { node: string };
+  /** Set when a loop did not converge — a hard failure, overrides apply. */
+  loopExhausted?: LoopExhaustedInfo;
 }
 
 export interface RunReporter {

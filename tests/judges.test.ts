@@ -62,6 +62,7 @@ describe("createJudgeHook", () => {
     const hook = makeHook({ requests });
     const results = await hook({
       configKey: "autofactory-flag-implementer",
+      iteration: 1,
       cfg: { key: "x", enabled: true } as unknown as LDAIAgentConfig,
       input: "prompt",
       output: "output",
@@ -78,6 +79,7 @@ describe("createJudgeHook", () => {
     const hook = makeHook({ requests });
     const results = await hook({
       configKey: "autofactory-flag-implementer",
+      iteration: 1,
       cfg: stubAgentConfig([{ key: "autofactory-judge-implementation-quality", samplingRate: 1 }]),
       input: "the node prompt",
       output: "the node output",
@@ -101,6 +103,7 @@ describe("createJudgeHook", () => {
     const hook = makeHook({});
     const results = await hook({
       configKey: "autofactory-flag-implementer",
+      iteration: 1,
       cfg: stubAgentConfig([{ judgeConfigKey: "autofactory-judge-implementation-quality", samplingRate: 1 }]),
       input: "p",
       output: "o",
@@ -115,6 +118,7 @@ describe("createJudgeHook", () => {
     const hook = makeHook({});
     await hook({
       configKey: "k",
+      iteration: 1,
       cfg: stubAgentConfig([{ key: "j", samplingRate: 100 }]),
       input: "p",
       output: "o",
@@ -129,6 +133,7 @@ describe("createJudgeHook", () => {
     const hook = makeHook({ requests });
     const results = await hook({
       configKey: "k",
+      iteration: 1,
       cfg: stubAgentConfig([{ key: "j", samplingRate: 0 }]),
       input: "p",
       output: "o",
@@ -144,6 +149,7 @@ describe("createJudgeHook", () => {
     const hook = makeHook({ judgeCfg: stubJudgeConfig({ enabled: false } as Partial<LDAIJudgeConfig>) });
     const results = await hook({
       configKey: "k",
+      iteration: 1,
       cfg: stubAgentConfig([{ key: "j", samplingRate: 1 }]),
       input: "p",
       output: "o",
@@ -162,6 +168,7 @@ describe("createJudgeHook", () => {
     });
     const results = await hook({
       configKey: "k",
+      iteration: 1,
       cfg: stubAgentConfig([{ key: "j", samplingRate: 1 }]),
       input: "p",
       output: "o",
@@ -206,6 +213,7 @@ describe("judge evidence", () => {
     const { tracker, tracked } = captureTracker();
     await hook({
       configKey: "autofactory-flag-implementer",
+      iteration: 1,
       cfg: stubAgentConfig([{ key: "j", samplingRate: 1 }]),
       input: "the brief",
       output: "the report",
@@ -231,6 +239,7 @@ describe("judge evidence", () => {
     const { tracker, tracked } = captureTracker();
     const results = await failing({
       configKey: "k",
+      iteration: 1,
       cfg: stubAgentConfig([{ key: "j", samplingRate: 1 }]),
       input: "p",
       output: "o",

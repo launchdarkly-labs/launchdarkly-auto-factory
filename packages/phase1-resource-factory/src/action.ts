@@ -39,6 +39,7 @@ import {
   computeConfigHash,
   createPolicyGate,
   decideApproval,
+  describeLoopExhausted,
   extractConfigStamp,
   getLdSdk,
   interpretWalk,
@@ -497,7 +498,8 @@ async function main(): Promise<void> {
     ? async (args) => {
         const results = await baseJudgeHook(args);
         for (const r of results) {
-          if (r.sampled && typeof r.score === "number") judgeScores.set(args.configKey, r.score);
+          // Key by node#iteration so a looped node's re-runs don't overwrite.
+          if (r.sampled && typeof r.score === "number") judgeScores.set(`${args.configKey}#${args.iteration}`, r.score);
         }
         return results;
       }
@@ -537,6 +539,12 @@ async function main(): Promise<void> {
       walk.verificationFailed.failures.map((f) => `[${f.name}] ${f.detail}`).join("; ")
     : "";
   if (verifyText) console.log(`::error::AutoFactory: ${verifyText}`);
+
+  // A loop did not converge within budget (or hit the run-cap). A hard failure —
+  // surface it as an error annotation and fail the run below, so it can never
+  // read as a clean success even if a stale routing tag looks approved.
+  const loopText = walk.loopExhausted ? describeLoopExhausted(walk.loopExhausted) : "";
+  if (loopText) console.log(`::error::AutoFactory: ${loopText}`);
 
   // Halted at an approval gate: report what's pending + how to approve, then
   // stop. The flag/code for the gated step have NOT been created. A re-run once
@@ -583,11 +591,13 @@ async function main(): Promise<void> {
   });
   if (intentReview.warning) console.log(`::warning::AutoFactory: ${intentReview.warning}`);
 
-  const verdict = interpretWalk(walk.tags);
+  const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);
 
   console.log(`Verdict → ${decision.reason}`);
-  if (decision.apply) {
+  if (walk.loopExhausted) {
+    console.log("⚠ Loop did not converge — see the error above. This run is not applied.");
+  } else if (decision.apply) {
     console.log("✓ Changes approved and applied by the agents.");
   } else if (decision.noop) {
     console.log("• No flag needed — nothing to apply.");
@@ -601,18 +611,20 @@ async function main(): Promise<void> {
   // LaunchDarkly judge evaluated the node). This is the at-a-glance record the
   // PR reader gets without opening the Actions log.
   const agentRows = walk.runs.map((r) => {
-    const judge = judgeScores.get(r.configKey);
+    const judge = judgeScores.get(`${r.configKey}#${r.iteration}`);
+    // Label re-runs so a looped node shows as distinct rows (iteration 2, 3, …).
+    const label = r.iteration > 1 ? `\`${r.configKey}\` (iter ${r.iteration})` : `\`${r.configKey}\``;
     const tags =
       Object.entries(r.tags)
         .map(([k, v]) => `${k}=${v}`)
         .join(", ")
         .slice(0, 140) || "—";
-    return `| \`${r.configKey}\` | ${r.status} | ${judge !== undefined ? judge.toFixed(2) : "—"} | ${tags} |`;
+    return `| ${label} | ${r.status} | ${judge !== undefined ? judge.toFixed(2) : "—"} | ${tags} |`;
   });
   const summary = [
     "### LaunchDarkly Auto-Factory — Phase 1",
     "",
-    `**Verdict:** ${decision.reason}` +
+    `**Verdict:** ${walk.loopExhausted ? "loop did not converge — not applied" : decision.reason}` +
       (policy.mode !== "yolo" ? ` _(approval mode: ${policy.mode}${policy.mode === "risk-threshold" ? ` @ ${policy.threshold}` : ""})_` : ""),
     intentReview.line ?? "",
     intentReview.warning ? `**⚠ Release intent:** ${intentReview.warning}` : "",
@@ -623,6 +635,7 @@ async function main(): Promise<void> {
         (kg.warnings.length ? `; ⚠ ${kg.warnings.map((w) => w.split(" — ")[0]).join("; ⚠ ")}` : "")
       : "",
     walk.skipped.length ? `**Skipped:** ${walk.skipped.join(", ")}` : "",
+    loopText ? `**⟳ Loop did not converge:** ${loopText}` : "",
     stallText ? `**⚠ Stalled:** ${stallText}` : "",
     verifyText ? `**⛔ Deterministic check failed:** ${verifyText}` : "",
     "",
@@ -641,8 +654,12 @@ async function main(): Promise<void> {
     name: "AutoFactory — Phase 1",
     repo: context.REPO,
     headSha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
-    conclusion: !walk.verificationFailed && (decision.apply || decision.noop) ? "success" : "failure",
-    title: walk.verificationFailed ? `Deterministic check failed after ${walk.verificationFailed.node}` : decision.reason,
+    conclusion: !walk.verificationFailed && !walk.loopExhausted && (decision.apply || decision.noop) ? "success" : "failure",
+    title: walk.verificationFailed
+      ? `Deterministic check failed after ${walk.verificationFailed.node}`
+      : walk.loopExhausted
+        ? `Loop did not converge at ${walk.loopExhausted.node}`
+        : decision.reason,
     summary,
   });
 
@@ -650,7 +667,7 @@ async function main(): Promise<void> {
   // no-op (no flag needed). Red: a genuine rejection, an incomplete run (the
   // chain stalled / never reviewed), or a failed deterministic check — each
   // carries its own distinct message above.
-  if (walk.verificationFailed || (!decision.apply && !decision.noop)) process.exitCode = 1;
+  if (walk.verificationFailed || walk.loopExhausted || (!decision.apply && !decision.noop)) process.exitCode = 1;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

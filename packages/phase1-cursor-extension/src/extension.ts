@@ -165,7 +165,7 @@ async function runOnce(context: vscode.ExtensionContext, reason: string): Promis
             return choice === "Approve";
           },
         });
-        const links = buildCreatedLinks(cfg.appProjectKey, result.tags);
+        const links = buildCreatedLinks(cfg.appProjectKey, result.inventory);
         panel.done(result, links);
         output.appendLine("");
         output.appendLine(`──── ${result.runs.map((r) => nodeTitle(r.configKey)).join(" → ")}`);
@@ -175,9 +175,11 @@ async function runOnce(context: vscode.ExtensionContext, reason: string): Promis
         if (links.flag) output.appendLine(`Flag → ${links.flag.url}`);
         for (const m of links.metrics) output.appendLine(`Metric ${m.key} → ${m.url}`);
 
-        const verb = result.pendingApproval
-          ? `⏸ stopped before ${nodeTitle(result.pendingApproval.node)} (approval declined)`
-          : result.decision.apply
+        const verb = result.loopExhausted
+          ? `⚠ did not converge (loop budget exhausted at ${nodeTitle(result.loopExhausted.node)})`
+          : result.pendingApproval
+            ? `⏸ stopped before ${nodeTitle(result.pendingApproval.node)} (approval declined)`
+            : result.decision.apply
               ? "✓ approved"
               : result.decision.noop
                 ? "• no flag needed"

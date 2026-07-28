@@ -2,3 +2,4 @@
 
 export * from "./args.js";
 export { runCli, UsageError } from "./run.js";
+export { deriveOutcome, type RunOutcome, type RunRecord } from "./runRecord.js";

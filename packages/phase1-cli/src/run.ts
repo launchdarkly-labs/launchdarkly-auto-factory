@@ -41,6 +41,7 @@ import {
   createPolicyGate,
   createWorkingTreeEvidence,
   decideApproval,
+  describeLoopExhausted,
   extractConfigStamp,
   getLdSdk,
   hasChangeToProcess,
@@ -58,7 +59,7 @@ import {
   withProvider,
 } from "@auto-factory/shared";
 import { type CliOptions, EXIT } from "./args.js";
-import { type RunOutcome, writeRunRecord } from "./runRecord.js";
+import { type RunOutcome, deriveOutcome, writeRunRecord } from "./runRecord.js";
 
 function appBaseUrl(): string {
   return (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, "");
@@ -320,7 +321,8 @@ async function run(opts: CliOptions): Promise<number> {
     ? async (args) => {
         const results = await baseJudgeHook(args);
         for (const r of results) {
-          if (r.sampled && typeof r.score === "number") judgeScores.set(args.configKey, r.score);
+          // Key by node#iteration so a looped node's re-runs don't overwrite.
+          if (r.sampled && typeof r.score === "number") judgeScores.set(`${args.configKey}#${args.iteration}`, r.score);
         }
         return results;
       }
@@ -348,6 +350,8 @@ async function run(opts: CliOptions): Promise<number> {
         else console.log(`⛔ deterministic check FAILED after ${v.node}: ${v.failures.map((c) => `[${c.name}] ${c.detail}`).join("; ")}`);
       } else if (event.type === "stalled") {
         console.log(`⚠ ${describeStall(event.stall)}`);
+      } else if (event.type === "loop-exhausted") {
+        console.log(`⚠ ${describeLoopExhausted(event.info)}`);
       } else if (event.type === "awaiting-approval") {
         console.log(`⏸ approval gate: stopped before ${event.node}`);
       }
@@ -377,7 +381,7 @@ async function run(opts: CliOptions): Promise<number> {
     return EXIT.PENDING_APPROVAL;
   }
 
-  const verdict = interpretWalk(walk.tags);
+  const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);
 
   // Release intent: validate the manifest's releaseIntent deterministically so
@@ -401,14 +405,24 @@ async function run(opts: CliOptions): Promise<number> {
   // Final summary: what was created, where it lives, and the reviewer's verdict
   // as the standard fenced JSON block every front end ends with.
   const lines: string[] = ["", "──────── AutoFactory Phase 1 — summary ────────", `Verdict: ${decision.reason}`];
-  if (walk.tags.flag_key) {
-    lines.push(`Flag: ${walk.tags.flag_key} → ${flagUrl(appProjectKey as string, walk.tags.flag_key)}`);
+  // Links come from the never-rewound inventory, so a loop rewind can't erase
+  // the record of resources that really exist.
+  if (walk.inventory.flag_key) {
+    lines.push(`Flag: ${walk.inventory.flag_key} → ${flagUrl(appProjectKey as string, walk.inventory.flag_key)}`);
   }
-  for (const key of (walk.tags.metric_keys ?? "").split(",").map((k) => k.trim()).filter(Boolean)) {
+  for (const key of (walk.inventory.metric_keys ?? "").split(",").map((k) => k.trim()).filter(Boolean)) {
     lines.push(`Metric: ${key} → ${metricUrl(appProjectKey as string, key)}`);
   }
   if (manifestRel && manifestExists) lines.push(`Manifest: ${manifestRel}`);
-  for (const [node, score] of judgeScores) lines.push(`Judge: ${node} scored ${score.toFixed(2)}`);
+  for (const [node, score] of judgeScores) {
+    // Keys are `configKey#iteration`; show "(iter N)" only for re-runs.
+    const parts = node.split("#");
+    const k = parts[0] ?? node;
+    const iter = parts[1];
+    const label = iter && iter !== "1" ? `${k} (iter ${iter})` : k;
+    lines.push(`Judge: ${label} scored ${score.toFixed(2)}`);
+  }
+  if (walk.loopExhausted) lines.push(`⚠ ${describeLoopExhausted(walk.loopExhausted)}`);
   if (walk.stalledAt) lines.push(`⚠ Stalled: ${describeStall(walk.stalledAt)}`);
   if (walk.verificationFailed) {
     lines.push(
@@ -431,23 +445,27 @@ async function run(opts: CliOptions): Promise<number> {
   // Record the completed run at <git-dir>/autofactory-last-run.json — the
   // evidence the pre-push gate reads (see runRecord.ts). Dry runs don't count.
   if (!opts.dryRun) {
-    const outcome: RunOutcome = walk.verificationFailed
-      ? "verification-failed"
-      : decision.apply
-        ? "approved"
-        : decision.noop
-          ? "noop"
-          : decision.incomplete
-            ? "incomplete"
-            : "rejected";
+    // Outcome mapping lives in a pure, unit-tested helper (runRecord.ts): a
+    // non-converged loop records as `incomplete` (so already-deployed pre-push
+    // hooks stay safe) plus a `loopExhausted` discriminator for updated hooks.
+    const outcome: RunOutcome = deriveOutcome({
+      verificationFailed: !!walk.verificationFailed,
+      loopExhausted: !!walk.loopExhausted,
+      apply: decision.apply,
+      noop: decision.noop,
+      incomplete: decision.incomplete,
+    });
+    const orphanedResources = verdict.orphanedFlagKeys;
     writeRunRecord(root, {
       ...(state.branch ? { branch: state.branch } : {}),
       ...(state.head ? { head: state.head } : {}),
       outcome,
-      ...(walk.tags.flag_key ? { flagKey: walk.tags.flag_key } : {}),
+      ...(walk.loopExhausted ? { loopExhausted: true } : {}),
+      ...(orphanedResources.length ? { orphanedResources } : {}),
+      ...(walk.inventory.flag_key ? { flagKey: walk.inventory.flag_key } : {}),
       ...(manifestRel && manifestExists ? { manifest: manifestRel } : {}),
     });
   }
 
-  return !walk.verificationFailed && (decision.apply || decision.noop) ? EXIT.OK : EXIT.FAILED;
+  return !walk.verificationFailed && !walk.loopExhausted && (decision.apply || decision.noop) ? EXIT.OK : EXIT.FAILED;
 }

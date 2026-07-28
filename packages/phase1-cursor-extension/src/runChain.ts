@@ -19,6 +19,7 @@ import {
   buildHandoffVerifier,
   createPolicyGate,
   decideApproval,
+  describeLoopExhausted,
   getLdSdk,
   interpretWalk,
   pipelineContext,
@@ -117,6 +118,8 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
           .map((e) => `→ ${e.target} needs ${Object.entries(e.requireMissing).map(([k, v]) => `${k}=${v}`).join(", ")}`)
           .join("; ");
         reporter.log(`⚠ chain stalled at ${event.stall.node}: unmet handoff ${u}`);
+      } else if (event.type === "loop-exhausted") {
+        reporter.log(`⚠ ${describeLoopExhausted(event.info)}`);
       } else if (event.type === "awaiting-approval") {
         reporter.log(`⏸ approval gate: stopped before ${event.node}`);
       }
@@ -128,15 +131,17 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
     buildHandoffVerifier({ sandboxRoot: opts.workspaceRoot, ...(writer ? { writer } : {}) }),
   );
 
-  const verdict = interpretWalk(walk.tags);
+  const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);
 
   const result: RunResult = {
     runs: walk.runs,
     skipped: walk.skipped,
     tags: walk.tags,
+    inventory: walk.inventory,
     decision,
     ...(walk.pendingApproval ? { pendingApproval: walk.pendingApproval } : {}),
+    ...(walk.loopExhausted ? { loopExhausted: walk.loopExhausted } : {}),
     mode: policy.mode,
     provider,
   };

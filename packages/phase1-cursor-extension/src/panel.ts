@@ -77,20 +77,26 @@ export class AutoFactoryViewProvider implements vscode.WebviewViewProvider {
     for (const n of NODE_SEQUENCE) {
       if (!ran.has(n.key)) this.send({ type: "node", configKey: n.key, status: "skipped" as NodeStatus });
     }
-    const verdict = result.pendingApproval
-      ? `stopped before ${result.pendingApproval.node}`
-      : result.tags.review_approved
-        ? `${result.tags.review_approved} (risk: ${result.tags.risk_level ?? "?"})`
-        : "no verdict";
+    const verdict = result.loopExhausted
+      ? `did not converge (loop budget exhausted at ${result.loopExhausted.node})`
+      : result.pendingApproval
+        ? `stopped before ${result.pendingApproval.node}`
+        : result.tags.review_approved
+          ? `${result.tags.review_approved} (risk: ${result.tags.risk_level ?? "?"})`
+          : "no verdict";
     this.send({
       type: "done",
       verdict,
-      reason: result.pendingApproval
-        ? "approval gate — the gated step was not run (approval declined)"
-        : result.decision.reason,
-      apply: result.decision.apply,
+      reason: result.loopExhausted
+        ? `loop did not converge — ${result.loopExhausted.reason}`
+        : result.pendingApproval
+          ? "approval gate — the gated step was not run (approval declined)"
+          : result.decision.reason,
+      // A non-converged loop is a hard failure: force apply off regardless of the
+      // (possibly stale) verdict.
+      apply: result.decision.apply && !result.loopExhausted,
       noop: result.decision.noop,
-      incomplete: result.decision.incomplete,
+      incomplete: result.decision.incomplete || !!result.loopExhausted,
       pending: !!result.pendingApproval,
       flag: links.flag ?? null,
       metrics: links.metrics,
