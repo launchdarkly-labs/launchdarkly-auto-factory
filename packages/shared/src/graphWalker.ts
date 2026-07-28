@@ -12,10 +12,16 @@
  *   - skip_if_tags: do NOT take the edge if ALL listed tags are present/equal
  *     (e.g. research sets {skip_flagging: "true"} → the flagging edge is skipped,
  *      short-circuiting the chain — "this PR needs no flag")
+ *   - max_visits: caps how many times THIS edge may be traversed. An edge that
+ *     carries max_visits is the author-designated loop-back edge; untagged edges
+ *     (forward / rejoin) are never capped. This is how bounded loops work — a
+ *     re-entered node re-runs, and its routing tags are rewound to the state
+ *     before it last ran (facts/inventory persist). Termination is guaranteed by
+ *     the per-edge cap plus a run-level backstop.
  *
- * Designed for the linear/conditional chains we use today; one outgoing edge is
- * taken per node. Per-node generation metrics and per-edge handoff metrics are
- * recorded back to LaunchDarkly via the AI-config and graph trackers.
+ * One outgoing edge is taken per node. Per-node generation metrics and per-edge
+ * handoff metrics are recorded back to LaunchDarkly via the AI-config and graph
+ * trackers.
  */
 
 import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker } from "@launchdarkly/server-sdk-ai";
@@ -23,11 +29,48 @@ import type { AgentNodeResult, AgentRunner } from "./agentRunner.js";
 import type { HandoffVerification, HandoffVerifier } from "./handoffVerifier.js";
 import type { JudgeHook } from "./judges.js";
 
+/** Hard ceiling on any declared `max_visits`, so config can't remove the guarantee. */
+const MAX_VISITS_HARD_CAP = 10;
+
+/**
+ * Tags produced by the LLM (routing/verdict) — REWOUND when a loop edge re-enters
+ * a node, so a re-run starts from the routing state that preceded the target's
+ * last run rather than inheriting stale downstream decisions. Mirrors tags.json
+ * `production: "llm"`. A check-configs case asserts this stays in sync.
+ */
+const ROUTING_TAGS = new Set<string>([
+  "skip_flagging",
+  "flag_worthy",
+  "flag_action",
+  "needs_tests",
+  "review_approved",
+  "risk_level",
+  "risk_score",
+]);
+
+/**
+ * Tags produced by tools (facts) — NEVER rewound; mirrored into `inventory` so
+ * reporting, the rework preamble, and the orphan guard see real created-resource
+ * state even after a routing rewind. Mirrors tags.json `production: "tool"`.
+ */
+const FACT_TAGS = new Set<string>([
+  "flag_ready",
+  "flag_created",
+  "flag_key",
+  "flag_variation",
+  "metrics_created",
+  "metric_keys",
+  "metric_event_keys",
+  "tests_last_run",
+]);
+
 export interface NodeRun {
   configKey: string;
   status: AgentNodeResult["status"];
   output: string;
   tags: Record<string, string>;
+  /** 1-based run count for this node key in this walk (>1 means a loop re-run). */
+  iteration: number;
 }
 
 /** An outgoing edge that could NOT be taken because its `require_tags` weren't met. */
@@ -54,10 +97,38 @@ export interface StallInfo {
   unmet: UnmetEdge[];
 }
 
+/**
+ * Why the walk stopped on a loop that did not converge, rather than at a terminal
+ * node, a stall, or an intentional skip. Distinct from a stall (a required tag
+ * was never produced) — here a loop edge PASSED its conditions but had already
+ * been traversed its budget (`"budget"`), or the run-level backstop tripped on an
+ * untagged/pathological cycle (`"run-cap"`). Either way the intended iteration
+ * did not complete; the caller must NOT report this as a clean success.
+ */
+export interface LoopExhaustedInfo {
+  /** The node the walk was at when it stopped. */
+  node: string;
+  /** Which ceiling stopped it. */
+  reason: "budget" | "run-cap";
+  /** Budget-exhausted loop edges that otherwise passed their tag conditions. */
+  exhausted: Array<{ source: string; target: string; traversals: number; maxVisits: number }>;
+  /** Any edges also blocked by unmet require_tags at the same point (context). */
+  alsoUnmet?: UnmetEdge[];
+  /** Tags present at exhaustion. */
+  tags: Record<string, string>;
+}
+
 export interface WalkResult {
   runs: NodeRun[];
-  /** Tags accumulated across all nodes. */
+  /** Tags accumulated across all nodes (routing tags may have been rewound). */
   tags: Record<string, string>;
+  /**
+   * Tool-produced facts accumulated across the whole walk and NEVER rewound —
+   * the authoritative created-resource inventory (flag_key, metric_keys, …).
+   * Reporting and the orphan guard read this, not `tags`, so a loop rewind can't
+   * erase the record of resources that really exist.
+   */
+  inventory: Record<string, string>;
   /** Node keys never reached because an edge condition stopped the chain. */
   skipped: string[];
   /**
@@ -81,6 +152,12 @@ export interface WalkResult {
    * that node — downstream agents must not build on an unverified claim.
    */
   verificationFailed?: HandoffVerification;
+  /**
+   * Set when a loop did not converge within budget (or hit the run-level
+   * backstop). A hard-fail terminal — callers must not treat it as success even
+   * if a stale routing tag reads as approved. Undefined for a clean finish.
+   */
+  loopExhausted?: LoopExhaustedInfo;
 }
 
 /**
@@ -113,11 +190,19 @@ export type WalkEvent =
   | { type: "node-complete"; configKey: string; index: number; run: NodeRun }
   | { type: "node-verified"; verification: HandoffVerification }
   | { type: "stalled"; stall: StallInfo }
+  | { type: "loop-exhausted"; info: LoopExhaustedInfo }
   | { type: "awaiting-approval"; node: string };
 
 /** All key/value pairs in `cond` are present and equal in `tags`. */
 function tagsMatch(tags: Record<string, string>, cond: Record<string, string>): boolean {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
+}
+
+/** The routing-classified (LLM-produced) subset of a tag map — the rewindable tags. */
+function pickRouting(tags: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(tags)) if (ROUTING_TAGS.has(k)) out[k] = v;
+  return out;
 }
 
 /** Read a `{key:value}` tag map out of an edge handoff field. */
@@ -139,11 +224,39 @@ function handoffStringArray(handoff: Record<string, unknown> | undefined, field:
 }
 
 /**
- * Build a node's prompt. Each node runs in its own conversation, so the prompt
- * carries the repo + PR header and, for non-root nodes, the previous agent's
- * full brief (the downstream agent's instructions tell it to parse this).
+ * A rework preamble injected into a re-entered node's prompt so the agent knows
+ * it is iteration N with prior work to amend (not a fresh first pass). Lists the
+ * created-resource inventory as "reuse, don't recreate" facts.
  */
-function buildPrompt(hasInbound: boolean, ctx: Record<string, unknown>): string {
+function reworkPreamble(iteration: number, inventory: Record<string, string>): string {
+  const facts = Object.entries(inventory)
+    .filter(([, v]) => v)
+    .map(([k, v]) => `- ${k}: ${v}`);
+  const factBlock = facts.length
+    ? `\nResources already created in a prior iteration (amend or reuse — do NOT recreate):\n${facts.join("\n")}`
+    : "";
+  return (
+    `=== REWORK ITERATION ${iteration} ===\n` +
+    `This is a re-run of an earlier step; a previous iteration already executed. ` +
+    `The brief below explains what to change.${factBlock}\n` +
+    `=== END REWORK CONTEXT ===`
+  );
+}
+
+/**
+ * Build a node's prompt. Each node runs in its own conversation, so the prompt
+ * carries the repo + PR header. The ROOT node always gets the PR body (even when
+ * re-entered via a loop edge, which would otherwise look "non-root"); nodes with
+ * an inbound edge also get the previous agent's brief. On a re-run (iteration>1)
+ * a rework preamble is prepended.
+ */
+function buildPrompt(
+  isRoot: boolean,
+  hasInbound: boolean,
+  iteration: number,
+  inventory: Record<string, string>,
+  ctx: Record<string, unknown>,
+): string {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
     ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
@@ -151,11 +264,17 @@ function buildPrompt(hasInbound: boolean, ctx: Record<string, unknown>): string 
   ]
     .filter(Boolean)
     .join("\n");
-  if (!hasInbound) {
-    return `${header}${ctx.PR_BODY ? `\n\n${ctx.PR_BODY}` : ""}`.trim();
+  const parts: string[] = [header];
+  if (iteration > 1) parts.push(reworkPreamble(iteration, inventory));
+  // The root always sees the PR body; a re-entered root keeps it too.
+  if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY) parts.push(ctx.PR_BODY);
+  // The inbound brief (previous step output): present for non-root nodes and for
+  // a root re-entered via a loop edge.
+  if (hasInbound) {
+    const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
+    if (brief) parts.push(brief);
   }
-  const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
-  return `${header}\n\n${brief}`.trim();
+  return parts.filter(Boolean).join("\n\n").trim();
 }
 
 function lastAssistantText(result: AgentNodeResult): string {
@@ -199,9 +318,29 @@ export async function walkGraph(
 ): Promise<WalkResult> {
   const runs: NodeRun[] = [];
   const accumulatedTags: Record<string, string> = {};
+  // Never-rewound mirror of tool-produced facts (the created-resource inventory).
+  const inventory: Record<string, string> = {};
   const ctx: Record<string, unknown> = { ...context };
   const gatedSteps = new Set(gate?.steps ?? []);
-  const visited = new Set<string>();
+
+  // Per-edge traversal counts (key `${source}→${target}`) — only loop edges (those
+  // carrying max_visits) are ever consulted/capped.
+  const edgeCounts = new Map<string, number>();
+  // Routing-tag state captured just before each run (parallel to `runs`), so a
+  // loop re-entry can restore the target's pre-run routing state.
+  const routingSnapshots: Array<Record<string, string>> = [];
+  // The edge-carried envelope (max_turns/request_type/capabilities) recorded on a
+  // node's first entry, inherited on re-entry when the loop edge omits a field.
+  const entryEdgeFields = new Map<string, { maxTurns?: number; requestType?: string; capabilities?: string[] }>();
+  // Per-node execution count, for the `iteration` label and the rework preamble.
+  const runCountByKey = new Map<string, number>();
+
+  const rootKey = graphDef.getConfig().root;
+  // Run-level termination backstop, scaled to graph size so it never preempts a
+  // legal per-edge budget (nodeCount × (hardCap+1)); the true control is the
+  // per-loop-edge cap. Guards untagged cycles and a maliciously edited served graph.
+  const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
+  let totalRuns = 0;
 
   let node: AgentGraphNode | null = graphDef.rootNode();
   // Handoff of the edge we traversed INTO the current node (root has none).
@@ -209,31 +348,60 @@ export async function walkGraph(
   let stalledAt: StallInfo | undefined;
   let pendingApproval: { node: string } | undefined;
   let verificationFailed: HandoffVerification | undefined;
+  let loopExhausted: LoopExhaustedInfo | undefined;
 
-  while (node && !visited.has(node.getKey())) {
+  while (node) {
     const key = node.getKey();
 
     // Approval gate: before running a gated node, ask the controller — passing
     // the tags accumulated so far, so risk-conditional gates can consult the
     // planner's risk_score. If not approved, halt BEFORE the node runs (so its
-    // side effects — flag creation, commits — don't happen).
+    // side effects — flag creation, commits — don't happen). Re-evaluated on each
+    // loop re-entry (each re-run can create new side effects).
     if (gate && gatedSteps.has(key) && !(await gate.resolve(key, accumulatedTags))) {
       pendingApproval = { node: key };
       onEvent?.({ type: "awaiting-approval", node: key });
       break;
     }
 
-    visited.add(key);
+    // Run-level backstop: bound total node executions (untagged cycles, malicious
+    // served graph). Checked BEFORE running so we never exceed the ceiling.
+    if (totalRuns >= maxTotalNodeRuns) {
+      loopExhausted = { node: key, reason: "run-cap", exhausted: [], tags: { ...accumulatedTags } };
+      onEvent?.({ type: "loop-exhausted", info: loopExhausted });
+      break;
+    }
+    totalRuns++;
+
+    const iteration = (runCountByKey.get(key) ?? 0) + 1;
+    runCountByKey.set(key, iteration);
+    // Snapshot the pre-run routing state (index aligns with the runs.push below).
+    routingSnapshots.push(pickRouting(accumulatedTags));
 
     const cfg = node.getConfig();
-    const maxTurns = handoffNumber(inboundHandoff, "max_turns");
-    const requestType = handoffString(inboundHandoff, "request_type");
-    const capabilities = handoffStringArray(inboundHandoff, "capabilities");
+    // Execution envelope: read the inbound edge's fields, recording them on first
+    // entry and inheriting them on re-entry when the loop edge omits a field (so a
+    // re-run isn't silently downgraded to the runner's built-in defaults).
+    const inboundMaxTurns = handoffNumber(inboundHandoff, "max_turns");
+    const inboundRequestType = handoffString(inboundHandoff, "request_type");
+    const inboundCapabilities = handoffStringArray(inboundHandoff, "capabilities");
+    if (!entryEdgeFields.has(key)) {
+      entryEdgeFields.set(key, {
+        maxTurns: inboundMaxTurns,
+        requestType: inboundRequestType,
+        capabilities: inboundCapabilities,
+      });
+    }
+    const entry = entryEdgeFields.get(key) ?? {};
+    const maxTurns = inboundMaxTurns ?? entry.maxTurns;
+    const requestType = inboundRequestType ?? entry.requestType;
+    const capabilities = inboundCapabilities ?? entry.capabilities;
+
     onEvent?.({ type: "node-start", configKey: key, index: runs.length });
     // One tracker per node run, shared between the runner (generation metrics)
     // and the judge hook (evaluation scores) so both land on the same AI run.
     const tracker = cfg.createTracker();
-    const prompt = buildPrompt(inboundHandoff !== undefined, ctx);
+    const prompt = buildPrompt(key === rootKey, inboundHandoff !== undefined, iteration, inventory, ctx);
     const result = await runner.runNode({
       configKey: key,
       prompt,
@@ -249,9 +417,11 @@ export async function walkGraph(
     });
 
     Object.assign(accumulatedTags, result.tags);
+    // Mirror tool-produced facts into the never-rewound inventory.
+    for (const [k, v] of Object.entries(result.tags)) if (FACT_TAGS.has(k)) inventory[k] = v;
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
-    const run: NodeRun = { configKey: key, status: result.status, output, tags: result.tags };
+    const run: NodeRun = { configKey: key, status: result.status, output, tags: result.tags, iteration };
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
 
@@ -287,23 +457,38 @@ export async function walkGraph(
       }
     }
 
-    // Pick the next edge whose handoff conditions pass.
+    // Pick the next edge whose handoff conditions pass. Only edges carrying
+    // `max_visits` (the author-designated loop edges) are budget-capped; untagged
+    // forward/rejoin edges are never blocked, so forward progress can't stall.
     let next: string | null = null;
     let nextHandoff: Record<string, unknown> | undefined;
+    let nextIsLoopEdge = false;
+    const budgetBlocked: LoopExhaustedInfo["exhausted"] = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
       const require = handoffTags(h, "require_tags");
       if (require && !tagsMatch(accumulatedTags, require)) continue;
       const skip = handoffTags(h, "skip_if_tags");
       if (skip && tagsMatch(accumulatedTags, skip)) continue;
+      const rawMax = handoffNumber(h, "max_visits");
+      if (rawMax !== undefined) {
+        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)), MAX_VISITS_HARD_CAP);
+        const ek = `${key}→${edge.key}`;
+        const traversals = edgeCounts.get(ek) ?? 0;
+        if (traversals >= maxVisits) {
+          budgetBlocked.push({ source: key, target: edge.key, traversals, maxVisits });
+          continue;
+        }
+      }
       next = edge.key;
       nextHandoff = h;
+      nextIsLoopEdge = rawMax !== undefined;
       break;
     }
 
-    // No edge taken: distinguish a genuine terminal (no outgoing edges) and an
-    // intentional skip (every blocked edge matched its skip_if) from a real
-    // stall (an outgoing edge's require_tags was never satisfied).
+    // No edge taken: distinguish a loop that exhausted its budget (a loop edge
+    // passed its conditions but is spent) from a genuine terminal / intentional
+    // skip / real stall (a required tag was never satisfied).
     if (!next) {
       const edges = node.getEdges();
       const unmet: UnmetEdge[] = [];
@@ -320,10 +505,43 @@ export async function walkGraph(
           unmet.push({ target: edge.key, requireMissing });
         }
       }
-      if (unmet.length > 0) {
+      if (budgetBlocked.length > 0) {
+        loopExhausted = {
+          node: key,
+          reason: "budget",
+          exhausted: budgetBlocked,
+          ...(unmet.length > 0 ? { alsoUnmet: unmet } : {}),
+          tags: { ...accumulatedTags },
+        };
+        onEvent?.({ type: "loop-exhausted", info: loopExhausted });
+      } else if (unmet.length > 0) {
         stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
+    }
+
+    // Taking a loop edge is an iteration boundary: rewind ROUTING tags to the
+    // target's pre-run state, then overlay this (source) node's routing tags as
+    // the trigger/feedback. Fact tags (inventory) are left at their latest values.
+    // Forward/rejoin re-entries do NOT rewind — that would resurrect stale
+    // iteration-1 routing state mid-iteration.
+    if (next && nextIsLoopEdge) {
+      let k = -1;
+      for (let j = runs.length - 1; j >= 0; j--) {
+        if (runs[j]?.configKey === next) {
+          k = j;
+          break;
+        }
+      }
+      if (k >= 0) {
+        const snap = routingSnapshots[k] ?? {};
+        const sourceRouting = pickRouting(runs[runs.length - 1]?.tags ?? {});
+        for (const rk of ROUTING_TAGS) delete accumulatedTags[rk];
+        for (const [rk, rv] of Object.entries(snap)) accumulatedTags[rk] = rv;
+        for (const [rk, rv] of Object.entries(sourceRouting)) accumulatedTags[rk] = rv;
+      }
+      const ek = `${key}→${next}`;
+      edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
     }
 
     if (next) graphTracker?.trackHandoffSuccess(key, next);
@@ -337,9 +555,11 @@ export async function walkGraph(
   return {
     runs,
     tags: accumulatedTags,
+    inventory,
     skipped,
     ...(stalledAt ? { stalledAt } : {}),
     ...(pendingApproval ? { pendingApproval } : {}),
     ...(verificationFailed ? { verificationFailed } : {}),
+    ...(loopExhausted ? { loopExhausted } : {}),
   };
 }
