@@ -1,18 +1,24 @@
 #!/usr/bin/env node
 /**
- * PreToolUse gate: don't let a PR leave the machine before AutoFactory has run.
+ * PreToolUse gate: don't let an `autofactory`-labeled PR leave the machine
+ * before AutoFactory has run.
  *
  * Wired in .claude/settings.json against the Bash tool, this intercepts
  * `git push` and `gh pr create` and checks the run record the `autofactory`
  * CLI writes at `<git-dir>/autofactory-last-run.json` (dry runs don't write
  * one). Decisions:
  *
+ *   - PR / create command is not labeled `autofactory` → allow
+ *     (bugfixes, chores, docs, etc. skip AutoFactory).
  *   - no record, or record from another branch → DENY, with the fix
  *     ("run /autofactory") fed back to Claude.
  *   - record says the review REJECTED the change (or a deterministic check
  *     failed) → ASK the human — a red verdict is a review opinion, not a
  *     pipeline failure, so the human may knowingly push anyway.
  *   - otherwise → allow.
+ *
+ * Opt-in label (case-insensitive): `autofactory`. Matches the GitHub Action
+ * gate in `.github/workflows/auto-factory.yml`.
  *
  * Deliberately branch-granular, not content-granular: committing the agents'
  * edits (or small follow-ups) after a run must not re-trip the gate. "Re-run
@@ -27,6 +33,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
+/** Label that means "new feature — AutoFactory required" (Action + local gate). */
+const AUTOFACTORY_LABEL = "autofactory";
+
 function decide(permissionDecision, reason) {
   console.log(
     JSON.stringify({
@@ -34,6 +43,46 @@ function decide(permissionDecision, reason) {
     }),
   );
   process.exit(0);
+}
+
+function normalizeLabel(label) {
+  return String(label ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function hasAutofactoryLabel(labels) {
+  return labels.some((l) => normalizeLabel(l) === AUTOFACTORY_LABEL);
+}
+
+/**
+ * Labels passed to `gh pr create` via repeated `--label` / `-l` flags.
+ * Does not shell-parse quoted values with spaces beyond a simple token grab —
+ * prefer `--label autofactory`.
+ */
+function labelsFromPrCreateCommand(command) {
+  const labels = [];
+  const re = /(?:^|\s)(?:--label|-l)\s+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
+  let m;
+  while ((m = re.exec(command))) {
+    labels.push(m[1] ?? m[2] ?? m[3]);
+  }
+  return labels;
+}
+
+/** Open PR labels for the current branch, or null if none / gh unavailable. */
+function labelsForBranch() {
+  try {
+    const raw = execFileSync(
+      "gh",
+      ["pr", "view", "--json", "labels", "--jq", ".labels[].name"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+    if (!raw) return [];
+    return raw.split("\n").map((l) => l.trim()).filter(Boolean);
+  } catch {
+    return null;
+  }
 }
 
 try {
@@ -71,11 +120,39 @@ try {
     decide("allow", `no AutoFactory gate on '${branch}'`);
   }
 
+  // Opt-in: unlabeled / non-feature PRs skip AutoFactory entirely.
+  let labels = [];
+  if (isPrCreate) {
+    labels = labelsFromPrCreateCommand(command);
+    if (!hasAutofactoryLabel(labels)) {
+      decide(
+        "allow",
+        "gh pr create without `autofactory` label — AutoFactory gate skipped",
+      );
+    }
+  } else {
+    const prLabels = labelsForBranch();
+    if (prLabels === null) {
+      decide(
+        "allow",
+        "no open PR for this branch — AutoFactory gate skipped (add the `autofactory` label when you open a feature PR)",
+      );
+    }
+    labels = prLabels;
+    if (!hasAutofactoryLabel(labels)) {
+      const shown = labels.length ? labels.join(", ") : "none";
+      decide(
+        "allow",
+        `PR labels [${shown}] do not include \`autofactory\` — AutoFactory gate skipped`,
+      );
+    }
+  }
+
   const recordPath = join(gitDir, "autofactory-last-run.json");
   if (!existsSync(recordPath)) {
     decide(
       "deny",
-      `AutoFactory has not run on branch '${branch}'. Run /autofactory on the change set first (a dry run does not count), then push.`,
+      `PR labeled \`autofactory\` on branch '${branch}', but AutoFactory has not run. Run /autofactory on the change set first (a dry run does not count), then push.`,
     );
   }
   let record;
@@ -87,7 +164,7 @@ try {
   if (!record || record.branch !== branch) {
     decide(
       "deny",
-      `AutoFactory last ran on branch '${record?.branch ?? "(unknown)"}', not '${branch}'. Run /autofactory on this branch first, then push.`,
+      `PR labeled \`autofactory\` requires AutoFactory on '${branch}', but the last run was on '${record?.branch ?? "(unknown)"}'. Run /autofactory on this branch first, then push.`,
     );
   }
   if (record.outcome === "rejected" || record.outcome === "verification-failed" || record.outcome === "incomplete") {

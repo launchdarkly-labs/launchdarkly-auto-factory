@@ -186,8 +186,9 @@ To run on the **Cursor** provider instead, copy `bootstrap/github-action-templat
 
 ### 3. Open a pull request
 
-Write the change normally, with no flag. The chain runs on every PR
-(opened/synchronize/reopened) and takes a few minutes. On a flag-worthy PR you get:
+Write the change normally, with no flag. The chain runs when a PR carries the
+`autofactory` label (opened/synchronize/reopened/labeled) and takes a few
+minutes — opt-in for new features, not every PR. On a flag-worthy PR you get:
 
 - a string multivariate flag in the app project (`control` + `v1`), targeting **off** in all
   environments — follow-up PRs iterate it with new variations (`v2`, `v3`, …) or ride an

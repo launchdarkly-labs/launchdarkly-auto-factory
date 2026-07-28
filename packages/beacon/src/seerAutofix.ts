@@ -151,9 +151,26 @@ export async function triggerSeerOnRevert(
       return;
     }
 
-    const issue = await findRelatedSentryIssue(settings, ctx);
+    let issue;
+    try {
+      issue = await findRelatedSentryIssue(settings, ctx);
+    } catch (e) {
+      // Auth/scope failures used to be swallowed inside findRelatedIssue and
+      // logged as "no matching issue" — hide the real 403 (missing
+      // project:read / event:read on SENTRY_AUTH_TOKEN).
+      console.warn(
+        `${tag}: Sentry issue search failed (check SENTRY_AUTH_TOKEN scopes — need project:read + event:read, and event:write for Autofix): ` +
+          `${e instanceof Error ? e.message : e}`,
+      );
+      return;
+    }
     if (!issue) {
-      console.warn(`${tag}: no matching Sentry issue in the last 24h — Autofix skipped`);
+      console.warn(
+        `${tag}: no matching Sentry issue in the last 24h — Autofix skipped ` +
+          `(searched feature:/flag: tags derived from '${ctx.flagKey}'` +
+          (ctx.targetVariation ? ` / ${ctx.targetVariation}` : "") +
+          `). Tag treatment-path errors with feature:<slug> or flag:<flagKey>.`,
+      );
       return;
     }
 

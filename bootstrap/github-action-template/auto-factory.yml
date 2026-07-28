@@ -1,16 +1,21 @@
 # Drop this into your app repo at .github/workflows/auto-factory.yml
 #
-# Phase 1 runs on every PR (opened/updated). The agent chain runs on the
-# Anthropic API by default. The auto-factory-ai-provider flag in the factory
-# project selects the backend; it is optional and defaults to "anthropic" when
-# absent. With flag creation and code changes enabled, the agents create a real
-# flag (targeting off), wire it into the code, instrument metrics, add tests,
-# and push to the PR branch.
+# Phase 1 is OPT-IN via the PR label `autofactory` — intended for user-created
+# new features, not every PR (docs, chores, bugfixes behind an existing flag).
+# Add the label when opening/updating a feature PR (or when you want the chain
+# to run). Bugfixes and unlabeled PRs skip the job.
+#
+# The agent chain runs on the Anthropic API by default. The
+# auto-factory-ai-provider flag in the factory project selects the backend; it
+# is optional and defaults to "anthropic" when absent. With flag creation and
+# code changes enabled, the agents create a real flag (targeting off), wire it
+# into the code, instrument metrics, add tests, and push to the PR branch.
 #
 # Per-step approval gates (optional): the auto-factory-approval-gates flag (an
 # array of agent node keys) pauses the chain before those steps. The run halts
 # and comments which label to add (af-approve:<step>); the `labeled` trigger
-# below makes adding that label re-run the chain so it proceeds past the gate.
+# below makes adding that label re-run the chain so it proceeds past the gate
+# (keep the `autofactory` label on the PR so the job still matches).
 #
 # Providers: this drop-in form works for the 'anthropic' (default) and 'vega'
 # backends. The 'cursor' backend can't run here — its @cursor/sdk dependency needs
@@ -31,12 +36,11 @@ permissions:
 jobs:
   auto-factory:
     runs-on: ubuntu-latest
-    # CI-loop guard (secondary). The primary guard is in the action itself: agent
-    # commits carry `[skip ci]`, so the agents' pushes don't create a workflow run
-    # at all (a job-level `if:` can't help — GitHub gates bot-triggered PR runs for
-    # approval at the RUN level, before job conditions evaluate). This `if` is just
-    # belt-and-suspenders in case a bot-triggered run is ever created and approved.
-    if: github.actor != 'github-actions[bot]'
+    # Opt-in: require the `autofactory` label (new features). Also skip the
+    # CI-loop bot actor. Primary loop guard is still `[skip ci]` on agent commits.
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.pull_request.labels.*.name, 'autofactory')
     steps:
       - uses: actions/checkout@v4
         with:

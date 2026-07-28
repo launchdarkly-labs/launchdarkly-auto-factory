@@ -72,39 +72,102 @@ export async function searchIssues(
 }
 
 /**
- * Prefer issues whose title/culprit mention the flag, then fall back to the
+ * Derive Sentry search tokens from an LD flag key.
+ *
+ * Apps rarely put the full flag key in the issue title/culprit. A common
+ * pattern is tagging errors as `feature:<slug>` while the flag is
+ * `enable-<slug>` (e.g. flag `enable-broken-sign-in` → tag `feature:broken-sign-in`).
+ * Searching only for the raw flag key returns zero hits; with swallowed API
+ * errors that used to look like "no matching issue".
+ */
+export function relatedIssueSearchTokens(flagKey: string): string[] {
+  const key = flagKey.trim();
+  if (!key) return [];
+  const tokens = new Set<string>([key]);
+  // enable-foo / show-foo / allow-foo → foo (feature tag convention)
+  const stripped = key.replace(/^(enable|show|allow|use|with|flag)-/i, "");
+  if (stripped && stripped !== key) tokens.add(stripped);
+  return [...tokens];
+}
+
+/** Build Sentry issue-search queries, most specific first. */
+export function buildRelatedIssueQueries(ctx: RelatedIssueContext): string[] {
+  const queries: string[] = [];
+  const tokens = ctx.flagKey ? relatedIssueSearchTokens(ctx.flagKey) : [];
+  for (const t of tokens) {
+    queries.push(`is:unresolved feature:${t}`);
+    queries.push(`is:unresolved flag:${t}`);
+    queries.push(`is:unresolved ${t}`);
+    if (ctx.targetVariation) {
+      queries.push(`is:unresolved feature:${t} ${ctx.targetVariation}`);
+    }
+  }
+  if (ctx.sha) queries.push(`is:unresolved release:${ctx.sha}`);
+  queries.push("is:unresolved");
+  // De-dupe while preserving order
+  return [...new Set(queries)];
+}
+
+function issueMentionsFlag(issue: SentryIssueSummary, flagKey: string): boolean {
+  const hay = `${issue.title ?? ""} ${issue.culprit ?? ""} ${issue.shortId ?? ""}`;
+  if (hay.includes(flagKey)) return true;
+  for (const t of relatedIssueSearchTokens(flagKey)) {
+    if (hay.includes(t)) return true;
+  }
+  return false;
+}
+
+/**
+ * Prefer issues tagged/titled for the flag (feature:/flag: search), then the
  * noisiest recent unresolved issue. Shared by metrics-author estate picture
  * and Beacon Seer (ADR 0014/0015).
+ *
+ * API failures are NOT swallowed into a silent null — if every query errors
+ * (e.g. 403 missing `project:read` / `event:read` on the token), the last
+ * error is rethrown so Beacon can log "permission denied" instead of the
+ * misleading "no matching Sentry issue".
  */
 export async function findRelatedIssue(
   conn: SentryConnection,
   ctx: RelatedIssueContext,
 ): Promise<SentryIssueSummary | null> {
   const statsPeriod = ctx.statsPeriod ?? "24h";
-  const queries = [
-    ctx.flagKey ? `is:unresolved ${ctx.flagKey}` : null,
-    ctx.flagKey && ctx.targetVariation ? `is:unresolved ${ctx.flagKey} ${ctx.targetVariation}` : null,
-    ctx.sha ? `is:unresolved release:${ctx.sha}` : null,
-    "is:unresolved",
-  ].filter((q): q is string => Boolean(q));
+  const queries = buildRelatedIssueQueries(ctx);
+  let lastError: Error | null = null;
+  let sawSuccessfulEmpty = false;
+  let fallback: SentryIssueSummary | null = null;
 
   for (const query of queries) {
     try {
-      const items = await searchIssues(conn, { query, statsPeriod, limit: 5, sort: "freq" });
-      if (items.length === 0) continue;
+      const items = await searchIssues(conn, { query, statsPeriod, limit: 10, sort: "freq" });
+      if (items.length === 0) {
+        sawSuccessfulEmpty = true;
+        continue;
+      }
       if (ctx.flagKey) {
-        const flagged = items.find(
-          (i) =>
-            (i.title ?? "").includes(ctx.flagKey!) ||
-            (i.culprit ?? "").includes(ctx.flagKey!),
-        );
+        const flagged = items.find((i) => issueMentionsFlag(i, ctx.flagKey!));
         if (flagged) return flagged;
+        // A feature:/flag: query that returned hits is already scoped — take top.
+        if (query.includes("feature:") || query.includes("flag:")) {
+          return items[0]!;
+        }
+        // Free-text / bare unresolved: keep as fallback, keep looking for a
+        // better tagged match from earlier-specific queries that returned empty.
+        fallback ??= items[0]!;
+        continue;
       }
       return items[0]!;
-    } catch {
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
       continue;
     }
   }
+
+  if (fallback) return fallback;
+  // Only treat as "no issues" when at least one query succeeded with [].
+  // If every attempt threw (auth/scope), surface that — callers used to log
+  // a false "no matching Sentry issue".
+  if (lastError && !sawSuccessfulEmpty) throw lastError;
   return null;
 }
 

@@ -75,6 +75,12 @@ On `reverted`, when `BEACON_SEER_AUTOFIX=true` and Sentry credentials are set,
 Beacon searches for a related Sentry issue and starts Seer Autofix
 (`stopping_point: open_pr` by default) — see ADR 0014 / `src/seerAutofix.ts`.
 
+**Seer token scopes.** `SENTRY_AUTH_TOKEN` must allow listing issues
+(`project:read`, `event:read`) and starting Autofix (`event:write` / Seer
+entitlement). A 403 on issue search is logged explicitly — it used to look like
+"no matching issue". Matching prefers `feature:<slug>` / `flag:<flagKey>` tags
+(e.g. flag `enable-broken-sign-in` → search `feature:broken-sign-in`).
+
 ## Config surface
 
 Read from the repo `config/` dir + env:

@@ -50,6 +50,31 @@ describe("sentryClient searchIssues / findRelatedIssue", () => {
     assert.equal(related?.id, "2");
   });
 
+  it("matches feature:broken-sign-in for enable-broken-sign-in (coffee-lab shape)", async () => {
+    const seen: string[] = [];
+    mockFetch((url) => {
+      seen.push(decodeURIComponent(url));
+      if (url.includes("feature%3Abroken-sign-in") || url.includes("feature:broken-sign-in")) {
+        return {
+          status: 200,
+          body: [
+            {
+              id: "7636790656",
+              shortId: "COFFEE-LAB-11",
+              title: 'error: relation "usernames" does not exist',
+              culprit: "POST /api/auth/login",
+            },
+          ],
+        };
+      }
+      // Raw flag-key free-text search returns nothing (real Sentry behavior).
+      return { status: 200, body: [] };
+    });
+    const related = await findRelatedIssue(conn, { flagKey: "enable-broken-sign-in" });
+    assert.equal(related?.shortId, "COFFEE-LAB-11");
+    assert.ok(seen.some((u) => u.includes("feature:broken-sign-in") || u.includes("feature%3Abroken-sign-in")));
+  });
+
   it("falls back to top issue when flag not in titles", async () => {
     mockFetch(() => ({
       status: 200,
@@ -57,6 +82,14 @@ describe("sentryClient searchIssues / findRelatedIssue", () => {
     }));
     const related = await findRelatedIssue(conn, { flagKey: "missing-flag" });
     assert.equal(related?.id, "9");
+  });
+
+  it("rethrows when every Sentry query fails (e.g. 403 missing scopes)", async () => {
+    mockFetch(() => ({ status: 403, body: { detail: "You do not have permission to perform this action." } }));
+    await assert.rejects(
+      () => findRelatedIssue(conn, { flagKey: "enable-broken-sign-in" }),
+      /Sentry issues HTTP 403/,
+    );
   });
 });
 

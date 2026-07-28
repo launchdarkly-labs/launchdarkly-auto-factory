@@ -1,6 +1,9 @@
 # Drop this into your app repo at .github/workflows/auto-factory.yml when you want
 # Phase 1 to run on the CURSOR provider (Cursor agents via @cursor/sdk).
 #
+# Phase 1 is OPT-IN via the PR label `autofactory` — for user-created new
+# features, not every PR. Add the label when you want the chain to run.
+#
 # Why this differs from the plain template: the Cursor provider lazy-loads
 # @cursor/sdk, which needs node_modules — a bare `uses: <owner>/...@main` action
 # ships no node_modules, so it can't run Cursor. This workflow instead checks the
@@ -26,9 +29,11 @@ permissions:
 jobs:
   auto-factory:
     runs-on: ubuntu-latest
-    # CI-loop guard (secondary). The primary guard is in the action: agent commits
-    # carry [skip ci], so the agents' pushes never create a workflow run.
-    if: github.actor != 'github-actions[bot]'
+    # Opt-in: require the `autofactory` label (new features). Also skip the
+    # CI-loop bot actor. Primary loop guard is still `[skip ci]` on agent commits.
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.pull_request.labels.*.name, 'autofactory')
     steps:
       # The code under analysis = the PR's head branch (so agent commits push back cleanly).
       - name: Check out the PR code

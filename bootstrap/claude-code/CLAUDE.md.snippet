@@ -2,7 +2,9 @@
 
 ## AutoFactory (LaunchDarkly)
 
-Before pushing a branch or opening a PR, run `/autofactory` on the change set.
+Before pushing or opening a **feature** PR (GitHub label `autofactory`),
+run `/autofactory` on the change set. Bugfix / chore / unlabeled PRs skip
+the gate and the GitHub Action.
 It researches the change and, when flag-worthy, creates a feature flag
 (targeting off) with the behavior wired behind it, guarded-release metrics with
 instrumentation, flag-on/flag-off tests, and a release manifest under
