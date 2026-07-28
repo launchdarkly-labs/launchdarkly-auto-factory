@@ -94,7 +94,7 @@ the registry, the graph, and the instructions all agree.
 ## Handoff fields the walker honors
 
 Each graph edge's `handoff` object may carry: `require_tags`, `skip_if_tags`,
-`max_turns`, `request_type`, and `capabilities`.
+`max_turns`, `request_type`, `capabilities`, and `max_visits`.
 
 `capabilities` is a string array granting the **target** node tool access on the
 Anthropic provider:
@@ -125,6 +125,47 @@ Anthropic provider:
   directory). Allowlisted to launchdarkly.com/docs, size-capped, budgeted at 8
   fetches per node run, and fail-soft. Each granted agent's instructions carry
   a curated page shortlist.
+
+### `max_visits` — bounded loop-back edges
+
+`max_visits` is how you make the graph **iterate**. A loop-back edge (one whose
+target has already run earlier in the chain — e.g. `code-reviewer →
+research-planner` to re-plan a rejection, or `flag-testing → flag-implementer` to
+fix failing tests) must carry `max_visits: N` to be allowed to loop: it may be
+traversed at most N times (N re-runs; hard-capped at 10 in code). Identification
+is **explicit** — the walker caps only edges that carry `max_visits`, never
+untagged forward/rejoin edges — so tag exactly the loop-closing edge(s); nested
+loops tag each loop edge. This is config, not code: the graph owns *which edges
+loop and their budget*; the code owns the guarantees (the per-edge hard cap and a
+run-level backstop) that a graph edit can't disable.
+
+When a loop re-enters a node, the walker **rewinds routing/verdict tags** (the
+`production: "llm"` tags — `review_approved`, `risk_score`, …) to the state before
+that node last ran, then overlays the loop source's routing tags as the trigger,
+so the re-run starts clean rather than inheriting a stale downstream verdict.
+**Tool-produced facts** (`production: "tool"` — `flag_key`, `metric_keys`, …) are
+never rewound: they accumulate into a run *inventory* that reporting and the
+approval guard read, so a rewind can't erase the record of resources that really
+exist. A re-entered node's prompt gets a `REWORK ITERATION N` preamble listing
+that inventory (see the agents' "Rework iterations" sections).
+
+If a loop does not converge within budget — or an untagged cycle runs to the
+run-level cap — the run reports `loopExhausted`: a hard failure (red PR check,
+non-zero exit), never a misleading "approved". Because the walker executes the
+graph LaunchDarkly serves at runtime (not this committed copy), adding a
+back-edge to a **served** graph is a live behavior change: previously such a
+cycle terminated silently; now it iterates to budget then, if it hasn't
+converged, goes red. `npm run check:configs` enforces that every cycle in the
+*committed* graph carries a `max_visits` and that `max_visits ∈ [1, 10]`, but it
+cannot see the runtime graph — the run-level cap is the backstop there.
+
+Two behaviors worth knowing: (1) a tag that is neither `llm` nor `tool` in
+`tags.json` is treated like a fact (never rewound) but is not inventoried, so
+avoid routing on unregistered LLM-produced tags across a loop; (2) execution-
+envelope inheritance (`max_turns`/`capabilities`/`request_type`) also applies when
+a node is re-entered via any edge that omits those fields, including a forward
+rejoin edge — grants widen to the first-entry values rather than the built-in
+default.
 
 Put grants here so "which agent can write" is config, not code. When an edge
 omits `capabilities`, the runner falls back to a built-in per-config-key map

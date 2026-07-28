@@ -287,7 +287,25 @@ function describeStall(stall: StallInfo): string {
  * the exact label to add to proceed. This is the human-readable view; the label
  * chips are the at-a-glance approved state.
  */
-function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNode: string): string {
+/**
+ * The one "what's been created / what approval does" sentence, shared by the PR
+ * comment and the `action_required` check-run summary so they can't diverge.
+ * Only claims a "prior iteration" when a loop actually re-ran a node (`reworked`)
+ * — on a first pass the gate pauses before the gated step, so "nothing created
+ * for this or later steps" stays accurate even if earlier steps created things.
+ */
+function gateStatusLine(pendingNode: string, reworked: boolean, inventory: Record<string, string>): string {
+  const created = [
+    inventory.flag_key ? `flag \`${inventory.flag_key}\`` : "",
+    inventory.metric_keys ? `metric(s) \`${inventory.metric_keys}\`` : "",
+  ].filter(Boolean);
+  if (reworked && created.length) {
+    return `The chain paused before **${pendingNode}**. A prior iteration already created ${created.join(" and ")}; approving may re-run this step (up to its \`max_visits\` budget) against new input.`;
+  }
+  return `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`;
+}
+
+function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNode: string, statusLine: string): string {
   const lines = gatedSteps.map((step) => {
     if (approved.has(step)) return `- ✓ \`${step}\` — approved`;
     if (step === pendingNode) return `- ⏸ \`${step}\` — **awaiting approval**: add the label \`${approveLabel(step)}\``;
@@ -296,7 +314,7 @@ function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNo
   return [
     "### LaunchDarkly Auto-Factory — Phase 1 ⏸ awaiting approval",
     "",
-    `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`,
+    statusLine,
     "Approve by adding the labeled step below; the chain resumes on the next run.",
     "",
     ...lines,
@@ -554,7 +572,11 @@ async function main(): Promise<void> {
     const label = approveLabel(node);
     await ensureLabel(context.REPO, label, process.env.GITHUB_TOKEN);
     console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the PR label '${label}' to proceed.`);
-    const summary = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node);
+    // One status sentence, reused by the PR comment and the check-run summary so
+    // they can't diverge; "prior iteration" wording only when a loop re-ran a node.
+    const reworked = walk.runs.some((r) => r.iteration > 1);
+    const statusLine = gateStatusLine(node, reworked, walk.inventory);
+    const summary = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node, statusLine);
     await postPrComment(summary, { prNumber: context.PR_NUMBER, repo: context.REPO });
     // Carry the pause as a distinct `action_required` check run rather than a red
     // failure, so it doesn't read as a pipeline error or a reviewer rejection
@@ -564,7 +586,7 @@ async function main(): Promise<void> {
       headSha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Approval required before ${node}`,
-      summary: `The AutoFactory chain paused before \`${node}\`. Nothing was created for this or later steps. Add the PR label \`${label}\` to approve; the chain resumes on the next run.`,
+      summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`,
     });
     return;
   }

@@ -15,6 +15,33 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-07-28 (bounded loop-back edges)
+
+### ✅ `max_visits` handoff field + rework-aware agents
+- **Why:** the walker silently dropped loop-back edges (a cycle looked like a
+  clean success). Bounded loops let the graph iterate — re-plan on a rejection,
+  fix failing tests — without redoing irreversible work or running forever.
+- **New handoff field `max_visits`:** tag a loop-closing edge with `max_visits: N`
+  (integer, hard-capped at 10) to let it be traversed N times. Only tagged edges
+  are capped; untagged forward/rejoin edges never are. A non-converged loop
+  reports `loopExhausted` — a hard failure (red check / non-zero exit), never
+  "approved". See README → "Handoff fields the walker honors → `max_visits`".
+- **Agent instructions (all six agents):** added a "Rework iterations" section —
+  on a `REWORK ITERATION N` prompt, amend/reuse the listed resources
+  (`use_existing_flag`/`add_variation`, never `create_flag`; update the existing
+  manifest) instead of recreating. The research-planner additionally must not set
+  `skip_flagging` once a flag exists in a prior iteration (would orphan it).
+- **Behavior change for served cyclic graphs:** the walker runs the LD-served
+  graph, so adding a back-edge in LaunchDarkly is live. A served cycle that used
+  to terminate silently now iterates to its budget and, if unconverged, goes red.
+  `check:configs` enforces `max_visits ∈ [1,10]` and that every *committed* cycle
+  carries a budget; the run-level cap backstops runtime-only cycles.
+- **Runtime (tooling — this branch):** walker per-edge budget + routing/inventory
+  tag split + rewind; approval orphan/false-green guard; loop-exhausted reporting
+  across all front ends; pre-push gate hook inverted to a fail-closed allowlist.
+
+---
+
 ## 2026-07-20 (provider-aware model routing)
 
 ### ✅ run.provider context attribute + provider-aware A/B rules

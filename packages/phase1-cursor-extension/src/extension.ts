@@ -146,6 +146,9 @@ async function runOnce(context: vscode.ExtensionContext, reason: string): Promis
         failed: (m) => output.appendLine(`ERROR: ${m}`),
       };
 
+      // Remember each gate answer for this run so a node re-entered by a loop
+      // (max_visits > 1) doesn't re-prompt the human on every iteration.
+      const gateAnswers = new Map<string, boolean>();
       try {
         const result = await runPhase1({
           workspaceRoot: root,
@@ -157,12 +160,16 @@ async function runOnce(context: vscode.ExtensionContext, reason: string): Promis
           reporter,
           // Approval gate → a modal that blocks the run until the human decides.
           confirmGate: async (nodeKey) => {
+            const prior = gateAnswers.get(nodeKey);
+            if (prior !== undefined) return prior;
             const choice = await vscode.window.showInformationMessage(
               `LaunchDarkly AutoFactory: approve running "${nodeTitle(nodeKey)}"?`,
-              { modal: true, detail: "This step is gated by auto-factory-approval-gates. Approve to run it (and continue), or stop the chain before it." },
+              { modal: true, detail: "This step is gated by auto-factory-approval-gates. Approve to run it (and continue), or stop the chain before it. A looped step is only asked once per run." },
               "Approve",
             );
-            return choice === "Approve";
+            const ok = choice === "Approve";
+            gateAnswers.set(nodeKey, ok);
+            return ok;
           },
         });
         const links = buildCreatedLinks(cfg.appProjectKey, result.inventory);

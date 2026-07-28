@@ -127,6 +127,70 @@ for (const [tag, def] of Object.entries(registry)) {
   }
 }
 
+// --- Check 6: loop-back budgets + walker tag-class sync -------------------
+// 6a: `max_visits` on any edge must be an integer in [1, 10]. 6b: removing every
+// max_visits-tagged edge must leave an ACYCLIC graph — i.e. every cycle carries a
+// budget on at least one edge, so the walker can't run it to the node-run cap.
+const MAX_VISITS_HARD_CAP = 10;
+for (const file of listJson(GRAPH_DIR)) {
+  const graph = JSON.parse(readFileSync(file, "utf8"));
+  const adjUntagged = new Map(); // source -> [target] for edges WITHOUT max_visits
+  for (const edge of graph.edges ?? []) {
+    const mv = edge.handoff?.max_visits;
+    if (mv !== undefined) {
+      if (!Number.isInteger(mv) || mv < 1 || mv > MAX_VISITS_HARD_CAP) {
+        fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has max_visits=${JSON.stringify(mv)} (must be an integer in [1, ${MAX_VISITS_HARD_CAP}]).`);
+      }
+    } else {
+      if (!adjUntagged.has(edge.sourceConfig)) adjUntagged.set(edge.sourceConfig, []);
+      adjUntagged.get(edge.sourceConfig).push(edge.targetConfig);
+    }
+  }
+  // DFS cycle detection over the untagged subgraph (white/gray/black).
+  const color = new Map();
+  let cycleNode = null;
+  const visit = (n) => {
+    color.set(n, "gray");
+    for (const m of adjUntagged.get(n) ?? []) {
+      const c = color.get(m);
+      if (c === "gray") { cycleNode = m; return true; }
+      if (c === undefined && visit(m)) return true;
+    }
+    color.set(n, "black");
+    return false;
+  };
+  for (const n of adjUntagged.keys()) {
+    if (color.get(n) === undefined && visit(n)) break;
+  }
+  if (cycleNode) {
+    fail(`graph ${basename(file)}: a cycle through '${cycleNode}' has no max_visits on any of its edges — the walker would run it to the node-run cap. Tag the loop-back edge with max_visits.`);
+  }
+}
+// 6c: the walker's hard-coded ROUTING_TAGS/FACT_TAGS (graphWalker.ts) must match
+// tags.json `production` (llm → routing/rewound, tool → fact/inventory), or a
+// loop rewind would drop/keep the wrong tags.
+try {
+  const walkerSrc = readFileSync("packages/shared/src/graphWalker.ts", "utf8");
+  const parseSet = (name) => {
+    const m = walkerSrc.match(new RegExp(`const ${name} = new Set<string>\\(\\[([\\s\\S]*?)\\]\\)`));
+    return m ? new Set([...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1])) : null;
+  };
+  const routing = parseSet("ROUTING_TAGS");
+  const fact = parseSet("FACT_TAGS");
+  if (!routing || !fact) {
+    fail("graphWalker.ts: could not parse ROUTING_TAGS/FACT_TAGS for the tag-class sync check.");
+  } else {
+    for (const [tag, def] of Object.entries(registry)) {
+      if (def.production === "llm" && !routing.has(tag)) fail(`graphWalker ROUTING_TAGS is missing '${tag}' (tags.json production:"llm").`);
+      if (def.production === "tool" && !fact.has(tag)) fail(`graphWalker FACT_TAGS is missing '${tag}' (tags.json production:"tool").`);
+    }
+    for (const t of routing) if (registry[t]?.production !== "llm") fail(`graphWalker ROUTING_TAGS has '${t}', not production:"llm" in tags.json.`);
+    for (const t of fact) if (registry[t]?.production !== "tool") fail(`graphWalker FACT_TAGS has '${t}', not production:"tool" in tags.json.`);
+  }
+} catch (e) {
+  fail(`graphWalker.ts: could not run tag-class sync check: ${e.message}`);
+}
+
 // --- Check 4: README ⟷ registry -------------------------------------------
 try {
   const md = readFileSync(README, "utf8");

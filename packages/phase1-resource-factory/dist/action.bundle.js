@@ -33597,8 +33597,42 @@ function extractConfigStamp(description) {
 }
 
 // ../shared/dist/graphWalker.js
+var MAX_VISITS_HARD_CAP = 10;
+var ROUTING_TAGS = /* @__PURE__ */ new Set([
+  "skip_flagging",
+  "flag_worthy",
+  "flag_action",
+  "needs_tests",
+  "review_approved",
+  "risk_level",
+  "risk_score"
+]);
+var FACT_TAGS = /* @__PURE__ */ new Set([
+  "flag_ready",
+  "flag_created",
+  "flag_key",
+  "flag_variation",
+  "metrics_created",
+  "metric_keys",
+  "metric_event_keys",
+  "tests_last_run"
+]);
+function describeLoopExhausted(info) {
+  if (info.reason === "run-cap") {
+    return `loop did not converge at '${info.node}': the run hit the total-node-run cap \u2014 likely an untagged cycle in the graph.`;
+  }
+  const edges = info.exhausted.map((e) => `edge \u2192 ${e.target} spent its budget (${e.traversals}/${e.maxVisits} traversals)`).join("; ");
+  return `loop did not converge at '${info.node}'; ${edges}. The chain could not advance within budget.`;
+}
 function tagsMatch(tags, cond) {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
+}
+function pickRouting(tags) {
+  const out = {};
+  for (const [k, v] of Object.entries(tags))
+    if (ROUTING_TAGS.has(k))
+      out[k] = v;
+  return out;
 }
 function handoffTags(handoff, field) {
   const v = handoff?.[field];
@@ -33616,21 +33650,32 @@ function handoffStringArray(handoff, field) {
   const v = handoff?.[field];
   return Array.isArray(v) ? v.filter((x) => typeof x === "string") : void 0;
 }
-function buildPrompt(hasInbound, ctx) {
+function reworkPreamble(iteration, inventory) {
+  const facts = Object.entries(inventory).filter(([, v]) => v).map(([k, v]) => `- ${k}: ${v}`);
+  const factBlock = facts.length ? `
+Resources already created in a prior iteration (amend or reuse \u2014 do NOT recreate):
+${facts.join("\n")}` : "";
+  return `=== REWORK ITERATION ${iteration} ===
+This is a re-run of an earlier step; a previous iteration already executed. The brief below explains what to change.${factBlock}
+=== END REWORK CONTEXT ===`;
+}
+function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx) {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
     ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
   ].filter(Boolean).join("\n");
-  if (!hasInbound) {
-    return `${header}${ctx.PR_BODY ? `
-
-${ctx.PR_BODY}` : ""}`.trim();
+  const parts = [header];
+  if (iteration > 1)
+    parts.push(reworkPreamble(iteration, inventory));
+  if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY)
+    parts.push(ctx.PR_BODY);
+  if (hasInbound) {
+    const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
+    if (brief)
+      parts.push(brief);
   }
-  const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
-  return `${header}
-
-${brief}`.trim();
+  return parts.filter(Boolean).join("\n\n").trim();
 }
 function lastAssistantText(result) {
   const finals = result.messages.filter((m) => m.role === "assistant");
@@ -33652,29 +33697,56 @@ function allNodeKeys(graphDef) {
 async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate, judgeHook, verifier) {
   const runs = [];
   const accumulatedTags = {};
+  const inventory = {};
   const ctx = { ...context };
   const gatedSteps = new Set(gate?.steps ?? []);
-  const visited = /* @__PURE__ */ new Set();
+  const edgeCounts = /* @__PURE__ */ new Map();
+  const routingSnapshots = [];
+  const entryEdgeFields = /* @__PURE__ */ new Map();
+  const runCountByKey = /* @__PURE__ */ new Map();
+  const rootKey = graphDef.getConfig().root;
+  const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
+  let totalRuns = 0;
   let node = graphDef.rootNode();
   let inboundHandoff;
   let stalledAt;
   let pendingApproval;
   let verificationFailed;
-  while (node && !visited.has(node.getKey())) {
+  let loopExhausted;
+  while (node) {
     const key = node.getKey();
     if (gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
       pendingApproval = { node: key };
       onEvent?.({ type: "awaiting-approval", node: key });
       break;
     }
-    visited.add(key);
+    if (totalRuns >= maxTotalNodeRuns) {
+      loopExhausted = { node: key, reason: "run-cap", exhausted: [], tags: { ...accumulatedTags } };
+      onEvent?.({ type: "loop-exhausted", info: loopExhausted });
+      break;
+    }
+    totalRuns++;
+    const iteration = (runCountByKey.get(key) ?? 0) + 1;
+    runCountByKey.set(key, iteration);
+    routingSnapshots.push(pickRouting(accumulatedTags));
     const cfg = node.getConfig();
-    const maxTurns = handoffNumber(inboundHandoff, "max_turns");
-    const requestType = handoffString(inboundHandoff, "request_type");
-    const capabilities = handoffStringArray(inboundHandoff, "capabilities");
+    const inboundMaxTurns = handoffNumber(inboundHandoff, "max_turns");
+    const inboundRequestType = handoffString(inboundHandoff, "request_type");
+    const inboundCapabilities = handoffStringArray(inboundHandoff, "capabilities");
+    if (!entryEdgeFields.has(key)) {
+      entryEdgeFields.set(key, {
+        maxTurns: inboundMaxTurns,
+        requestType: inboundRequestType,
+        capabilities: inboundCapabilities
+      });
+    }
+    const entry = entryEdgeFields.get(key) ?? {};
+    const maxTurns = inboundMaxTurns ?? entry.maxTurns;
+    const requestType = inboundRequestType ?? entry.requestType;
+    const capabilities = inboundCapabilities ?? entry.capabilities;
     onEvent?.({ type: "node-start", configKey: key, index: runs.length });
     const tracker = cfg.createTracker();
-    const prompt = buildPrompt(inboundHandoff !== void 0, ctx);
+    const prompt = buildPrompt(key === rootKey, inboundHandoff !== void 0, iteration, inventory, ctx);
     const result = await runner.runNode({
       configKey: key,
       prompt,
@@ -33689,14 +33761,17 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
       ...cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}
     });
     Object.assign(accumulatedTags, result.tags);
+    for (const [k, v] of Object.entries(result.tags))
+      if (FACT_TAGS.has(k))
+        inventory[k] = v;
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
-    const run = { configKey: key, status: result.status, output, tags: result.tags };
+    const run = { configKey: key, status: result.status, output, tags: result.tags, iteration };
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
     if (judgeHook) {
       try {
-        await judgeHook({ configKey: key, cfg, input: prompt, output, tracker });
+        await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
       } catch (e) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
       }
@@ -33721,6 +33796,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     }
     let next = null;
     let nextHandoff;
+    let nextIsLoopEdge = false;
+    const budgetBlocked = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
       const require2 = handoffTags(h, "require_tags");
@@ -33729,8 +33806,19 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
       const skip = handoffTags(h, "skip_if_tags");
       if (skip && tagsMatch(accumulatedTags, skip))
         continue;
+      const rawMax = handoffNumber(h, "max_visits");
+      if (rawMax !== void 0) {
+        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)), MAX_VISITS_HARD_CAP);
+        const ek = `${key}\u2192${edge.key}`;
+        const traversals = edgeCounts.get(ek) ?? 0;
+        if (traversals >= maxVisits) {
+          budgetBlocked.push({ source: key, target: edge.key, traversals, maxVisits });
+          continue;
+        }
+      }
       next = edge.key;
       nextHandoff = h;
+      nextIsLoopEdge = rawMax !== void 0;
       break;
     }
     if (!next) {
@@ -33751,10 +33839,40 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
           unmet.push({ target: edge.key, requireMissing });
         }
       }
-      if (unmet.length > 0) {
+      if (budgetBlocked.length > 0) {
+        loopExhausted = {
+          node: key,
+          reason: "budget",
+          exhausted: budgetBlocked,
+          ...unmet.length > 0 ? { alsoUnmet: unmet } : {},
+          tags: { ...accumulatedTags }
+        };
+        onEvent?.({ type: "loop-exhausted", info: loopExhausted });
+      } else if (unmet.length > 0) {
         stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
+    }
+    if (next && nextIsLoopEdge) {
+      let k = -1;
+      for (let j = runs.length - 1; j >= 0; j--) {
+        if (runs[j]?.configKey === next) {
+          k = j;
+          break;
+        }
+      }
+      if (k >= 0) {
+        const snap = routingSnapshots[k] ?? {};
+        const sourceRouting = pickRouting(runs[runs.length - 1]?.tags ?? {});
+        for (const rk of ROUTING_TAGS)
+          delete accumulatedTags[rk];
+        for (const [rk, rv] of Object.entries(snap))
+          accumulatedTags[rk] = rv;
+        for (const [rk, rv] of Object.entries(sourceRouting))
+          accumulatedTags[rk] = rv;
+      }
+      const ek = `${key}\u2192${next}`;
+      edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
     }
     if (next)
       graphTracker?.trackHandoffSuccess(key, next);
@@ -33766,10 +33884,12 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
   return {
     runs,
     tags: accumulatedTags,
+    inventory,
     skipped,
     ...stalledAt ? { stalledAt } : {},
     ...pendingApproval ? { pendingApproval } : {},
-    ...verificationFailed ? { verificationFailed } : {}
+    ...verificationFailed ? { verificationFailed } : {},
+    ...loopExhausted ? { loopExhausted } : {}
   };
 }
 
@@ -33886,6 +34006,20 @@ function buildHandoffVerifier(opts) {
 // ../shared/dist/approval.js
 function decideApproval(verdict) {
   const base = { apply: false, noop: false, incomplete: false };
+  if (verdict.inconsistentSkip) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: "INCOMPLETE \u2014 a flag was created in an earlier iteration but the run now reports no flag needed (orphaned resource \u2014 clean up in LaunchDarkly)"
+    };
+  }
+  if (verdict.orphanedFlagKeys.length > 0) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: `INCOMPLETE \u2014 an earlier iteration created a different flag (${verdict.orphanedFlagKeys.join(", ")}) than the final one (orphaned \u2014 clean up in LaunchDarkly)`
+    };
+  }
   if (verdict.skipFlagging) {
     return { ...base, noop: true, reason: "no flag needed \u2014 nothing to review" };
   }
@@ -33897,7 +34031,7 @@ function decideApproval(verdict) {
   }
   return { ...base, apply: true, reason: "code review APPROVED" };
 }
-function interpretWalk(tags) {
+function interpretWalk(tags, inventory = {}, runs = []) {
   const rawDecision = (tags.review_approved ?? // canonical
   tags.review_decision ?? // legacy
   tags.decision ?? // legacy
@@ -33910,7 +34044,13 @@ function interpretWalk(tags) {
   "").toLowerCase();
   const risk = rawRisk === "low" || rawRisk === "medium" || rawRisk === "high" ? rawRisk : void 0;
   const skipFlagging = (tags.skip_flagging ?? "").toLowerCase() === "true";
-  return { reviewApproved, hasVerdict, risk, skipFlagging };
+  const flagWasCreated = inventory.flag_created?.toLowerCase() === "true" || inventory.flag_ready?.toLowerCase() === "true" || Boolean(inventory.flag_key);
+  const inconsistentSkip = skipFlagging && flagWasCreated;
+  const finalFlagKey = inventory.flag_key;
+  const orphanedFlagKeys = [
+    ...new Set(runs.map((r) => r.tags.flag_key).filter((k) => Boolean(k) && k !== finalFlagKey))
+  ];
+  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys };
 }
 
 // ../shared/dist/approvalGates.js
@@ -39791,7 +39931,17 @@ function describeStall(stall) {
   const edges = stall.unmet.map((u) => `edge \u2192 ${u.target} requires ${Object.entries(u.requireMissing).map(([k, v]) => `${k}=${v}`).join(", ")} (never produced)`).join("; ");
   return `chain stalled at '${stall.node}'; ${edges}. Downstream agents did not run.`;
 }
-function buildGateComment(gatedSteps, approved, pendingNode) {
+function gateStatusLine(pendingNode, reworked, inventory) {
+  const created = [
+    inventory.flag_key ? `flag \`${inventory.flag_key}\`` : "",
+    inventory.metric_keys ? `metric(s) \`${inventory.metric_keys}\`` : ""
+  ].filter(Boolean);
+  if (reworked && created.length) {
+    return `The chain paused before **${pendingNode}**. A prior iteration already created ${created.join(" and ")}; approving may re-run this step (up to its \`max_visits\` budget) against new input.`;
+  }
+  return `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`;
+}
+function buildGateComment(gatedSteps, approved, pendingNode, statusLine) {
   const lines = gatedSteps.map((step) => {
     if (approved.has(step)) return `- \u2713 \`${step}\` \u2014 approved`;
     if (step === pendingNode) return `- \u23F8 \`${step}\` \u2014 **awaiting approval**: add the label \`${approveLabel(step)}\``;
@@ -39800,7 +39950,7 @@ function buildGateComment(gatedSteps, approved, pendingNode) {
   return [
     "### LaunchDarkly Auto-Factory \u2014 Phase 1 \u23F8 awaiting approval",
     "",
-    `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`,
+    statusLine,
     "Approve by adding the labeled step below; the chain resumes on the next run.",
     "",
     ...lines
@@ -39940,7 +40090,7 @@ async function main() {
   const judgeHook = baseJudgeHook ? async (args) => {
     const results = await baseJudgeHook(args);
     for (const r of results) {
-      if (r.sampled && typeof r.score === "number") judgeScores.set(args.configKey, r.score);
+      if (r.sampled && typeof r.score === "number") judgeScores.set(`${args.configKey}#${args.iteration}`, r.score);
     }
     return results;
   } : void 0;
@@ -39960,19 +40110,23 @@ async function main() {
   if (stallText) console.log(`::warning::AutoFactory: ${stallText}`);
   const verifyText = walk2.verificationFailed ? `deterministic check failed after '${walk2.verificationFailed.node}': ` + walk2.verificationFailed.failures.map((f) => `[${f.name}] ${f.detail}`).join("; ") : "";
   if (verifyText) console.log(`::error::AutoFactory: ${verifyText}`);
+  const loopText = walk2.loopExhausted ? describeLoopExhausted(walk2.loopExhausted) : "";
+  if (loopText) console.log(`::error::AutoFactory: ${loopText}`);
   if (walk2.pendingApproval) {
     const node = walk2.pendingApproval.node;
     const label = approveLabel(node);
     await ensureLabel(context.REPO, label, process.env.GITHUB_TOKEN);
     console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the PR label '${label}' to proceed.`);
-    const summary2 = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node);
+    const reworked = walk2.runs.some((r) => r.iteration > 1);
+    const statusLine = gateStatusLine(node, reworked, walk2.inventory);
+    const summary2 = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node, statusLine);
     await postPrComment(summary2, { prNumber: context.PR_NUMBER, repo: context.REPO });
     await postCheckRun({
       repo: context.REPO,
       headSha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Approval required before ${node}`,
-      summary: `The AutoFactory chain paused before \`${node}\`. Nothing was created for this or later steps. Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
+      summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
     });
     return;
   }
@@ -39993,10 +40147,12 @@ async function main() {
     ...process.env.PR_BRANCH ? { prBranch: process.env.PR_BRANCH } : {}
   });
   if (intentReview.warning) console.log(`::warning::AutoFactory: ${intentReview.warning}`);
-  const verdict = interpretWalk(walk2.tags);
+  const verdict = interpretWalk(walk2.tags, walk2.inventory, walk2.runs);
   const decision = decideApproval(verdict);
   console.log(`Verdict \u2192 ${decision.reason}`);
-  if (decision.apply) {
+  if (walk2.loopExhausted) {
+    console.log("\u26A0 Loop did not converge \u2014 see the error above. This run is not applied.");
+  } else if (decision.apply) {
     console.log("\u2713 Changes approved and applied by the agents.");
   } else if (decision.noop) {
     console.log("\u2022 No flag needed \u2014 nothing to apply.");
@@ -40006,19 +40162,21 @@ async function main() {
     console.log("\u2717 Not applied \u2014 code review REJECTED.");
   }
   const agentRows = walk2.runs.map((r) => {
-    const judge = judgeScores.get(r.configKey);
+    const judge = judgeScores.get(`${r.configKey}#${r.iteration}`);
+    const label = r.iteration > 1 ? `\`${r.configKey}\` (iter ${r.iteration})` : `\`${r.configKey}\``;
     const tags = Object.entries(r.tags).map(([k, v]) => `${k}=${v}`).join(", ").slice(0, 140) || "\u2014";
-    return `| \`${r.configKey}\` | ${r.status} | ${judge !== void 0 ? judge.toFixed(2) : "\u2014"} | ${tags} |`;
+    return `| ${label} | ${r.status} | ${judge !== void 0 ? judge.toFixed(2) : "\u2014"} | ${tags} |`;
   });
   const summary = [
     "### LaunchDarkly Auto-Factory \u2014 Phase 1",
     "",
-    `**Verdict:** ${decision.reason}` + (policy.mode !== "yolo" ? ` _(approval mode: ${policy.mode}${policy.mode === "risk-threshold" ? ` @ ${policy.threshold}` : ""})_` : ""),
+    `**Verdict:** ${walk2.loopExhausted ? "loop did not converge \u2014 not applied" : decision.reason}` + (policy.mode !== "yolo" ? ` _(approval mode: ${policy.mode}${policy.mode === "risk-threshold" ? ` @ ${policy.threshold}` : ""})_` : ""),
     intentReview.line ?? "",
     intentReview.warning ? `**\u26A0 Release intent:** ${intentReview.warning}` : "",
     configDrift ? `**\u26A0 Config drift:** ${configDrift}` : "",
     kg ? `**Knowledge graph:** on \u2014 ${kg.graph.edges.filter((e) => e.kind === "service_calls").length} service edges (traces), ${kg.graph.edges.filter((e) => e.kind === "flag_wraps").length} wrap points (code refs)` + (kg.warnings.length ? `; \u26A0 ${kg.warnings.map((w) => w.split(" \u2014 ")[0]).join("; \u26A0 ")}` : "") : "",
     walk2.skipped.length ? `**Skipped:** ${walk2.skipped.join(", ")}` : "",
+    loopText ? `**\u27F3 Loop did not converge:** ${loopText}` : "",
     stallText ? `**\u26A0 Stalled:** ${stallText}` : "",
     verifyText ? `**\u26D4 Deterministic check failed:** ${verifyText}` : "",
     "",
@@ -40031,11 +40189,11 @@ async function main() {
     name: "AutoFactory \u2014 Phase 1",
     repo: context.REPO,
     headSha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
-    conclusion: !walk2.verificationFailed && (decision.apply || decision.noop) ? "success" : "failure",
-    title: walk2.verificationFailed ? `Deterministic check failed after ${walk2.verificationFailed.node}` : decision.reason,
+    conclusion: !walk2.verificationFailed && !walk2.loopExhausted && (decision.apply || decision.noop) ? "success" : "failure",
+    title: walk2.verificationFailed ? `Deterministic check failed after ${walk2.verificationFailed.node}` : walk2.loopExhausted ? `Loop did not converge at ${walk2.loopExhausted.node}` : decision.reason,
     summary
   });
-  if (walk2.verificationFailed || !decision.apply && !decision.noop) process.exitCode = 1;
+  if (walk2.verificationFailed || walk2.loopExhausted || !decision.apply && !decision.noop) process.exitCode = 1;
 }
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((e) => {
