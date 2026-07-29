@@ -5,7 +5,7 @@ import {
   seerSettingsFromEnv,
   startSeerAutofix,
   triggerSeerOnRevert,
-} from "../packages/beacon/src/seerAutofix.ts";
+} from "@auto-factory/beacon";
 
 describe("seerAutofix settings", () => {
   it("defaults to disabled", () => {

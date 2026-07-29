@@ -66,8 +66,9 @@ re-provisioned into a fresh project) to take effect.
 Shared **APP-project** metric definitions (ADR 0014). Provisioned into
 `LD_APP_PROJECT_KEY` (not the factory project) by `npm run bridge -- provision|upgrade`.
 Today: `sentry-errors-binary` and `sentry-errors-count` — fed by the
-LaunchDarkly↔Sentry metrics integration on event key `sentry-errors`. Metrics-
-author reuses these as the error killswitch when the target app has Sentry.
+LaunchDarkly↔Sentry metrics integration on event key `sentry-errors`. The
+metrics author's **`sentry` variation** (served via LD targeting; the `default`
+variation is the unchanged non-Sentry path) reuses these as the error killswitch.
 
 ## Canonical agent tags
 

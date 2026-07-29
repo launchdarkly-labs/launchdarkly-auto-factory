@@ -7,7 +7,7 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc -b",
-    "bundle": "esbuild src/action.ts --bundle --platform=node --format=esm --external:@cursor/sdk --external:@launchdarkly/observability-node --external:@opentelemetry/api --outfile=dist/action.bundle.js --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\""
+    "bundle": "esbuild src/action.ts --bundle --platform=node --format=esm --external:@cursor/sdk --external:@sentry/node --external:@launchdarkly/observability-node --external:@opentelemetry/api --outfile=dist/action.bundle.js --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\""
   },
   "dependencies": {
     "@auto-factory/shared": "*"

@@ -275,7 +275,6 @@ export class AnthropicAgentRunner implements AgentRunner {
     );
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : undefined;
 
-    const system = (req.instructions ?? "") + modeNote(caps);
     const model = anthropicModelId(req.model);
     // Parity with the Cursor runner's model log: the served variation's model is
     // what makes A/B run logs attributable without querying LD monitoring.
@@ -307,6 +306,12 @@ export class AnthropicAgentRunner implements AgentRunner {
       );
     }
     const tools = overlay.tools as Anthropic.Tool[];
+    // The Sentry note only belongs in the prompt when the variation actually
+    // attached query_sentry — the edge grant is a ceiling shared by variations
+    // (e.g. the metrics author's non-Sentry default), not the offered set.
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const system =
+      (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
     const toolCallsUsed = new Set<string>();
     const maxTurns = req.maxTurns ?? DEFAULT_MAX_TURNS;
 

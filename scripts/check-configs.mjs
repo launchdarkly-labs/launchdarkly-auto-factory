@@ -48,7 +48,10 @@ function listJson(dir) {
     return [];
   }
 }
-const instructionsOf = (p) => JSON.parse(readFileSync(p, "utf8")).variations?.[0]?.instructions ?? "";
+// All variations' instructions, joined: a tag counts as produced by the agent
+// when ANY variation mentions it (e.g. the metrics author's `sentry` variation).
+const instructionsOf = (p) =>
+  (JSON.parse(readFileSync(p, "utf8")).variations ?? []).map((v) => v?.instructions ?? "").join("\n");
 const edgeId = (from, to, kind) => `${from} -${kind}-> ${to}`;
 
 const violations = [];

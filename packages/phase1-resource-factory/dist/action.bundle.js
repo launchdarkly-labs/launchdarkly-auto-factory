@@ -39,6 +39,60 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 
+// ../shared/dist/env.js
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+function loadDotEnv(repoRoot = process.cwd()) {
+  if (loaded)
+    return;
+  loaded = true;
+  const path5 = resolve(repoRoot, ".env");
+  if (!existsSync(path5))
+    return;
+  for (const rawLine of readFileSync(path5, "utf8").split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || !line.includes("="))
+      continue;
+    const idx = line.indexOf("=");
+    const key = line.slice(0, idx).trim();
+    let val = line.slice(idx + 1).trim();
+    if (val.startsWith('"') && val.endsWith('"') || val.startsWith("'") && val.endsWith("'")) {
+      val = val.slice(1, -1);
+    }
+    if (process.env[key] === void 0)
+      process.env[key] = val;
+  }
+}
+function required(name) {
+  const v = process.env[name];
+  if (!v)
+    throw new Error(`Missing required env var: ${name}`);
+  return v;
+}
+function targetConnection() {
+  loadDotEnv();
+  return {
+    apiKey: required("LD_API_KEY"),
+    baseUrl: (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, ""),
+    projectKey: required("LD_PROJECT_KEY")
+  };
+}
+function appConnection() {
+  loadDotEnv();
+  return {
+    apiKey: required("LD_API_KEY"),
+    baseUrl: (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, ""),
+    projectKey: process.env.LD_APP_PROJECT_KEY || required("LD_PROJECT_KEY")
+  };
+}
+var loaded;
+var init_env = __esm({
+  "../shared/dist/env.js"() {
+    "use strict";
+    loaded = false;
+  }
+});
+
 // ../../node_modules/yaml/dist/nodes/identity.js
 var require_identity = __commonJS({
   "../../node_modules/yaml/dist/nodes/identity.js"(exports) {
@@ -21761,6 +21815,71 @@ var require_src2 = __commonJS({
   }
 });
 
+// ../shared/dist/sentryInit.js
+var sentryInit_exports = {};
+__export(sentryInit_exports, {
+  flushFactorySentry: () => flushFactorySentry,
+  initFactorySentry: () => initFactorySentry,
+  sentryEnabled: () => sentryEnabled
+});
+function sentryEnabled() {
+  return initialized && Boolean(process.env.SENTRY_DSN);
+}
+async function initFactorySentry(opts = {}) {
+  if (initialized)
+    return;
+  loadDotEnv();
+  const dsn = process.env.SENTRY_DSN;
+  if (!dsn)
+    return;
+  try {
+    const Sentry = await import("@sentry/node");
+    const serviceName = opts.serviceName ?? process.env.SENTRY_SERVICE_NAME ?? process.env.LD_OBSERVABILITY_SERVICE ?? "auto-factory-phase1";
+    Sentry.init({
+      dsn,
+      environment: process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV ?? "development",
+      release: process.env.GITHUB_SHA ?? process.env.SENTRY_RELEASE,
+      tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? "1"),
+      // Keep AI traces even if other traffic is sampled down later.
+      tracesSampler: (ctx) => {
+        const name = ctx.name ?? "";
+        const op = ctx.attributes?.["sentry.op"] ?? ctx.attributes?.["gen_ai.operation.name"];
+        if (typeof name === "string" && (name.startsWith("chat ") || name.startsWith("judge ") || name.startsWith("invoke_agent ") || name.startsWith("handoff "))) {
+          return 1;
+        }
+        if (op === "gen_ai.chat" || op === "gen_ai.invoke_agent" || op === "gen_ai.handoff")
+          return 1;
+        return Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? "1");
+      },
+      serverName: serviceName,
+      // Prompt capture is gated in observability.ts (SENTRY_AI_RECORD_PROMPTS);
+      // keep default-PII off so nothing else leaks CI content either.
+      sendDefaultPii: false
+    });
+    initialized = true;
+    console.log(`[sentry] factory AI monitoring enabled (service=${serviceName})`);
+  } catch (e) {
+    console.warn(`[sentry] init failed (${e instanceof Error ? e.message : e}); continuing without it.`);
+  }
+}
+async function flushFactorySentry(timeoutMs = 2e3) {
+  if (!initialized)
+    return;
+  try {
+    const Sentry = await import("@sentry/node");
+    await Sentry.flush(timeoutMs);
+  } catch {
+  }
+}
+var initialized;
+var init_sentryInit = __esm({
+  "../shared/dist/sentryInit.js"() {
+    "use strict";
+    init_env();
+    initialized = false;
+  }
+});
+
 // ../../node_modules/@anthropic-ai/sdk/internal/tslib.mjs
 function __classPrivateFieldSet(receiver, state, value, kind, f) {
   if (kind === "m")
@@ -22918,7 +23037,7 @@ var init_token_cache = __esm({
 
 // ../../node_modules/@anthropic-ai/sdk/internal/utils/env.mjs
 var readEnv;
-var init_env = __esm({
+var init_env2 = __esm({
   "../../node_modules/@anthropic-ai/sdk/internal/utils/env.mjs"() {
     readEnv = (env) => {
       if (typeof globalThis.process !== "undefined") {
@@ -23052,7 +23171,7 @@ var init_utils2 = __esm({
   "../../node_modules/@anthropic-ai/sdk/internal/utils.mjs"() {
     init_values();
     init_base64();
-    init_env();
+    init_env2();
     init_log();
     init_uuid();
     init_sleep();
@@ -23553,7 +23672,7 @@ function cachedExchangeProvider(exchange, credentialsPath, onCacheWriteError, on
 }
 var init_credential_chain = __esm({
   "../../node_modules/@anthropic-ai/sdk/lib/credentials/credential-chain.mjs"() {
-    init_env();
+    init_env2();
     init_credentials();
     init_types();
     init_time();
@@ -27523,7 +27642,7 @@ var init_worker = __esm({
     init_tslib();
     init_error();
     init_log();
-    init_env();
+    init_env2();
     init_sleep();
     init_backoff();
     init_abort();
@@ -32383,7 +32502,7 @@ var init_client = __esm({
     init_messages2();
     init_detect_platform();
     init_headers();
-    init_env();
+    init_env2();
     init_log();
     init_values();
     HUMAN_PROMPT = "\\n\\nHuman:";
@@ -33126,53 +33245,8 @@ import { existsSync as existsSync6, readFileSync as readFileSync8, writeFileSync
 import { dirname as dirname5, join as join8, resolve as resolve7 } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// ../shared/dist/env.js
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
-var loaded = false;
-function loadDotEnv(repoRoot = process.cwd()) {
-  if (loaded)
-    return;
-  loaded = true;
-  const path5 = resolve(repoRoot, ".env");
-  if (!existsSync(path5))
-    return;
-  for (const rawLine of readFileSync(path5, "utf8").split("\n")) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#") || !line.includes("="))
-      continue;
-    const idx = line.indexOf("=");
-    const key = line.slice(0, idx).trim();
-    let val = line.slice(idx + 1).trim();
-    if (val.startsWith('"') && val.endsWith('"') || val.startsWith("'") && val.endsWith("'")) {
-      val = val.slice(1, -1);
-    }
-    if (process.env[key] === void 0)
-      process.env[key] = val;
-  }
-}
-function required(name) {
-  const v = process.env[name];
-  if (!v)
-    throw new Error(`Missing required env var: ${name}`);
-  return v;
-}
-function targetConnection() {
-  loadDotEnv();
-  return {
-    apiKey: required("LD_API_KEY"),
-    baseUrl: (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, ""),
-    projectKey: required("LD_PROJECT_KEY")
-  };
-}
-function appConnection() {
-  loadDotEnv();
-  return {
-    apiKey: required("LD_API_KEY"),
-    baseUrl: (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, ""),
-    projectKey: process.env.LD_APP_PROJECT_KEY || required("LD_PROJECT_KEY")
-  };
-}
+// ../shared/dist/index.js
+init_env();
 
 // ../shared/dist/config.js
 var import_yaml = __toESM(require_dist(), 1);
@@ -33596,527 +33670,8 @@ function extractConfigStamp(description) {
   return description?.match(STAMP_RE)?.[1];
 }
 
-// ../shared/dist/graphWalker.js
-function tagsMatch(tags, cond) {
-  return Object.entries(cond).every(([k, v]) => tags[k] === v);
-}
-function handoffTags(handoff, field) {
-  const v = handoff?.[field];
-  return v && typeof v === "object" ? v : void 0;
-}
-function handoffNumber(handoff, field) {
-  const v = handoff?.[field];
-  return typeof v === "number" ? v : void 0;
-}
-function handoffString(handoff, field) {
-  const v = handoff?.[field];
-  return typeof v === "string" ? v : void 0;
-}
-function handoffStringArray(handoff, field) {
-  const v = handoff?.[field];
-  return Array.isArray(v) ? v.filter((x) => typeof x === "string") : void 0;
-}
-function buildPrompt(hasInbound, ctx) {
-  const header = [
-    ctx.REPO ? `Repository: ${ctx.REPO}` : "",
-    ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
-    ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
-  ].filter(Boolean).join("\n");
-  if (!hasInbound) {
-    return `${header}${ctx.PR_BODY ? `
-
-${ctx.PR_BODY}` : ""}`.trim();
-  }
-  const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
-  return `${header}
-
-${brief}`.trim();
-}
-function lastAssistantText(result) {
-  const finals = result.messages.filter((m) => m.role === "assistant");
-  const fin = finals.find((m) => m.isFinal) ?? finals[finals.length - 1];
-  return fin?.content ?? "";
-}
-function allNodeKeys(graphDef) {
-  const raw = graphDef.getConfig();
-  const keys = /* @__PURE__ */ new Set();
-  if (raw.root)
-    keys.add(raw.root);
-  for (const [source, edges] of Object.entries(raw.edges ?? {})) {
-    keys.add(source);
-    for (const e of edges)
-      keys.add(e.key);
-  }
-  return [...keys];
-}
-async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate, judgeHook, verifier) {
-  const runs = [];
-  const accumulatedTags = {};
-  const ctx = { ...context };
-  const gatedSteps = new Set(gate?.steps ?? []);
-  const visited = /* @__PURE__ */ new Set();
-  let node = graphDef.rootNode();
-  let inboundHandoff;
-  let stalledAt;
-  let pendingApproval;
-  let verificationFailed;
-  while (node && !visited.has(node.getKey())) {
-    const key = node.getKey();
-    if (gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
-      pendingApproval = { node: key };
-      onEvent?.({ type: "awaiting-approval", node: key });
-      break;
-    }
-    visited.add(key);
-    const cfg = node.getConfig();
-    const maxTurns = handoffNumber(inboundHandoff, "max_turns");
-    const requestType = handoffString(inboundHandoff, "request_type");
-    const capabilities = handoffStringArray(inboundHandoff, "capabilities");
-    onEvent?.({ type: "node-start", configKey: key, index: runs.length });
-    const tracker = cfg.createTracker();
-    const prompt = buildPrompt(inboundHandoff !== void 0, ctx);
-    const result = await runner.runNode({
-      configKey: key,
-      prompt,
-      ...cfg.instructions ? { instructions: cfg.instructions } : {},
-      ...cfg.model?.name ? { model: cfg.model.name } : {},
-      ...cfg.model?.parameters ? { modelParameters: cfg.model.parameters } : {},
-      tracker,
-      ...maxTurns !== void 0 ? { maxTurns } : {},
-      ...requestType ? { requestType } : {},
-      ...capabilities ? { capabilities } : {},
-      // Tool attachments from the LD variation (interface overrides; ADR 0011).
-      ...cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}
-    });
-    Object.assign(accumulatedTags, result.tags);
-    const output = lastAssistantText(result);
-    ctx.PREVIOUS_STEP_OUTPUT = output;
-    const run = { configKey: key, status: result.status, output, tags: result.tags };
-    runs.push(run);
-    onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
-    if (judgeHook) {
-      try {
-        await judgeHook({ configKey: key, cfg, input: prompt, output, tracker });
-      } catch (e) {
-        console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
-      }
-    }
-    if (verifier) {
-      try {
-        const verification = await verifier({ configKey: key, tags: result.tags });
-        if (verification) {
-          onEvent?.({ type: "node-verified", verification });
-          for (const c of verification.passed)
-            console.log(`[verify] ${key} \u2713 ${c.name}: ${c.detail}`);
-          for (const c of verification.failures)
-            console.error(`[verify] ${key} \u2717 ${c.name}: ${c.detail}`);
-          if (!verification.ok) {
-            verificationFailed = verification;
-            break;
-          }
-        }
-      } catch (e) {
-        console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
-      }
-    }
-    let next = null;
-    let nextHandoff;
-    for (const edge of node.getEdges()) {
-      const h = edge.handoff;
-      const require2 = handoffTags(h, "require_tags");
-      if (require2 && !tagsMatch(accumulatedTags, require2))
-        continue;
-      const skip = handoffTags(h, "skip_if_tags");
-      if (skip && tagsMatch(accumulatedTags, skip))
-        continue;
-      next = edge.key;
-      nextHandoff = h;
-      break;
-    }
-    if (!next) {
-      const edges = node.getEdges();
-      const unmet = [];
-      for (const edge of edges) {
-        const h = edge.handoff;
-        const skip = handoffTags(h, "skip_if_tags");
-        if (skip && tagsMatch(accumulatedTags, skip))
-          continue;
-        const require2 = handoffTags(h, "require_tags");
-        if (require2 && !tagsMatch(accumulatedTags, require2)) {
-          const requireMissing = {};
-          for (const [k, v] of Object.entries(require2)) {
-            if (accumulatedTags[k] !== v)
-              requireMissing[k] = v;
-          }
-          unmet.push({ target: edge.key, requireMissing });
-        }
-      }
-      if (unmet.length > 0) {
-        stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
-        onEvent?.({ type: "stalled", stall: stalledAt });
-      }
-    }
-    if (next)
-      graphTracker?.trackHandoffSuccess(key, next);
-    node = next ? graphDef.getNode(next) : null;
-    inboundHandoff = nextHandoff;
-  }
-  const reached = new Set(runs.map((r) => r.configKey));
-  const skipped = allNodeKeys(graphDef).filter((k) => !reached.has(k));
-  return {
-    runs,
-    tags: accumulatedTags,
-    skipped,
-    ...stalledAt ? { stalledAt } : {},
-    ...pendingApproval ? { pendingApproval } : {},
-    ...verificationFailed ? { verificationFailed } : {}
-  };
-}
-
-// ../shared/dist/workingTree.js
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-var exec = promisify(execFile);
-
-// ../shared/dist/handoffVerifier.js
-import { readdirSync as readdirSync2, readFileSync as readFileSync3, statSync } from "node:fs";
-import { join as join2 } from "node:path";
-var SKIP_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", "dist", "build", "__pycache__", ".venv", ".release-flags"]);
-var MAX_FILE_BYTES = 4e5;
-var VN_RE = /^v\d+$/;
-function filesContaining(root, needle) {
-  const hits = [];
-  const walk2 = (dir, rel) => {
-    let entries;
-    try {
-      entries = readdirSync2(dir);
-    } catch {
-      return;
-    }
-    for (const name of entries) {
-      if (SKIP_DIRS.has(name))
-        continue;
-      const abs = join2(dir, name);
-      const relPath = rel ? `${rel}/${name}` : name;
-      let st;
-      try {
-        st = statSync(abs);
-      } catch {
-        continue;
-      }
-      if (st.isDirectory()) {
-        walk2(abs, relPath);
-      } else if (st.isFile() && st.size <= MAX_FILE_BYTES) {
-        try {
-          if (readFileSync3(abs, "utf8").includes(needle))
-            hits.push(relPath);
-        } catch {
-        }
-      }
-    }
-  };
-  walk2(root, "");
-  return hits;
-}
-function quotedOccurrence(content, value) {
-  for (const q of ["'", '"', "`"]) {
-    if (content.includes(`${q}${value}${q}`))
-      return true;
-  }
-  return false;
-}
-function buildHandoffVerifier(opts) {
-  return async (run) => {
-    const t = run.tags;
-    const passed = [];
-    const failures = [];
-    const check = (ok, name, okDetail, failDetail) => {
-      (ok ? passed : failures).push({ name, detail: ok ? okDetail : failDetail });
-    };
-    if (t.flag_ready === "true" && t.flag_key) {
-      const flagKey = t.flag_key;
-      const variation = t.flag_variation ?? "";
-      if (opts.writer) {
-        try {
-          const state = await opts.writer.getFlagState(flagKey);
-          check(state.exists, "flag-exists-in-ld", `'${flagKey}' exists in project '${opts.writer.projectKey}'`, `'${flagKey}' does NOT exist in project '${opts.writer.projectKey}' despite flag_ready`);
-          if (state.exists && variation) {
-            check(state.variations.some((v) => v.value === variation), "variation-exists-in-ld", `variation '${variation}' exists on '${flagKey}'`, `variation '${variation}' does NOT exist on '${flagKey}'`);
-          }
-        } catch (e) {
-          failures.push({
-            name: "flag-exists-in-ld",
-            detail: `could not verify '${flagKey}' in LaunchDarkly: ${e instanceof Error ? e.message : String(e)}`
-          });
-        }
-      }
-      const referencing = filesContaining(opts.sandboxRoot, flagKey);
-      check(referencing.length > 0, "flag-wired-in-code", `'${flagKey}' referenced in ${referencing.length} file(s) (${referencing.slice(0, 3).join(", ")})`, `'${flagKey}' is not referenced anywhere in the code \u2014 a flag that exists in LaunchDarkly but gates nothing`);
-      if (VN_RE.test(variation) && referencing.length > 0) {
-        const wired = referencing.some((rel) => {
-          try {
-            return quotedOccurrence(readFileSync3(join2(opts.sandboxRoot, rel), "utf8"), variation);
-          } catch {
-            return false;
-          }
-        });
-        check(wired, "variation-wired-in-code", `'${variation}' compared (quoted) alongside '${flagKey}'`, `'${variation}' never appears (quoted) in any file referencing '${flagKey}' \u2014 multivariate flag evaluated through a boolean helper? Every string variation is truthy, so the control path would be unreachable`);
-      }
-    }
-    if (t.metric_event_keys) {
-      for (const eventKey of t.metric_event_keys.split(",").filter(Boolean)) {
-        const emitters = filesContaining(opts.sandboxRoot, eventKey);
-        check(emitters.length > 0, "metric-event-instrumented", `event '${eventKey}' emitted in ${emitters.slice(0, 2).join(", ")}`, `metric event '${eventKey}' has no emitter in the code \u2014 the metric exists in LaunchDarkly but will never receive data. This check greps for the LITERAL key: if the code builds it dynamically (e.g. \`\${FLAG_KEY}-suffix\` or concatenation), rewrite the emitter to pass the literal string \u2014 deterministic verification and LaunchDarkly code references both need greppable literals`);
-      }
-    }
-    if (t.tests_last_run === "fail") {
-      failures.push({
-        name: "tests-green-at-handoff",
-        detail: "the last real run_tests execution FAILED \u2014 the node handed off with a red suite"
-      });
-    } else if (t.tests_last_run === "pass") {
-      passed.push({ name: "tests-green-at-handoff", detail: "last run_tests execution passed" });
-    }
-    if (passed.length === 0 && failures.length === 0)
-      return null;
-    return { node: run.configKey, ok: failures.length === 0, passed, failures };
-  };
-}
-
-// ../shared/dist/approval.js
-function decideApproval(verdict) {
-  const base = { apply: false, noop: false, incomplete: false };
-  if (verdict.skipFlagging) {
-    return { ...base, noop: true, reason: "no flag needed \u2014 nothing to review" };
-  }
-  if (!verdict.hasVerdict) {
-    return { ...base, incomplete: true, reason: "INCOMPLETE \u2014 the code reviewer never produced a verdict" };
-  }
-  if (!verdict.reviewApproved) {
-    return { ...base, reason: "code review REJECTED" };
-  }
-  return { ...base, apply: true, reason: "code review APPROVED" };
-}
-function interpretWalk(tags) {
-  const rawDecision = (tags.review_approved ?? // canonical
-  tags.review_decision ?? // legacy
-  tags.decision ?? // legacy
-  tags.approved ?? // legacy
-  "").toLowerCase();
-  const hasVerdict = rawDecision !== "";
-  const reviewApproved = rawDecision === "approve" || rawDecision === "approved" || rawDecision === "true";
-  const rawRisk = (tags.risk_level ?? // canonical
-  tags.risk ?? // legacy
-  "").toLowerCase();
-  const risk = rawRisk === "low" || rawRisk === "medium" || rawRisk === "high" ? rawRisk : void 0;
-  const skipFlagging = (tags.skip_flagging ?? "").toLowerCase() === "true";
-  return { reviewApproved, hasVerdict, risk, skipFlagging };
-}
-
-// ../shared/dist/approvalGates.js
-var APPROVAL_GATES_FLAG_KEY = "auto-factory-approval-gates";
-function parseGateSteps(value) {
-  if (!Array.isArray(value))
-    return [];
-  const steps = [];
-  for (const v of value) {
-    if (typeof v === "string" && v.length > 0) {
-      steps.push({ step: v });
-    } else if (v && typeof v === "object" && typeof v.step === "string") {
-      const o = v;
-      const t = typeof o.threshold === "number" && o.threshold >= 0 && o.threshold <= 1 ? o.threshold : void 0;
-      steps.push({ step: o.step, ...t !== void 0 ? { threshold: t } : {} });
-    }
-  }
-  return steps;
-}
-async function resolveApprovalGates(ldClient, context, flagKey = APPROVAL_GATES_FLAG_KEY) {
-  loadDotEnv();
-  const env = process.env.APPROVAL_GATES?.trim();
-  if (env) {
-    try {
-      return parseGateSteps(JSON.parse(env));
-    } catch {
-      return parseGateSteps(env.split(",").map((s) => s.trim()));
-    }
-  }
-  const value = await ldClient.variation(flagKey, context, []);
-  return parseGateSteps(value);
-}
-
-// ../shared/dist/approvalPolicy.js
-var APPROVAL_MODE_FLAG_KEY = "auto-factory-approval-mode";
-var RISK_THRESHOLD_FLAG_KEY = "auto-factory-risk-threshold";
-var DEFAULT_MODE = "yolo";
-var DEFAULT_THRESHOLD = 0.6;
-var DEFAULT_GATED_STEPS = ["autofactory-flag-implementer"];
-function normalizeApprovalMode(raw) {
-  const m = String(raw ?? "").toLowerCase().trim();
-  if (m === "risk-threshold" || m === "middle")
-    return "risk-threshold";
-  if (m === "always" || m === "manual")
-    return "always";
-  return DEFAULT_MODE;
-}
-function riskScoreOf(tags) {
-  const raw = Number.parseFloat(tags.risk_score ?? "");
-  if (Number.isFinite(raw) && raw >= 0 && raw <= 1)
-    return raw;
-  const level = (tags.risk_level ?? "").toLowerCase();
-  if (level === "low")
-    return 0.25;
-  if (level === "medium")
-    return 0.5;
-  if (level === "high")
-    return 0.75;
-  return void 0;
-}
-async function resolveApprovalPolicy(ldClient, context) {
-  loadDotEnv();
-  const modeSource = process.env.APPROVAL_MODE ? "env" : "flag";
-  const mode = process.env.APPROVAL_MODE ? normalizeApprovalMode(process.env.APPROVAL_MODE) : normalizeApprovalMode(await ldClient.variation(APPROVAL_MODE_FLAG_KEY, context, DEFAULT_MODE));
-  if (modeSource === "env") {
-    const flagMode = normalizeApprovalMode(await ldClient.variation(APPROVAL_MODE_FLAG_KEY, context, DEFAULT_MODE));
-    const conflict = flagMode !== mode ? ` \u2014 the ${APPROVAL_MODE_FLAG_KEY} flag says '${flagMode}' and is being IGNORED` : "";
-    const msg = `approval mode '${mode}' comes from the APPROVAL_MODE env var, not LaunchDarkly${conflict}. Remove APPROVAL_MODE from the workflow to let the flags control approvals.`;
-    console.log(process.env.GITHUB_ACTIONS ? `::warning::AutoFactory: ${msg}` : `[approval] ${msg}`);
-  }
-  const rawThreshold = process.env.RISK_THRESHOLD ? Number.parseFloat(process.env.RISK_THRESHOLD) : Number(await ldClient.variation(RISK_THRESHOLD_FLAG_KEY, context, DEFAULT_THRESHOLD));
-  const threshold = Number.isFinite(rawThreshold) ? Math.min(1, Math.max(0, rawThreshold)) : DEFAULT_THRESHOLD;
-  let steps = await resolveApprovalGates(ldClient, context);
-  if (steps.length === 0 && mode !== "yolo") {
-    console.log(`[approval] mode '${mode}' with no gated steps configured \u2014 defaulting to [${DEFAULT_GATED_STEPS.join(", ")}]`);
-    steps = DEFAULT_GATED_STEPS.map((step) => ({ step }));
-  }
-  return { mode, threshold, steps, modeSource };
-}
-function createPolicyGate(policy, approve) {
-  if (policy.mode === "yolo" || policy.steps.length === 0)
-    return void 0;
-  const byStep = new Map(policy.steps.map((s) => [s.step, s]));
-  return {
-    steps: policy.steps.map((s) => s.step),
-    async resolve(nodeKey, tags) {
-      if (policy.mode === "risk-threshold") {
-        const risk = riskScoreOf(tags);
-        const effective = byStep.get(nodeKey)?.threshold ?? policy.threshold;
-        if (risk !== void 0 && risk < effective) {
-          console.log(`[approval] '${nodeKey}' below risk threshold (risk ${risk.toFixed(2)} < ${effective.toFixed(2)}) \u2014 no approval needed`);
-          return true;
-        }
-        console.log(`[approval] '${nodeKey}' requires approval: risk ${risk === void 0 ? "UNKNOWN (fail-closed)" : risk.toFixed(2)} \u2265 threshold ${effective.toFixed(2)}`);
-      }
-      return approve(nodeKey);
-    }
-  };
-}
-
-// ../shared/dist/vegaClient.js
-var TERMINAL = /* @__PURE__ */ new Set(["completed", "failed", "stopped", "cancelled"]);
-var StubVegaTransport = class {
-  async dispatch(_req) {
-    throw new Error("Vega transport not configured \u2014 set VEGA_ENDPOINT + VEGA_TOKEN, or use the default 'anthropic' provider.");
-  }
-  async getStatus(_conversationId) {
-    throw new Error("Vega transport not configured \u2014 set VEGA_ENDPOINT + VEGA_TOKEN.");
-  }
-};
-var VegaClient = class {
-  transport;
-  pollMillis;
-  timeoutMillis;
-  constructor(transport = new StubVegaTransport(), opts = {}) {
-    this.transport = transport;
-    this.pollMillis = opts.pollMillis ?? 3e3;
-    this.timeoutMillis = opts.timeoutMillis ?? 30 * 60 * 1e3;
-  }
-  /** Dispatch a single agent/node and wait for its terminal result. */
-  async runNode(req) {
-    const { conversationId } = await this.transport.dispatch(req);
-    const deadline = Date.now() + this.timeoutMillis;
-    for (; ; ) {
-      const result = await this.transport.getStatus(conversationId);
-      if (TERMINAL.has(result.status))
-        return result;
-      if (Date.now() > deadline) {
-        throw new Error(`Vega node ${req.configKey} timed out (status: ${result.status})`);
-      }
-      await new Promise((r) => setTimeout(r, this.pollMillis));
-    }
-  }
-};
-
-// ../shared/dist/vegaTransport.js
-var DISPATCH_MUTATION = `mutation AgentDispatch($input: AgentDispatchInput!) {
-  agentDispatch(input: $input) { conversation_id success }
-}`;
-var STATUS_QUERY = `query AgentDispatchStatus($id: StringID!) {
-  agentDispatchStatus(conversation_id: $id) {
-    conversation_id
-    status
-    messages { role content turn is_final }
-    tags { key value }
-  }
-}`;
-var GraphQLVegaTransport = class {
-  opts;
-  constructor(opts) {
-    this.opts = opts;
-  }
-  async gql(query, variables) {
-    const headerName = this.opts.authHeaderName ?? "Authorization";
-    const scheme = this.opts.authScheme ?? "";
-    const res = await fetch(this.opts.endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        [headerName]: `${scheme} ${this.opts.token}`.trim()
-      },
-      body: JSON.stringify({ query, variables })
-    });
-    const json = await res.json();
-    if (!res.ok || json.errors) {
-      throw new Error(`Vega GraphQL error (HTTP ${res.status}): ${JSON.stringify(json.errors ?? "")}`);
-    }
-    return json.data;
-  }
-  async dispatch(req) {
-    const input = {
-      prompt: req.prompt,
-      ai_config_key: req.configKey,
-      request_type: this.opts.requestType ?? "Fix"
-    };
-    if (this.opts.repositories?.length)
-      input.repositories = this.opts.repositories;
-    if (req.maxTurns !== void 0)
-      input.max_turns = req.maxTurns;
-    if (this.opts.projectSlug)
-      input.project_slug = this.opts.projectSlug;
-    const data = await this.gql(DISPATCH_MUTATION, { input });
-    if (!data.agentDispatch?.success) {
-      throw new Error(`Vega dispatch was not accepted for config '${req.configKey}'`);
-    }
-    return { conversationId: data.agentDispatch.conversation_id };
-  }
-  async getStatus(conversationId) {
-    const data = await this.gql(STATUS_QUERY, { id: conversationId });
-    const p = data.agentDispatchStatus;
-    const tags = {};
-    for (const t of p.tags ?? [])
-      tags[t.key] = t.value;
-    return {
-      conversationId: p.conversation_id,
-      status: p.status,
-      messages: p.messages.map((m) => ({
-        role: m.role,
-        content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-        isFinal: m.is_final
-      })),
-      tags
-    };
-  }
-};
+// ../shared/dist/observability.js
+import * as nodeModule from "node:module";
 
 // ../shared/dist/ldSdk.js
 var import_node_server_sdk = __toESM(require_src2(), 1);
@@ -36183,6 +35738,7 @@ function initAi(ldClient) {
 }
 
 // ../shared/dist/ldSdk.js
+init_env();
 async function observabilityPlugins() {
   if (process.env.DISABLE_LD_OBSERVABILITY === "true")
     return [];
@@ -36215,11 +35771,22 @@ async function getLdSdk() {
   return cached;
 }
 async function closeLdSdk() {
-  if (!cached)
+  if (!cached) {
+    try {
+      const { flushFactorySentry: flushFactorySentry2 } = await Promise.resolve().then(() => (init_sentryInit(), sentryInit_exports));
+      await flushFactorySentry2();
+    } catch {
+    }
     return;
+  }
   try {
     const { LDObserve } = await import("@launchdarkly/observability-node");
     await LDObserve.flush();
+  } catch {
+  }
+  try {
+    const { flushFactorySentry: flushFactorySentry2 } = await Promise.resolve().then(() => (init_sentryInit(), sentryInit_exports));
+    await flushFactorySentry2();
   } catch {
   }
   try {
@@ -36253,6 +35820,713 @@ function pipelineContext(extra = {}) {
     run: { key: currentRunId }
   };
 }
+
+// ../shared/dist/observability.js
+init_sentryInit();
+var TRACER_NAME = "launchdarkly-auto-factory";
+var MAX_CONTENT = 8e3;
+var NOOP_SPAN = {
+  setAttribute() {
+    return NOOP_SPAN;
+  },
+  setAttributes() {
+    return NOOP_SPAN;
+  },
+  setStatus() {
+    return NOOP_SPAN;
+  },
+  recordException() {
+  },
+  addEvent() {
+    return NOOP_SPAN;
+  },
+  updateName() {
+    return NOOP_SPAN;
+  },
+  end() {
+  },
+  isRecording() {
+    return false;
+  },
+  spanContext() {
+    return { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+  }
+};
+function loadOtelApi() {
+  try {
+    return nodeModule.createRequire(import.meta.url)("@opentelemetry/api");
+  } catch {
+    return {
+      trace: { getTracer: () => ({ startSpan: () => NOOP_SPAN }) },
+      // Values mirror the OTel API enums so recorded constants stay comparable.
+      SpanKind: { INTERNAL: 0, SERVER: 1, CLIENT: 2, PRODUCER: 3, CONSUMER: 4 },
+      SpanStatusCode: { UNSET: 0, OK: 1, ERROR: 2 }
+    };
+  }
+}
+var otel = loadOtelApi();
+var SpanKind = otel.SpanKind;
+var SpanStatusCode = otel.SpanStatusCode;
+function aiTracer() {
+  return otel.trace.getTracer(TRACER_NAME);
+}
+function truncate(s) {
+  return s.length > MAX_CONTENT ? `${s.slice(0, MAX_CONTENT)}\u2026[truncated]` : s;
+}
+function buildGenAiAttributes(d, includeContent) {
+  const attrs = {
+    "gen_ai.operation.name": d.operationName ?? "chat",
+    "gen_ai.system": d.provider,
+    "gen_ai.provider": d.provider,
+    "gen_ai.request.model": d.requestModel,
+    "gen_ai.model": d.requestModel,
+    // Groups the whole Phase 1 chain in Sentry Conversations / LD views.
+    "gen_ai.conversation.id": pipelineRunId()
+  };
+  const agentName = d.agentName ?? d.tracker?.getTrackData?.()?.configKey;
+  if (agentName)
+    attrs["gen_ai.agent.name"] = agentName;
+  if (d.usage) {
+    attrs["gen_ai.usage.input_tokens"] = d.usage.input;
+    attrs["gen_ai.usage.output_tokens"] = d.usage.output;
+    attrs["gen_ai.usage.total_tokens"] = d.usage.total;
+    attrs["gen_ai.usage.prompt_tokens"] = d.usage.input;
+    attrs["gen_ai.usage.completion_tokens"] = d.usage.output;
+  }
+  if (includeContent) {
+    if (d.prompt)
+      attrs["gen_ai.input"] = truncate(d.prompt);
+    if (d.output)
+      attrs["gen_ai.output"] = truncate(d.output);
+  }
+  attrs["launchdarkly.run.id"] = pipelineRunId();
+  const td = d.tracker?.getTrackData?.();
+  if (td) {
+    attrs["launchdarkly.ai.config.key"] = td.configKey;
+    attrs["launchdarkly.ai.config.variation"] = td.variationKey;
+    attrs["launchdarkly.ai.config.version"] = td.version;
+    attrs["launchdarkly.ai.config.model"] = td.modelName;
+    attrs["launchdarkly.ai.provider"] = td.providerName;
+    attrs["launchdarkly.ai.run.id"] = td.runId;
+    if (td.graphKey)
+      attrs["launchdarkly.ai.graph.key"] = td.graphKey;
+  }
+  return attrs;
+}
+function setGenAiAttributes(span, d) {
+  try {
+    span.setAttributes(buildGenAiAttributes(d, true));
+  } catch {
+  }
+}
+function startAiSpan(name, opts = {}) {
+  const otelSpan = aiTracer().startSpan(name, { kind: opts.kind ?? SpanKind.CLIENT });
+  let sentrySpan = null;
+  if (sentryEnabled()) {
+    try {
+      const Sentry = nodeModule.createRequire(import.meta.url)("@sentry/node");
+      if (typeof Sentry.startInactiveSpan === "function") {
+        sentrySpan = Sentry.startInactiveSpan({
+          name,
+          op: opts.op ?? "gen_ai.chat"
+        });
+      }
+    } catch {
+    }
+  }
+  return {
+    otel: otelSpan,
+    setGenAi(d) {
+      setGenAiAttributes(otelSpan, d);
+      if (sentrySpan) {
+        try {
+          const recordPrompts = process.env.SENTRY_AI_RECORD_PROMPTS === "true";
+          sentrySpan.setAttributes(buildGenAiAttributes(d, recordPrompts));
+        } catch {
+        }
+      }
+    },
+    recordException(err) {
+      if (err instanceof Error)
+        otelSpan.recordException(err);
+    },
+    end(status = "ok", message) {
+      try {
+        otelSpan.setStatus({
+          code: status === "ok" ? SpanStatusCode.OK : SpanStatusCode.ERROR,
+          ...message ? { message } : {}
+        });
+        otelSpan.end();
+      } catch {
+      }
+      if (sentrySpan) {
+        try {
+          sentrySpan.setStatus({
+            code: status === "ok" ? 1 : 2,
+            ...message ? { message } : {}
+          });
+          sentrySpan.end();
+        } catch {
+        }
+      }
+    }
+  };
+}
+function startHandoffSpan(fromKey, toKey) {
+  return startAiSpan(`handoff from ${fromKey} to ${toKey}`, {
+    kind: SpanKind.INTERNAL,
+    op: "gen_ai.handoff"
+  });
+}
+
+// ../shared/dist/graphWalker.js
+function tagsMatch(tags, cond) {
+  return Object.entries(cond).every(([k, v]) => tags[k] === v);
+}
+function handoffTags(handoff, field) {
+  const v = handoff?.[field];
+  return v && typeof v === "object" ? v : void 0;
+}
+function handoffNumber(handoff, field) {
+  const v = handoff?.[field];
+  return typeof v === "number" ? v : void 0;
+}
+function handoffString(handoff, field) {
+  const v = handoff?.[field];
+  return typeof v === "string" ? v : void 0;
+}
+function handoffStringArray(handoff, field) {
+  const v = handoff?.[field];
+  return Array.isArray(v) ? v.filter((x) => typeof x === "string") : void 0;
+}
+function buildPrompt(hasInbound, ctx) {
+  const header = [
+    ctx.REPO ? `Repository: ${ctx.REPO}` : "",
+    ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
+  ].filter(Boolean).join("\n");
+  if (!hasInbound) {
+    return `${header}${ctx.PR_BODY ? `
+
+${ctx.PR_BODY}` : ""}`.trim();
+  }
+  const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
+  return `${header}
+
+${brief}`.trim();
+}
+function lastAssistantText(result) {
+  const finals = result.messages.filter((m) => m.role === "assistant");
+  const fin = finals.find((m) => m.isFinal) ?? finals[finals.length - 1];
+  return fin?.content ?? "";
+}
+function allNodeKeys(graphDef) {
+  const raw = graphDef.getConfig();
+  const keys = /* @__PURE__ */ new Set();
+  if (raw.root)
+    keys.add(raw.root);
+  for (const [source, edges] of Object.entries(raw.edges ?? {})) {
+    keys.add(source);
+    for (const e of edges)
+      keys.add(e.key);
+  }
+  return [...keys];
+}
+async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate, judgeHook, verifier) {
+  const runs = [];
+  const accumulatedTags = {};
+  const ctx = { ...context };
+  const gatedSteps = new Set(gate?.steps ?? []);
+  const visited = /* @__PURE__ */ new Set();
+  let node = graphDef.rootNode();
+  let inboundHandoff;
+  let stalledAt;
+  let pendingApproval;
+  let verificationFailed;
+  while (node && !visited.has(node.getKey())) {
+    const key = node.getKey();
+    if (gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
+      pendingApproval = { node: key };
+      onEvent?.({ type: "awaiting-approval", node: key });
+      break;
+    }
+    visited.add(key);
+    const cfg = node.getConfig();
+    const maxTurns = handoffNumber(inboundHandoff, "max_turns");
+    const requestType = handoffString(inboundHandoff, "request_type");
+    const capabilities = handoffStringArray(inboundHandoff, "capabilities");
+    onEvent?.({ type: "node-start", configKey: key, index: runs.length });
+    const tracker = cfg.createTracker();
+    const prompt = buildPrompt(inboundHandoff !== void 0, ctx);
+    const result = await runner.runNode({
+      configKey: key,
+      prompt,
+      ...cfg.instructions ? { instructions: cfg.instructions } : {},
+      ...cfg.model?.name ? { model: cfg.model.name } : {},
+      ...cfg.model?.parameters ? { modelParameters: cfg.model.parameters } : {},
+      tracker,
+      ...maxTurns !== void 0 ? { maxTurns } : {},
+      ...requestType ? { requestType } : {},
+      ...capabilities ? { capabilities } : {},
+      // Tool attachments from the LD variation (interface overrides; ADR 0011).
+      ...cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}
+    });
+    Object.assign(accumulatedTags, result.tags);
+    const output = lastAssistantText(result);
+    ctx.PREVIOUS_STEP_OUTPUT = output;
+    const run = { configKey: key, status: result.status, output, tags: result.tags };
+    runs.push(run);
+    onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
+    if (judgeHook) {
+      try {
+        await judgeHook({ configKey: key, cfg, input: prompt, output, tracker });
+      } catch (e) {
+        console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    if (verifier) {
+      try {
+        const verification = await verifier({ configKey: key, tags: result.tags });
+        if (verification) {
+          onEvent?.({ type: "node-verified", verification });
+          for (const c of verification.passed)
+            console.log(`[verify] ${key} \u2713 ${c.name}: ${c.detail}`);
+          for (const c of verification.failures)
+            console.error(`[verify] ${key} \u2717 ${c.name}: ${c.detail}`);
+          if (!verification.ok) {
+            verificationFailed = verification;
+            break;
+          }
+        }
+      } catch (e) {
+        console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    let next = null;
+    let nextHandoff;
+    for (const edge of node.getEdges()) {
+      const h = edge.handoff;
+      const require2 = handoffTags(h, "require_tags");
+      if (require2 && !tagsMatch(accumulatedTags, require2))
+        continue;
+      const skip = handoffTags(h, "skip_if_tags");
+      if (skip && tagsMatch(accumulatedTags, skip))
+        continue;
+      next = edge.key;
+      nextHandoff = h;
+      break;
+    }
+    if (!next) {
+      const edges = node.getEdges();
+      const unmet = [];
+      for (const edge of edges) {
+        const h = edge.handoff;
+        const skip = handoffTags(h, "skip_if_tags");
+        if (skip && tagsMatch(accumulatedTags, skip))
+          continue;
+        const require2 = handoffTags(h, "require_tags");
+        if (require2 && !tagsMatch(accumulatedTags, require2)) {
+          const requireMissing = {};
+          for (const [k, v] of Object.entries(require2)) {
+            if (accumulatedTags[k] !== v)
+              requireMissing[k] = v;
+          }
+          unmet.push({ target: edge.key, requireMissing });
+        }
+      }
+      if (unmet.length > 0) {
+        stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
+        onEvent?.({ type: "stalled", stall: stalledAt });
+      }
+    }
+    if (next) {
+      graphTracker?.trackHandoffSuccess(key, next);
+      const handoff = startHandoffSpan(key, next);
+      handoff.setGenAi({
+        provider: "auto-factory",
+        requestModel: "graph-walker",
+        agentName: key,
+        operationName: "handoff"
+      });
+      handoff.end("ok");
+    }
+    node = next ? graphDef.getNode(next) : null;
+    inboundHandoff = nextHandoff;
+  }
+  const reached = new Set(runs.map((r) => r.configKey));
+  const skipped = allNodeKeys(graphDef).filter((k) => !reached.has(k));
+  return {
+    runs,
+    tags: accumulatedTags,
+    skipped,
+    ...stalledAt ? { stalledAt } : {},
+    ...pendingApproval ? { pendingApproval } : {},
+    ...verificationFailed ? { verificationFailed } : {}
+  };
+}
+
+// ../shared/dist/workingTree.js
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+var exec = promisify(execFile);
+
+// ../shared/dist/handoffVerifier.js
+import { readdirSync as readdirSync2, readFileSync as readFileSync3, statSync } from "node:fs";
+import { join as join2 } from "node:path";
+
+// ../shared/dist/sentryMetrics.js
+var SENTRY_INTEGRATION_EVENT_KEYS = /* @__PURE__ */ new Set(["sentry-errors"]);
+
+// ../shared/dist/handoffVerifier.js
+var SKIP_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", "dist", "build", "__pycache__", ".venv", ".release-flags"]);
+var MAX_FILE_BYTES = 4e5;
+var VN_RE = /^v\d+$/;
+function filesContaining(root, needle) {
+  const hits = [];
+  const walk2 = (dir, rel) => {
+    let entries;
+    try {
+      entries = readdirSync2(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      if (SKIP_DIRS.has(name))
+        continue;
+      const abs = join2(dir, name);
+      const relPath = rel ? `${rel}/${name}` : name;
+      let st;
+      try {
+        st = statSync(abs);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        walk2(abs, relPath);
+      } else if (st.isFile() && st.size <= MAX_FILE_BYTES) {
+        try {
+          if (readFileSync3(abs, "utf8").includes(needle))
+            hits.push(relPath);
+        } catch {
+        }
+      }
+    }
+  };
+  walk2(root, "");
+  return hits;
+}
+function quotedOccurrence(content, value) {
+  for (const q of ["'", '"', "`"]) {
+    if (content.includes(`${q}${value}${q}`))
+      return true;
+  }
+  return false;
+}
+function buildHandoffVerifier(opts) {
+  return async (run) => {
+    const t = run.tags;
+    const passed = [];
+    const failures = [];
+    const check = (ok, name, okDetail, failDetail) => {
+      (ok ? passed : failures).push({ name, detail: ok ? okDetail : failDetail });
+    };
+    if (t.flag_ready === "true" && t.flag_key) {
+      const flagKey = t.flag_key;
+      const variation = t.flag_variation ?? "";
+      if (opts.writer) {
+        try {
+          const state = await opts.writer.getFlagState(flagKey);
+          check(state.exists, "flag-exists-in-ld", `'${flagKey}' exists in project '${opts.writer.projectKey}'`, `'${flagKey}' does NOT exist in project '${opts.writer.projectKey}' despite flag_ready`);
+          if (state.exists && variation) {
+            check(state.variations.some((v) => v.value === variation), "variation-exists-in-ld", `variation '${variation}' exists on '${flagKey}'`, `variation '${variation}' does NOT exist on '${flagKey}'`);
+          }
+        } catch (e) {
+          failures.push({
+            name: "flag-exists-in-ld",
+            detail: `could not verify '${flagKey}' in LaunchDarkly: ${e instanceof Error ? e.message : String(e)}`
+          });
+        }
+      }
+      const referencing = filesContaining(opts.sandboxRoot, flagKey);
+      check(referencing.length > 0, "flag-wired-in-code", `'${flagKey}' referenced in ${referencing.length} file(s) (${referencing.slice(0, 3).join(", ")})`, `'${flagKey}' is not referenced anywhere in the code \u2014 a flag that exists in LaunchDarkly but gates nothing`);
+      if (VN_RE.test(variation) && referencing.length > 0) {
+        const wired = referencing.some((rel) => {
+          try {
+            return quotedOccurrence(readFileSync3(join2(opts.sandboxRoot, rel), "utf8"), variation);
+          } catch {
+            return false;
+          }
+        });
+        check(wired, "variation-wired-in-code", `'${variation}' compared (quoted) alongside '${flagKey}'`, `'${variation}' never appears (quoted) in any file referencing '${flagKey}' \u2014 multivariate flag evaluated through a boolean helper? Every string variation is truthy, so the control path would be unreachable`);
+      }
+    }
+    if (t.metric_event_keys) {
+      for (const eventKey of t.metric_event_keys.split(",").filter(Boolean)) {
+        if (SENTRY_INTEGRATION_EVENT_KEYS.has(eventKey)) {
+          passed.push({
+            name: "metric-event-instrumented",
+            detail: `event '${eventKey}' is Sentry-integration-backed (no track() emitter required)`
+          });
+          continue;
+        }
+        const emitters = filesContaining(opts.sandboxRoot, eventKey);
+        check(emitters.length > 0, "metric-event-instrumented", `event '${eventKey}' emitted in ${emitters.slice(0, 2).join(", ")}`, `metric event '${eventKey}' has no emitter in the code \u2014 the metric exists in LaunchDarkly but will never receive data. This check greps for the LITERAL key: if the code builds it dynamically (e.g. \`\${FLAG_KEY}-suffix\` or concatenation), rewrite the emitter to pass the literal string \u2014 deterministic verification and LaunchDarkly code references both need greppable literals`);
+      }
+    }
+    if (t.sentry_guardrail === "true") {
+      const ctxFiles = filesContaining(opts.sandboxRoot, "launchdarklyContext");
+      check(ctxFiles.length > 0, "sentry-launchdarkly-context", `launchdarklyContext set in ${ctxFiles.slice(0, 2).join(", ")}`, `sentry_guardrail=true but no 'launchdarklyContext' string in the checkout \u2014 the LD\u2194Sentry metrics integration ignores error events without that exact Sentry custom context name`);
+    }
+    if (t.tests_last_run === "fail") {
+      failures.push({
+        name: "tests-green-at-handoff",
+        detail: "the last real run_tests execution FAILED \u2014 the node handed off with a red suite"
+      });
+    } else if (t.tests_last_run === "pass") {
+      passed.push({ name: "tests-green-at-handoff", detail: "last run_tests execution passed" });
+    }
+    if (passed.length === 0 && failures.length === 0)
+      return null;
+    return { node: run.configKey, ok: failures.length === 0, passed, failures };
+  };
+}
+
+// ../shared/dist/approval.js
+function decideApproval(verdict) {
+  const base = { apply: false, noop: false, incomplete: false };
+  if (verdict.skipFlagging) {
+    return { ...base, noop: true, reason: "no flag needed \u2014 nothing to review" };
+  }
+  if (!verdict.hasVerdict) {
+    return { ...base, incomplete: true, reason: "INCOMPLETE \u2014 the code reviewer never produced a verdict" };
+  }
+  if (!verdict.reviewApproved) {
+    return { ...base, reason: "code review REJECTED" };
+  }
+  return { ...base, apply: true, reason: "code review APPROVED" };
+}
+function interpretWalk(tags) {
+  const rawDecision = (tags.review_approved ?? // canonical
+  tags.review_decision ?? // legacy
+  tags.decision ?? // legacy
+  tags.approved ?? // legacy
+  "").toLowerCase();
+  const hasVerdict = rawDecision !== "";
+  const reviewApproved = rawDecision === "approve" || rawDecision === "approved" || rawDecision === "true";
+  const rawRisk = (tags.risk_level ?? // canonical
+  tags.risk ?? // legacy
+  "").toLowerCase();
+  const risk = rawRisk === "low" || rawRisk === "medium" || rawRisk === "high" ? rawRisk : void 0;
+  const skipFlagging = (tags.skip_flagging ?? "").toLowerCase() === "true";
+  return { reviewApproved, hasVerdict, risk, skipFlagging };
+}
+
+// ../shared/dist/approvalGates.js
+init_env();
+var APPROVAL_GATES_FLAG_KEY = "auto-factory-approval-gates";
+function parseGateSteps(value) {
+  if (!Array.isArray(value))
+    return [];
+  const steps = [];
+  for (const v of value) {
+    if (typeof v === "string" && v.length > 0) {
+      steps.push({ step: v });
+    } else if (v && typeof v === "object" && typeof v.step === "string") {
+      const o = v;
+      const t = typeof o.threshold === "number" && o.threshold >= 0 && o.threshold <= 1 ? o.threshold : void 0;
+      steps.push({ step: o.step, ...t !== void 0 ? { threshold: t } : {} });
+    }
+  }
+  return steps;
+}
+async function resolveApprovalGates(ldClient, context, flagKey = APPROVAL_GATES_FLAG_KEY) {
+  loadDotEnv();
+  const env = process.env.APPROVAL_GATES?.trim();
+  if (env) {
+    try {
+      return parseGateSteps(JSON.parse(env));
+    } catch {
+      return parseGateSteps(env.split(",").map((s) => s.trim()));
+    }
+  }
+  const value = await ldClient.variation(flagKey, context, []);
+  return parseGateSteps(value);
+}
+
+// ../shared/dist/approvalPolicy.js
+init_env();
+var APPROVAL_MODE_FLAG_KEY = "auto-factory-approval-mode";
+var RISK_THRESHOLD_FLAG_KEY = "auto-factory-risk-threshold";
+var DEFAULT_MODE = "yolo";
+var DEFAULT_THRESHOLD = 0.6;
+var DEFAULT_GATED_STEPS = ["autofactory-flag-implementer"];
+function normalizeApprovalMode(raw) {
+  const m = String(raw ?? "").toLowerCase().trim();
+  if (m === "risk-threshold" || m === "middle")
+    return "risk-threshold";
+  if (m === "always" || m === "manual")
+    return "always";
+  return DEFAULT_MODE;
+}
+function riskScoreOf(tags) {
+  const raw = Number.parseFloat(tags.risk_score ?? "");
+  if (Number.isFinite(raw) && raw >= 0 && raw <= 1)
+    return raw;
+  const level = (tags.risk_level ?? "").toLowerCase();
+  if (level === "low")
+    return 0.25;
+  if (level === "medium")
+    return 0.5;
+  if (level === "high")
+    return 0.75;
+  return void 0;
+}
+async function resolveApprovalPolicy(ldClient, context) {
+  loadDotEnv();
+  const modeSource = process.env.APPROVAL_MODE ? "env" : "flag";
+  const mode = process.env.APPROVAL_MODE ? normalizeApprovalMode(process.env.APPROVAL_MODE) : normalizeApprovalMode(await ldClient.variation(APPROVAL_MODE_FLAG_KEY, context, DEFAULT_MODE));
+  if (modeSource === "env") {
+    const flagMode = normalizeApprovalMode(await ldClient.variation(APPROVAL_MODE_FLAG_KEY, context, DEFAULT_MODE));
+    const conflict = flagMode !== mode ? ` \u2014 the ${APPROVAL_MODE_FLAG_KEY} flag says '${flagMode}' and is being IGNORED` : "";
+    const msg = `approval mode '${mode}' comes from the APPROVAL_MODE env var, not LaunchDarkly${conflict}. Remove APPROVAL_MODE from the workflow to let the flags control approvals.`;
+    console.log(process.env.GITHUB_ACTIONS ? `::warning::AutoFactory: ${msg}` : `[approval] ${msg}`);
+  }
+  const rawThreshold = process.env.RISK_THRESHOLD ? Number.parseFloat(process.env.RISK_THRESHOLD) : Number(await ldClient.variation(RISK_THRESHOLD_FLAG_KEY, context, DEFAULT_THRESHOLD));
+  const threshold = Number.isFinite(rawThreshold) ? Math.min(1, Math.max(0, rawThreshold)) : DEFAULT_THRESHOLD;
+  let steps = await resolveApprovalGates(ldClient, context);
+  if (steps.length === 0 && mode !== "yolo") {
+    console.log(`[approval] mode '${mode}' with no gated steps configured \u2014 defaulting to [${DEFAULT_GATED_STEPS.join(", ")}]`);
+    steps = DEFAULT_GATED_STEPS.map((step) => ({ step }));
+  }
+  return { mode, threshold, steps, modeSource };
+}
+function createPolicyGate(policy, approve) {
+  if (policy.mode === "yolo" || policy.steps.length === 0)
+    return void 0;
+  const byStep = new Map(policy.steps.map((s) => [s.step, s]));
+  return {
+    steps: policy.steps.map((s) => s.step),
+    async resolve(nodeKey, tags) {
+      if (policy.mode === "risk-threshold") {
+        const risk = riskScoreOf(tags);
+        const effective = byStep.get(nodeKey)?.threshold ?? policy.threshold;
+        if (risk !== void 0 && risk < effective) {
+          console.log(`[approval] '${nodeKey}' below risk threshold (risk ${risk.toFixed(2)} < ${effective.toFixed(2)}) \u2014 no approval needed`);
+          return true;
+        }
+        console.log(`[approval] '${nodeKey}' requires approval: risk ${risk === void 0 ? "UNKNOWN (fail-closed)" : risk.toFixed(2)} \u2265 threshold ${effective.toFixed(2)}`);
+      }
+      return approve(nodeKey);
+    }
+  };
+}
+
+// ../shared/dist/vegaClient.js
+var TERMINAL = /* @__PURE__ */ new Set(["completed", "failed", "stopped", "cancelled"]);
+var StubVegaTransport = class {
+  async dispatch(_req) {
+    throw new Error("Vega transport not configured \u2014 set VEGA_ENDPOINT + VEGA_TOKEN, or use the default 'anthropic' provider.");
+  }
+  async getStatus(_conversationId) {
+    throw new Error("Vega transport not configured \u2014 set VEGA_ENDPOINT + VEGA_TOKEN.");
+  }
+};
+var VegaClient = class {
+  transport;
+  pollMillis;
+  timeoutMillis;
+  constructor(transport = new StubVegaTransport(), opts = {}) {
+    this.transport = transport;
+    this.pollMillis = opts.pollMillis ?? 3e3;
+    this.timeoutMillis = opts.timeoutMillis ?? 30 * 60 * 1e3;
+  }
+  /** Dispatch a single agent/node and wait for its terminal result. */
+  async runNode(req) {
+    const { conversationId } = await this.transport.dispatch(req);
+    const deadline = Date.now() + this.timeoutMillis;
+    for (; ; ) {
+      const result = await this.transport.getStatus(conversationId);
+      if (TERMINAL.has(result.status))
+        return result;
+      if (Date.now() > deadline) {
+        throw new Error(`Vega node ${req.configKey} timed out (status: ${result.status})`);
+      }
+      await new Promise((r) => setTimeout(r, this.pollMillis));
+    }
+  }
+};
+
+// ../shared/dist/vegaTransport.js
+var DISPATCH_MUTATION = `mutation AgentDispatch($input: AgentDispatchInput!) {
+  agentDispatch(input: $input) { conversation_id success }
+}`;
+var STATUS_QUERY = `query AgentDispatchStatus($id: StringID!) {
+  agentDispatchStatus(conversation_id: $id) {
+    conversation_id
+    status
+    messages { role content turn is_final }
+    tags { key value }
+  }
+}`;
+var GraphQLVegaTransport = class {
+  opts;
+  constructor(opts) {
+    this.opts = opts;
+  }
+  async gql(query, variables) {
+    const headerName = this.opts.authHeaderName ?? "Authorization";
+    const scheme = this.opts.authScheme ?? "";
+    const res = await fetch(this.opts.endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        [headerName]: `${scheme} ${this.opts.token}`.trim()
+      },
+      body: JSON.stringify({ query, variables })
+    });
+    const json = await res.json();
+    if (!res.ok || json.errors) {
+      throw new Error(`Vega GraphQL error (HTTP ${res.status}): ${JSON.stringify(json.errors ?? "")}`);
+    }
+    return json.data;
+  }
+  async dispatch(req) {
+    const input = {
+      prompt: req.prompt,
+      ai_config_key: req.configKey,
+      request_type: this.opts.requestType ?? "Fix"
+    };
+    if (this.opts.repositories?.length)
+      input.repositories = this.opts.repositories;
+    if (req.maxTurns !== void 0)
+      input.max_turns = req.maxTurns;
+    if (this.opts.projectSlug)
+      input.project_slug = this.opts.projectSlug;
+    const data = await this.gql(DISPATCH_MUTATION, { input });
+    if (!data.agentDispatch?.success) {
+      throw new Error(`Vega dispatch was not accepted for config '${req.configKey}'`);
+    }
+    return { conversationId: data.agentDispatch.conversation_id };
+  }
+  async getStatus(conversationId) {
+    const data = await this.gql(STATUS_QUERY, { id: conversationId });
+    const p = data.agentDispatchStatus;
+    const tags = {};
+    for (const t of p.tags ?? [])
+      tags[t.key] = t.value;
+    return {
+      conversationId: p.conversation_id,
+      status: p.status,
+      messages: p.messages.map((m) => ({
+        role: m.role,
+        content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+        isFinal: m.is_final
+      })),
+      tags
+    };
+  }
+};
 
 // ../shared/dist/vegaAgentRunner.js
 var VegaAgentRunner = class {
@@ -36384,6 +36658,288 @@ function blastRadius(graph, changedFiles, maxDepth = 3) {
     })),
     gaps: graph.gaps
   };
+}
+
+// ../shared/dist/sentry/sentryClient.js
+async function sentryFetch(conn, path5, init2) {
+  return fetch(`${conn.apiBase}${path5}`, {
+    ...init2,
+    headers: {
+      Authorization: `Bearer ${conn.authToken}`,
+      "Content-Type": "application/json",
+      ...init2?.headers ?? {}
+    }
+  });
+}
+async function searchIssues(conn, opts = {}) {
+  const query = opts.query ?? "is:unresolved";
+  const statsPeriod = opts.statsPeriod ?? "24h";
+  const limit2 = opts.limit ?? 10;
+  const sort = opts.sort ?? "freq";
+  const url = `/api/0/projects/${encodeURIComponent(conn.org)}/${encodeURIComponent(conn.project)}/issues/?query=${encodeURIComponent(query)}&statsPeriod=${encodeURIComponent(statsPeriod)}&sort=${encodeURIComponent(sort)}&limit=${limit2}`;
+  const res = await sentryFetch(conn, url);
+  if (!res.ok) {
+    throw new Error(`Sentry issues HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  }
+  const items = await res.json();
+  return Array.isArray(items) ? items : [];
+}
+function relatedIssueSearchTokens(flagKey) {
+  const key = flagKey.trim();
+  if (!key)
+    return [];
+  const tokens = /* @__PURE__ */ new Set([key]);
+  const stripped = key.replace(/^(enable|show|allow|use|with|flag)-/i, "");
+  if (stripped && stripped !== key)
+    tokens.add(stripped);
+  return [...tokens];
+}
+function buildRelatedIssueQueries(ctx) {
+  const queries = [];
+  const tokens = ctx.flagKey ? relatedIssueSearchTokens(ctx.flagKey) : [];
+  for (const t of tokens) {
+    queries.push(`is:unresolved feature:${t}`);
+    queries.push(`is:unresolved flag:${t}`);
+    queries.push(`is:unresolved ${t}`);
+    if (ctx.targetVariation) {
+      queries.push(`is:unresolved feature:${t} ${ctx.targetVariation}`);
+    }
+  }
+  if (ctx.sha)
+    queries.push(`is:unresolved release:${ctx.sha}`);
+  queries.push("is:unresolved");
+  return [...new Set(queries)];
+}
+function issueMentionsFlag(issue, flagKey) {
+  const hay = `${issue.title ?? ""} ${issue.culprit ?? ""} ${issue.shortId ?? ""}`;
+  if (hay.includes(flagKey))
+    return true;
+  for (const t of relatedIssueSearchTokens(flagKey)) {
+    if (hay.includes(t))
+      return true;
+  }
+  return false;
+}
+async function findRelatedIssue(conn, ctx) {
+  const statsPeriod = ctx.statsPeriod ?? "24h";
+  const queries = buildRelatedIssueQueries(ctx);
+  let lastError = null;
+  let sawSuccessfulEmpty = false;
+  let fallback = null;
+  for (const query of queries) {
+    try {
+      const items = await searchIssues(conn, { query, statsPeriod, limit: 10, sort: "freq" });
+      if (items.length === 0) {
+        sawSuccessfulEmpty = true;
+        continue;
+      }
+      if (ctx.flagKey) {
+        const flagged = items.find((i) => issueMentionsFlag(i, ctx.flagKey));
+        if (flagged)
+          return flagged;
+        if (query.includes("feature:") || query.includes("flag:")) {
+          return items[0];
+        }
+        fallback ??= items[0];
+        continue;
+      }
+      return items[0];
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      continue;
+    }
+  }
+  if (fallback)
+    return fallback;
+  if (lastError && !sawSuccessfulEmpty)
+    throw lastError;
+  return null;
+}
+async function eventStats(conn, opts = {}) {
+  const query = opts.query ?? "event.type:error";
+  const statsPeriod = opts.statsPeriod ?? "24h";
+  const interval = opts.interval ?? "1h";
+  const url = `/api/0/projects/${encodeURIComponent(conn.org)}/${encodeURIComponent(conn.project)}/events/stats/?query=${encodeURIComponent(query)}&statsPeriod=${encodeURIComponent(statsPeriod)}&interval=${encodeURIComponent(interval)}`;
+  const res = await sentryFetch(conn, url);
+  if (!res.ok)
+    return [];
+  const raw = await res.json();
+  return normalizeStats(raw);
+}
+function normalizeStats(raw) {
+  if (!Array.isArray(raw))
+    return [];
+  const out = [];
+  for (const row of raw) {
+    if (!Array.isArray(row) || row.length < 2)
+      continue;
+    const time = Number(row[0]);
+    const bucket = row[1];
+    let count = 0;
+    if (Array.isArray(bucket) && bucket[0] && typeof bucket[0] === "object") {
+      count = Number(bucket[0].count ?? 0);
+    } else if (typeof bucket === "number") {
+      count = bucket;
+    }
+    if (Number.isFinite(time))
+      out.push({ time, count });
+  }
+  return out;
+}
+async function discoverAggregates(conn, opts = {}) {
+  const field = opts.field ?? "count()";
+  const query = opts.query ?? "event.type:error";
+  const statsPeriod = opts.statsPeriod ?? "24h";
+  const url = `/api/0/organizations/${encodeURIComponent(conn.org)}/events/?project=${encodeURIComponent(conn.project)}&field=${encodeURIComponent(field)}&query=${encodeURIComponent(query)}&statsPeriod=${encodeURIComponent(statsPeriod)}&referrer=auto-factory-estate`;
+  try {
+    const res = await sentryFetch(conn, url);
+    if (!res.ok)
+      return {};
+    const data = await res.json();
+    const row = data.data?.[0];
+    if (!row)
+      return {};
+    const out = {};
+    for (const [k, v] of Object.entries(row)) {
+      if (typeof v === "number" || typeof v === "string")
+        out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+async function sampleErrorEvents(conn, opts = {}) {
+  const limit2 = opts.limit ?? 10;
+  const statsPeriod = opts.statsPeriod ?? "24h";
+  const query = opts.query ?? "event.type:error";
+  const url = `/api/0/projects/${encodeURIComponent(conn.org)}/${encodeURIComponent(conn.project)}/events/?query=${encodeURIComponent(query)}&statsPeriod=${encodeURIComponent(statsPeriod)}&limit=${limit2}&full=true`;
+  try {
+    const res = await sentryFetch(conn, url);
+    if (!res.ok)
+      return { sampled: 0, withLaunchdarklyContext: 0, flagTagHits: [] };
+    const events = await res.json();
+    if (!Array.isArray(events))
+      return { sampled: 0, withLaunchdarklyContext: 0, flagTagHits: [] };
+    let withLaunchdarklyContext = 0;
+    const flagTagHits = [];
+    for (const ev of events) {
+      if (ev.context && "launchdarklyContext" in ev.context)
+        withLaunchdarklyContext += 1;
+      for (const t of ev.tags ?? []) {
+        if (t.key === "flag" || t.key.startsWith("ld.") || t.key.includes("feature")) {
+          flagTagHits.push(`${t.key}=${t.value}`);
+        }
+      }
+    }
+    return { sampled: events.length, withLaunchdarklyContext, flagTagHits: [...new Set(flagTagHits)].slice(0, 20) };
+  } catch {
+    return { sampled: 0, withLaunchdarklyContext: 0, flagTagHits: [] };
+  }
+}
+
+// ../shared/dist/sentry/sentryEnv.js
+function sentryConnectionFromEnv(env = process.env) {
+  const authToken = env.SENTRY_AUTH_TOKEN?.trim();
+  const org = env.SENTRY_ORG?.trim();
+  const project = env.SENTRY_PROJECT?.trim();
+  if (!authToken || !org || !project)
+    return null;
+  return {
+    authToken,
+    org,
+    project,
+    apiBase: (env.SENTRY_API_BASE || "https://sentry.io").replace(/\/+$/, "")
+  };
+}
+
+// ../shared/dist/sentry/sentryEstate.js
+function statsPeriodFromHours(hours) {
+  if (hours <= 1)
+    return "1h";
+  if (hours <= 24)
+    return `${Math.max(1, Math.round(hours))}h`;
+  if (hours <= 24 * 7)
+    return `${Math.max(1, Math.round(hours / 24))}d`;
+  return "14d";
+}
+async function getEstatePicture(opts = {}) {
+  const conn = opts.connection === void 0 ? sentryConnectionFromEnv() : opts.connection;
+  if (!conn) {
+    return {
+      available: false,
+      warning: "Sentry estate unavailable \u2014 set SENTRY_AUTH_TOKEN, SENTRY_ORG, and SENTRY_PROJECT (same token family as Beacon Seer). Repo may still have the Sentry SDK; detect via grep.",
+      dualExportHint: "Latency guardrails still need LD-native metrics (otel* / track() / kind=trace). If the app only sends OTLP to Sentry, dual-export to LD hosted o11y (ADR 0015)."
+    };
+  }
+  const windowHours = opts.windowHours ?? 24;
+  const statsPeriod = statsPeriodFromHours(windowHours);
+  const notes = [];
+  const issueQueryParts = ["is:unresolved"];
+  if (opts.flagKey)
+    issueQueryParts.push(opts.flagKey);
+  if (opts.query)
+    issueQueryParts.push(opts.query);
+  if (opts.transaction)
+    issueQueryParts.push(`transaction:${opts.transaction}`);
+  try {
+    const [topIssues, relatedIssue, stats, aggregates, attribution] = await Promise.all([
+      searchIssues(conn, {
+        query: issueQueryParts.join(" "),
+        statsPeriod,
+        limit: 8,
+        sort: "freq"
+      }),
+      findRelatedIssue(conn, {
+        flagKey: opts.flagKey,
+        sha: opts.sha,
+        statsPeriod
+      }),
+      eventStats(conn, {
+        query: opts.transaction ? `event.type:error transaction:${opts.transaction}` : "event.type:error",
+        statsPeriod
+      }),
+      discoverAggregates(conn, {
+        field: "count()",
+        query: opts.transaction ? `event.type:error transaction:${opts.transaction}` : "event.type:error",
+        statsPeriod
+      }),
+      sampleErrorEvents(conn, {
+        statsPeriod,
+        query: opts.flagKey ? `event.type:error ${opts.flagKey}` : "event.type:error",
+        limit: 10
+      })
+    ]);
+    const errorCountApprox = stats.reduce((s, p) => s + p.count, 0);
+    if (attribution.sampled > 0 && attribution.withLaunchdarklyContext === 0) {
+      notes.push("Recent error events lack Sentry custom context 'launchdarklyContext' \u2014 the LD\u2194Sentry metrics integration will ignore them until instrumented (ADR 0014).");
+    }
+    notes.push("Do NOT attach Sentry Explore aggregates as guarded-release metrics. Use LD metrics: sentry-errors-* (errors), otel*/track()/trace (latency/business).");
+    return {
+      available: true,
+      org: conn.org,
+      project: conn.project,
+      statsPeriod,
+      topIssues,
+      relatedIssue,
+      errorCountApprox,
+      aggregates,
+      attribution: {
+        ...attribution,
+        launchdarklyContextGap: attribution.sampled > 0 && attribution.withLaunchdarklyContext === 0
+      },
+      dualExportHint: "If list_metrics shows no otel* autogens but Sentry has traffic, enable dual-export: same OTel spans \u2192 Sentry and LD hosted o11y (or run @launchdarkly/observability alongside Sentry). Knowledge-graph service edges still read LD MCP query-traces (ADR 0010/0015).",
+      notes
+    };
+  } catch (e) {
+    return {
+      available: false,
+      org: conn.org,
+      project: conn.project,
+      warning: `Sentry estate query failed: ${e instanceof Error ? e.message : e}`,
+      dualExportHint: "Fall back to repo detection (grep Sentry SDK) + list_metrics for otel*/sentry-errors-*."
+    };
+  }
 }
 
 // ../shared/dist/anthropic/ldWriter.js
@@ -36978,7 +37534,7 @@ var USE_EXISTING_FLAG_TOOL = {
 };
 var CREATE_METRIC_TOOL = {
   name: "create_metric",
-  description: "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) \u2014 pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, \u2026)` call on the path the flag wraps, via edit_file) so the metric has data once live. (2) TRACE-backed \u2014 pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span \u2014 see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
+  description: "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) \u2014 pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, \u2026)` call on the path the flag wraps, via edit_file) so the metric has data once live \u2014 EXCEPTION: event_key `sentry-errors` is fed by the LD\u2194Sentry integration (no track() emitter). Prefer reusing provisioned `sentry-errors-binary` / `sentry-errors-count` via list_metrics when Sentry is present (ADR 0014). (2) TRACE-backed \u2014 pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span \u2014 see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
   input_schema: {
     type: "object",
     properties: {
@@ -37119,6 +37675,35 @@ var QUERY_DEPENDENCIES_TOOL = {
     }
   }
 };
+var QUERY_SENTRY_TOOL = {
+  name: "query_sentry",
+  description: "Query the Sentry estate picture for this app (ADR 0015): top unresolved issues, approximate error volume, whether recent errors carry launchdarklyContext (required for the LD\u2194Sentry metrics integration), and dual-export guidance for otel* latency guardrails. Call EARLY when the repo has Sentry or when choosing error killswitches. Does NOT create LaunchDarkly metrics \u2014 use list_metrics / create_metric / write_manifest for that. Sentry Explore aggregates alone are NEVER valid guarded-release backings. Soft-fails with available:false when SENTRY_AUTH_TOKEN / SENTRY_ORG / SENTRY_PROJECT are unset.",
+  input_schema: {
+    type: "object",
+    properties: {
+      window_hours: {
+        type: "number",
+        description: "Lookback window in hours (default 24)."
+      },
+      flag_key: {
+        type: "string",
+        description: "Flag key to bias issue search (usually from the Flag Implementer)."
+      },
+      query: {
+        type: "string",
+        description: "Optional extra Sentry issue/Discover query fragment."
+      },
+      transaction: {
+        type: "string",
+        description: "Optional transaction/endpoint name to scope error stats."
+      },
+      sha: {
+        type: "string",
+        description: "Optional release/deploy SHA for issue search."
+      }
+    }
+  }
+};
 var QUERY_RELATED_REPOS_TOOL = {
   name: "query_related_repos",
   description: "Query the estate's OTHER repositories, registered in .autofactory/services.yaml under relatedRepos \u2014 for split-repo estates where upstream/downstream services live outside this checkout. Call op='list' FIRST to see which repos exist and how each relates to this one (downstream = consumes this repo's surfaces; upstream = this repo consumes theirs). Then op='search' the relevant repos for the concrete surfaces this PR touches \u2014 endpoint paths, event names, shared types, LaunchDarkly flag keys \u2014 and op='read_file'/'list_dir' for exact contents. Cite repo+path evidence in your cross_repo_impact findings and prerequisite-flag recommendation. Search covers each repo's DEFAULT branch and may lag recent pushes: no hits is weak evidence, never proof of no impact. A failed call must not block your task \u2014 report the gap and continue.",
@@ -37162,6 +37747,7 @@ var SANDBOX_TOOL_DEFS = new Map([
   ...READONLY_TOOLS,
   READ_LD_DOCS_TOOL,
   QUERY_DEPENDENCIES_TOOL,
+  QUERY_SENTRY_TOOL,
   QUERY_RELATED_REPOS_TOOL,
   GET_FLAG_STATE_TOOL,
   CREATE_FLAG_TOOL,
@@ -37201,6 +37787,8 @@ function buildSandboxTools(caps) {
     tools.push(READ_LD_DOCS_TOOL);
   if (caps.queryGraph)
     tools.push(QUERY_DEPENDENCIES_TOOL);
+  if (caps.querySentry)
+    tools.push(QUERY_SENTRY_TOOL);
   if (caps.queryRepos)
     tools.push(QUERY_RELATED_REPOS_TOOL);
   if (caps.flagState)
@@ -37228,6 +37816,7 @@ var TOOL_OWNED_TAGS = /* @__PURE__ */ new Set([
   "metric_event_keys",
   "tests_last_run"
 ]);
+var EXTERNAL_METRIC_EVENT_KEYS = /* @__PURE__ */ new Set(["sentry-errors"]);
 var SandboxToolExecutor = class {
   root;
   writer;
@@ -37307,6 +37896,8 @@ var SandboxToolExecutor = class {
           return this.writeManifestTool(String(input.path ?? ""), input.manifest);
         case "query_dependencies":
           return this.queryDependencies(input);
+        case "query_sentry":
+          return await this.querySentry(input);
         case "query_related_repos":
           return await this.queryRelatedRepos(input);
         case "read_ld_docs":
@@ -37325,6 +37916,16 @@ var SandboxToolExecutor = class {
     } catch (e) {
       return { content: e instanceof Error ? e.message : String(e), isError: true };
     }
+  }
+  async querySentry(input) {
+    const picture = await getEstatePicture({
+      ...input.window_hours != null ? { windowHours: Number(input.window_hours) } : {},
+      ...input.flag_key ? { flagKey: String(input.flag_key) } : {},
+      ...input.query ? { query: String(input.query) } : {},
+      ...input.transaction ? { transaction: String(input.transaction) } : {},
+      ...input.sha ? { sha: String(input.sha) } : {}
+    });
+    return { content: JSON.stringify(picture, null, 2) };
   }
   /**
    * `query_dependencies`: no `node` → blast radius of the PR's changed files;
@@ -37720,7 +38321,7 @@ ${verdicts.join("\n")}` : "")
     if (!keys.includes(result.key))
       keys.push(result.key);
     this.tags.metric_keys = keys.join(",");
-    if (input.event_key) {
+    if (input.event_key && !EXTERNAL_METRIC_EVENT_KEYS.has(String(input.event_key))) {
       const events = this.tags.metric_event_keys ? this.tags.metric_event_keys.split(",").filter(Boolean) : [];
       if (!events.includes(String(input.event_key)))
         events.push(String(input.event_key));
@@ -38013,95 +38614,6 @@ ${t.out}`), isError: t.code !== 0 };
 
 // ../shared/dist/anthropic/anthropicAgentRunner.js
 init_sdk();
-
-// ../shared/dist/observability.js
-import * as nodeModule from "node:module";
-var TRACER_NAME = "launchdarkly-auto-factory";
-var MAX_CONTENT = 8e3;
-var NOOP_SPAN = {
-  setAttribute() {
-    return NOOP_SPAN;
-  },
-  setAttributes() {
-    return NOOP_SPAN;
-  },
-  setStatus() {
-    return NOOP_SPAN;
-  },
-  recordException() {
-  },
-  addEvent() {
-    return NOOP_SPAN;
-  },
-  updateName() {
-    return NOOP_SPAN;
-  },
-  end() {
-  },
-  isRecording() {
-    return false;
-  },
-  spanContext() {
-    return { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
-  }
-};
-function loadOtelApi() {
-  try {
-    return nodeModule.createRequire(import.meta.url)("@opentelemetry/api");
-  } catch {
-    return {
-      trace: { getTracer: () => ({ startSpan: () => NOOP_SPAN }) },
-      // Values mirror the OTel API enums so recorded constants stay comparable.
-      SpanKind: { INTERNAL: 0, SERVER: 1, CLIENT: 2, PRODUCER: 3, CONSUMER: 4 },
-      SpanStatusCode: { UNSET: 0, OK: 1, ERROR: 2 }
-    };
-  }
-}
-var otel = loadOtelApi();
-var SpanKind = otel.SpanKind;
-var SpanStatusCode = otel.SpanStatusCode;
-function aiTracer() {
-  return otel.trace.getTracer(TRACER_NAME);
-}
-function truncate(s) {
-  return s.length > MAX_CONTENT ? `${s.slice(0, MAX_CONTENT)}\u2026[truncated]` : s;
-}
-function setGenAiAttributes(span, d) {
-  try {
-    const attrs = {
-      "gen_ai.operation.name": "chat",
-      "gen_ai.system": d.provider,
-      "gen_ai.provider": d.provider,
-      "gen_ai.request.model": d.requestModel,
-      "gen_ai.model": d.requestModel
-    };
-    if (d.usage) {
-      attrs["gen_ai.usage.input_tokens"] = d.usage.input;
-      attrs["gen_ai.usage.output_tokens"] = d.usage.output;
-      attrs["gen_ai.usage.total_tokens"] = d.usage.total;
-      attrs["gen_ai.usage.prompt_tokens"] = d.usage.input;
-      attrs["gen_ai.usage.completion_tokens"] = d.usage.output;
-    }
-    if (d.prompt)
-      attrs["gen_ai.input"] = truncate(d.prompt);
-    if (d.output)
-      attrs["gen_ai.output"] = truncate(d.output);
-    attrs["launchdarkly.run.id"] = pipelineRunId();
-    const td = d.tracker?.getTrackData?.();
-    if (td) {
-      attrs["launchdarkly.ai.config.key"] = td.configKey;
-      attrs["launchdarkly.ai.config.variation"] = td.variationKey;
-      attrs["launchdarkly.ai.config.version"] = td.version;
-      attrs["launchdarkly.ai.config.model"] = td.modelName;
-      attrs["launchdarkly.ai.provider"] = td.providerName;
-      attrs["launchdarkly.ai.run.id"] = td.runId;
-      if (td.graphKey)
-        attrs["launchdarkly.ai.graph.key"] = td.graphKey;
-    }
-    span.setAttributes(attrs);
-  } catch {
-  }
-}
 
 // ../shared/dist/github/relatedRepos.js
 var import_yaml3 = __toESM(require_dist(), 1);
@@ -38705,6 +39217,9 @@ function modeNote(caps) {
   if (caps.queryGraph) {
     lines.push("You have `query_dependencies` \u2014 the estate's knowledge graph (service call edges observed from LaunchDarkly telemetry + flag\u2192code wrap points). Call it with NO arguments EARLY to get this PR's blast radius (changed services, dependent services at risk, upstream contracts, flags already on the changed code) and let it inform your classification and risk_score. Treat any entry in its `gaps` list as UNKNOWN coverage \u2014 a thin graph is never evidence of low impact.");
   }
+  if (caps.querySentry) {
+    lines.push("You have `query_sentry` \u2014 a Sentry estate picture (top issues, error volume, whether recent errors carry `launchdarklyContext`, dual-export hints for otel*). Call it EARLY when choosing error killswitches or when the repo has Sentry. It does not create LD metrics; attach sentry-errors-* / otel* via list_metrics + write_manifest. Never treat Sentry Explore aggregates as guarded-release backings (ADR 0015).");
+  }
   if (caps.queryRepos) {
     lines.push("You have `query_related_repos` \u2014 the estate's OTHER repositories, registered by this repo (relatedRepos in .autofactory/services.yaml). Call op='list' EARLY, then establish upstream/downstream impact of the concrete surfaces this PR touches (endpoint paths, event names, shared types, flag keys). EVIDENCE PROTOCOL: op='search' first; when search rate-limits or returns nothing, NAVIGATE instead \u2014 op='list_dir' the repo, op='read_file' the module serving the consumed surface; flag gates read like isEnabled(\"<flag-key>\") with the key declared as a constant near the top of the gated module. A flag key you report MUST be the exact string from the code \u2014 never a guess, never prose. If your output contract includes cross_repo_impact / prerequisite_flag_recommendation sections, ground them in this evidence (repo+path); if you are CONSUMING a brief's cross-repo claim (e.g. a parent flag key), verify it here before acting on it or downgrading it. No search hits is weak evidence, never proof of no impact.");
   }
@@ -38751,7 +39266,7 @@ var NODE_CAPABILITIES = {
   "autofactory-flag-testing": { createFlag: false, createMetric: false, editFiles: true },
   // The metrics author creates LD metrics and instruments the event (track()) that
   // feeds them — so it needs create_metric AND edit_files (+ manifest updates).
-  "autofactory-metrics-author": { createFlag: false, createMetric: true, editFiles: true, writeManifest: true, readDocs: true, queryGraph: true },
+  "autofactory-metrics-author": { createFlag: false, createMetric: true, editFiles: true, writeManifest: true, readDocs: true, queryGraph: true, querySentry: true },
   // The reviewer is read-only but verifies LaunchDarkly semantics — docs access
   // lets it check claims against the source instead of trusting the chain.
   "autofactory-code-reviewer": { createFlag: false, createMetric: false, editFiles: false, readDocs: true }
@@ -38777,6 +39292,7 @@ var CAP_EDIT_FILES = "edit_files";
 var CAP_WRITE_MANIFEST = "write_manifest";
 var CAP_STEWARD_MANIFEST = "steward_manifest";
 var CAP_QUERY_GRAPH = "query_graph";
+var CAP_QUERY_SENTRY = "query_sentry";
 var CAP_READ_DOCS = "read_docs";
 var CAP_QUERY_REPOS = "query_repos";
 function resolveGrant(configKey, capabilities) {
@@ -38790,6 +39306,7 @@ function resolveGrant(configKey, capabilities) {
         writeManifest: capabilities.includes(CAP_WRITE_MANIFEST),
         stewardManifest: capabilities.includes(CAP_STEWARD_MANIFEST),
         queryGraph: capabilities.includes(CAP_QUERY_GRAPH),
+        querySentry: capabilities.includes(CAP_QUERY_SENTRY),
         readDocs: capabilities.includes(CAP_READ_DOCS),
         queryRepos: capabilities.includes(CAP_QUERY_REPOS)
       },
@@ -38821,14 +39338,15 @@ var AnthropicAgentRunner = class {
       stewardManifest: grant.stewardManifest === true && this.opts.codeChangesEnabled === true,
       // Read-only; globally enabled by the presence of a composed graph (KG flag).
       queryGraph: grant.queryGraph === true && this.opts.knowledgeGraph !== void 0,
+      // Read-only; soft when SENTRY_* unset (estate picture returns available:false).
+      querySentry: grant.querySentry === true,
       // Read-only; no global gate (fetch failures degrade inside the tool).
       readDocs: grant.readDocs === true,
       // Read-only; globally enabled by a registered relatedRepos list + a token.
       queryRepos: grant.queryRepos === true && (this.opts.relatedRepos?.length ?? 0) > 0 && Boolean(this.opts.githubToken ?? process.env.GITHUB_TOKEN)
     };
-    console.log(`[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} queryRepos=${grant.queryRepos === true} \u2192 effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} queryRepos=${caps.queryRepos === true}`);
+    console.log(`[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} querySentry=${grant.querySentry === true} queryRepos=${grant.queryRepos === true} \u2192 effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} querySentry=${caps.querySentry === true} queryRepos=${caps.queryRepos === true}`);
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
-    const system = (req.instructions ?? "") + modeNote(caps);
     const model = anthropicModelId(req.model);
     console.log(`[node] ${req.configKey} anthropic model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
     const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true);
@@ -38843,6 +39361,8 @@ var AnthropicAgentRunner = class {
       console.warn(`[node] ${req.configKey} LD variation attaches tool(s) with no local implementation: ${overlay.unknown.join(", ")} \u2014 ignored (execution lives in the runner; add the implementation or detach them)`);
     }
     const tools = overlay.tools;
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const system = (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
     const toolCallsUsed = /* @__PURE__ */ new Set();
     const maxTurns = req.maxTurns ?? DEFAULT_MAX_TURNS;
     const messages = [{ role: "user", content: req.prompt }];
@@ -38851,7 +39371,7 @@ var AnthropicAgentRunner = class {
     let inputTokens = 0;
     let outputTokens = 0;
     const started = Date.now();
-    const span = aiTracer().startSpan(`chat ${req.configKey}`, { kind: SpanKind.CLIENT });
+    const span = startAiSpan(`chat ${req.configKey}`, { op: "gen_ai.chat" });
     try {
       for (let turn = 0; turn < maxTurns; turn++) {
         const resp = await this.client.messages.create({
@@ -38912,8 +39432,7 @@ var AnthropicAgentRunner = class {
       status = "failed";
       finalText = e instanceof Error ? e.message : String(e);
       req.tracker?.trackError();
-      if (e instanceof Error)
-        span.recordException(e);
+      span.recordException(e);
     } finally {
       req.tracker?.trackDuration(Date.now() - started);
       if (toolCallsUsed.size > 0) {
@@ -38925,16 +39444,16 @@ var AnthropicAgentRunner = class {
       if (inputTokens || outputTokens) {
         req.tracker?.trackTokens({ input: inputTokens, output: outputTokens, total: inputTokens + outputTokens });
       }
-      setGenAiAttributes(span, {
+      span.setGenAi({
         provider: "anthropic",
         requestModel: model,
+        agentName: req.configKey,
         ...req.tracker ? { tracker: req.tracker } : {},
         prompt: req.prompt,
         output: finalText,
         ...inputTokens || outputTokens ? { usage: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens } } : {}
       });
-      span.setStatus({ code: status === "completed" ? SpanStatusCode.OK : SpanStatusCode.ERROR });
-      span.end();
+      span.end(status === "completed" ? "ok" : "error");
     }
     return {
       status,
@@ -39075,12 +39594,14 @@ var CursorAgentRunner = class {
       stewardManifest: grant.stewardManifest === true && this.opts.codeChangesEnabled === true,
       // Read-only; globally enabled by the presence of a composed graph (KG flag).
       queryGraph: grant.queryGraph === true && this.opts.knowledgeGraph !== void 0,
+      // Read-only; soft when SENTRY_* unset (estate picture returns available:false).
+      querySentry: grant.querySentry === true,
       // Read-only; no global gate (fetch failures degrade inside the tool).
       readDocs: grant.readDocs === true,
       // Read-only; globally enabled by a registered relatedRepos list + a token.
       queryRepos: grant.queryRepos === true && (this.opts.relatedRepos?.length ?? 0) > 0 && Boolean(this.opts.githubToken ?? process.env.GITHUB_TOKEN)
     };
-    console.log(`[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} queryRepos=${grant.queryRepos === true} \u2192 effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} queryRepos=${caps.queryRepos === true}`);
+    console.log(`[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} querySentry=${grant.querySentry === true} queryRepos=${grant.queryRepos === true} \u2192 effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} querySentry=${caps.querySentry === true} queryRepos=${caps.queryRepos === true}`);
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
     const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true);
     if (caps.queryGraph && this.opts.knowledgeGraph) {
@@ -39105,7 +39626,8 @@ var CursorAgentRunner = class {
     } else {
       console.log(`[node] ${req.configKey} cursor model \u2192 '${match.id}' (${match.reason}); ${paramSummary}`);
     }
-    const preamble = (req.instructions ?? "") + modeNote(caps);
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const preamble = (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
     const message = `${preamble}
 
 ---
@@ -39116,7 +39638,7 @@ ${req.prompt}`;
     let usage;
     let agent;
     const started = Date.now();
-    const span = aiTracer().startSpan(`chat ${req.configKey}`, { kind: SpanKind.CLIENT });
+    const span = startAiSpan(`chat ${req.configKey}`, { op: "gen_ai.chat" });
     try {
       const { Agent } = await loadCursorSdk();
       agent = await Agent.create({
@@ -39164,8 +39686,7 @@ ${req.prompt}`;
       status = "failed";
       finalText = e instanceof Error ? e.message : String(e);
       req.tracker?.trackError();
-      if (e instanceof Error)
-        span.recordException(e);
+      span.recordException(e);
     } finally {
       req.tracker?.trackDuration(Date.now() - started);
       if (toolCallsUsed.size > 0) {
@@ -39177,16 +39698,16 @@ ${req.prompt}`;
       if (usage) {
         req.tracker?.trackTokens({ input: usage.inputTokens, output: usage.outputTokens, total: usage.totalTokens });
       }
-      setGenAiAttributes(span, {
+      span.setGenAi({
         provider: "cursor",
         requestModel: match.id,
+        agentName: req.configKey,
         ...req.tracker ? { tracker: req.tracker } : {},
         prompt: message,
         output: finalText,
         ...usage ? { usage: { input: usage.inputTokens, output: usage.outputTokens, total: usage.totalTokens } } : {}
       });
-      span.setStatus({ code: status === "completed" ? SpanStatusCode.OK : SpanStatusCode.ERROR });
-      span.end();
+      span.end(status === "completed" ? "ok" : "error");
       if (agent) {
         try {
           await agent[Symbol.asyncDispose]();
@@ -39201,6 +39722,9 @@ ${req.prompt}`;
     };
   }
 };
+
+// ../shared/dist/index.js
+init_sentryInit();
 
 // ../shared/dist/judges.js
 var judgeSdkLogger = {
@@ -39221,7 +39745,7 @@ var CompletionJudgeRunner = class {
   }
   async run(input, outputType) {
     const system = (this.judgeCfg.messages ?? []).map((m) => m.content).join("\n\n");
-    const span = aiTracer().startSpan(`judge ${this.spanMeta.judgeKey}`, { kind: SpanKind.CLIENT });
+    const span = startAiSpan(`judge ${this.spanMeta.judgeKey}`, { op: "gen_ai.chat" });
     try {
       const r = await this.completion({
         ...this.judgeCfg.model?.name ? { model: this.judgeCfg.model.name } : {},
@@ -39229,35 +39753,29 @@ var CompletionJudgeRunner = class {
         input,
         schema: outputType ?? {}
       });
-      setGenAiAttributes(span, {
+      span.setGenAi({
         provider: this.spanMeta.provider ?? "unknown",
         requestModel: this.judgeCfg.model?.name ?? "unknown",
+        agentName: this.spanMeta.judgeKey,
         prompt: `${system}
 
 ${input}`,
         output: r.content,
         ...r.tokens ? { usage: r.tokens } : {}
       });
-      span.setAttributes({
+      span.otel.setAttributes({
         "launchdarkly.ai.config.key": this.spanMeta.judgeKey,
         "launchdarkly.ai.judge.of": this.spanMeta.judgedConfigKey
       });
-      if (!r.success) {
-        span.setStatus({ code: SpanStatusCode.ERROR, message: "judge completion failed" });
-      }
+      span.end(r.success ? "ok" : "error", r.success ? void 0 : "judge completion failed");
       return {
         content: r.content,
         ...r.parsed ? { parsed: r.parsed } : {},
         metrics: { success: r.success, ...r.tokens ? { tokens: r.tokens } : {} }
       };
     } catch (e) {
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: e instanceof Error ? e.message : String(e)
-      });
+      span.end("error", e instanceof Error ? e.message : String(e));
       throw e;
-    } finally {
-      span.end();
     }
   }
 };
@@ -39870,6 +40388,7 @@ async function detectConfigDrift(graphKey) {
 async function main() {
   mapActionInputs();
   const context = assemblePrContext();
+  await initFactorySentry({ serviceName: "auto-factory-phase1-gha" });
   const { ldClient, aiClient } = await getLdSdk();
   let ldContext = pipelineContext();
   const provider = await resolveAiProvider(ldClient, ldContext);

@@ -1,9 +1,9 @@
 # Drop this into your app repo at .github/workflows/auto-factory.yml
 #
-# Phase 1 is OPT-IN via the PR label `autofactory` — intended for user-created
-# new features, not every PR (docs, chores, bugfixes behind an existing flag).
-# Add the label when opening/updating a feature PR (or when you want the chain
-# to run). Bugfixes and unlabeled PRs skip the job.
+# Phase 1 runs on every PR (opened/updated) by default. To make it label-gated
+# instead — only PRs carrying the `autofactory` label run (e.g. feature PRs, not
+# docs/chores) — set the repository variable AUTOFACTORY_REQUIRE_LABEL=true
+# (Settings → Secrets and variables → Actions → Variables). Unset = every PR.
 #
 # The agent chain runs on the Anthropic API by default. The
 # auto-factory-ai-provider flag in the factory project selects the backend; it
@@ -15,7 +15,7 @@
 # array of agent node keys) pauses the chain before those steps. The run halts
 # and comments which label to add (af-approve:<step>); the `labeled` trigger
 # below makes adding that label re-run the chain so it proceeds past the gate
-# (keep the `autofactory` label on the PR so the job still matches).
+# (with AUTOFACTORY_REQUIRE_LABEL, keep `autofactory` on the PR so the job matches).
 #
 # Providers: this drop-in form works for the 'anthropic' (default) and 'vega'
 # backends. The 'cursor' backend can't run here — its @cursor/sdk dependency needs
@@ -36,11 +36,13 @@ permissions:
 jobs:
   auto-factory:
     runs-on: ubuntu-latest
-    # Opt-in: require the `autofactory` label (new features). Also skip the
-    # CI-loop bot actor. Primary loop guard is still `[skip ci]` on agent commits.
+    # CI-loop guard (secondary — the primary guard is `[skip ci]` on agent
+    # commits), plus the OPTIONAL label gate: when the repo variable
+    # AUTOFACTORY_REQUIRE_LABEL is 'true', only `autofactory`-labeled PRs run.
     if: |
       github.actor != 'github-actions[bot]' &&
-      contains(github.event.pull_request.labels.*.name, 'autofactory')
+      (vars.AUTOFACTORY_REQUIRE_LABEL != 'true' ||
+       contains(github.event.pull_request.labels.*.name, 'autofactory'))
     steps:
       - uses: actions/checkout@v4
         with:

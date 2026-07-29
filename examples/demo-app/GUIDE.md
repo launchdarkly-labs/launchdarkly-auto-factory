@@ -30,12 +30,13 @@ deployed the same `.release-flags/` file before releasing.
 1. **Phase 1** — open a PR that adds a feature behind a flag; the agents create the flag
    + metrics and wire it in. (The committed example uses `new-greeting`, but agents derive
    a flag key per-PR from the change — don't expect that exact key on your own PRs.)
-   When Sentry is present, the metrics author calls `query_sentry` for an estate picture,
-   prefers shared `sentry-errors-*` LD metrics as the error killswitch, and instruments
-   `launchdarklyContext` for the LD↔Sentry integration. Latency still needs LD-backed
-   metrics (`otel*` / `track()`), not Sentry Explore aggregates alone.
+   Optional Sentry path: serve the metrics author's `sentry` variation (LD targeting)
+   and it calls `query_sentry` for an estate picture, prefers shared `sentry-errors-*`
+   LD metrics as the error killswitch, and instruments `launchdarklyContext` for the
+   LD↔Sentry integration. Latency still needs LD-backed metrics (`otel*` / `track()`),
+   not Sentry Explore aggregates alone.
 2. A `.release-flags/<flag-key>.json` lands (see `pr-1.json` for the shape) declaring the
-   flag + scope + rollout (example includes `sentry-errors-binary`).
+   flag + scope + rollout (the Sentry path additionally attaches `sentry-errors-binary`).
 3. **Phase 2** — on deploy, the Notifier pings Beacon, which discovers the new release flag and
    starts a guarded rollout via LaunchDarkly. On auto-revert, Beacon can start Seer Autofix
    (`BEACON_SEER_AUTOFIX=true`).

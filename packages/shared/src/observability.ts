@@ -109,9 +109,15 @@ export interface GenAiSpanData {
   operationName?: string;
 }
 
-/** Build GenAI + LD correlation attributes (shared by OTel and Sentry). */
-function buildGenAiAttributes(d: GenAiSpanData): Attributes {
-  const recordPrompts = process.env.SENTRY_AI_RECORD_PROMPTS === "true";
+/**
+ * Build GenAI + LD correlation attributes (shared by OTel and Sentry).
+ *
+ * `includeContent` controls whether the prompt/output land on the span. The LD
+ * span always records them (pre-Sentry behavior — LD LLM Observability is the
+ * operator's own account); the Sentry copy only includes them when the operator
+ * opts in with SENTRY_AI_RECORD_PROMPTS=true (CI prompts carry PR diffs).
+ */
+function buildGenAiAttributes(d: GenAiSpanData, includeContent: boolean): Attributes {
   const attrs: Attributes = {
     "gen_ai.operation.name": d.operationName ?? "chat",
     "gen_ai.system": d.provider,
@@ -131,7 +137,7 @@ function buildGenAiAttributes(d: GenAiSpanData): Attributes {
     attrs["gen_ai.usage.prompt_tokens"] = d.usage.input;
     attrs["gen_ai.usage.completion_tokens"] = d.usage.output;
   }
-  if (recordPrompts) {
+  if (includeContent) {
     if (d.prompt) attrs["gen_ai.input"] = truncate(d.prompt);
     if (d.output) attrs["gen_ai.output"] = truncate(d.output);
   }
@@ -158,7 +164,7 @@ function buildGenAiAttributes(d: GenAiSpanData): Attributes {
  */
 export function setGenAiAttributes(span: Span, d: GenAiSpanData): void {
   try {
-    span.setAttributes(buildGenAiAttributes(d));
+    span.setAttributes(buildGenAiAttributes(d, true));
   } catch {
     /* telemetry must never break the run */
   }
@@ -214,7 +220,9 @@ export function startAiSpan(
       setGenAiAttributes(otelSpan, d);
       if (sentrySpan) {
         try {
-          sentrySpan.setAttributes(buildGenAiAttributes(d) as Record<string, unknown>);
+          // Prompt/output content goes to Sentry only on explicit opt-in.
+          const recordPrompts = process.env.SENTRY_AI_RECORD_PROMPTS === "true";
+          sentrySpan.setAttributes(buildGenAiAttributes(d, recordPrompts) as Record<string, unknown>);
         } catch {
           /* ignore */
         }

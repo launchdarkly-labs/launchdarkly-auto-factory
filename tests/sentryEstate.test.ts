@@ -21,7 +21,7 @@ afterEach(() => {
 });
 
 function mockFetch(handler: (url: string) => { status: number; body: unknown }): void {
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
     const url = String(input);
     const { status, body } = handler(url);
     return new Response(JSON.stringify(body), {

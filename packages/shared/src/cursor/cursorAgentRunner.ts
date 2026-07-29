@@ -234,8 +234,11 @@ export class CursorAgentRunner implements AgentRunner {
     }
 
     // No system-prompt param in the SDK → prepend the LD instructions + the
-    // shared capability/tagging note, then the run prompt.
-    const preamble = (req.instructions ?? "") + modeNote(caps);
+    // shared capability/tagging note, then the run prompt. The Sentry note is
+    // keyed to the variation's offered tools, not the shared edge ceiling.
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const preamble =
+      (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
     const message = `${preamble}\n\n---\n\n${req.prompt}`;
 
     let status: AgentStatus = "completed";

@@ -15,6 +15,24 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-07-29 (Sentry path → `sentry` variation; review patch)
+
+### ✅ Metrics author: Sentry moved to a dedicated variation
+- **Why:** keep Sentry an optional path with zero drift on the core factory —
+  the `default` variation (instructions + tools) is byte-identical to the
+  pre-Sentry config; LD targeting selects the `sentry` variation to opt in.
+- **Config:** `autofactory-metrics-author.json` now ships two variations:
+  `default` (unchanged, no `query_sentry` attached) and `sentry` (Sentry
+  instructions + `query_sentry`). The graph edge keeps `query_sentry` as the
+  capability ceiling (ADR 0011); runners only advertise the tool in the mode
+  note when the served variation actually attaches it.
+- **Also in this patch:** LD LLM Observability spans record prompts/outputs
+  unconditionally again (SENTRY_AI_RECORD_PROMPTS gates only the Sentry copy);
+  the GHA/pre-push label gate is now optional (AUTOFACTORY_REQUIRE_LABEL,
+  default = every PR); demo manifest `pr-1.json` back to `api-errors` only.
+
+---
+
 ## 2026-07-24 (Sentry estate bridge — ADR 0015)
 
 ### ✅ Metrics author: `query_sentry` + dual-export guidance

@@ -2,12 +2,14 @@
  * Factory-runner Sentry bootstrap (ADR 0014).
  *
  * When SENTRY_DSN is set, initializes @sentry/node with tracing so Phase 1
- * agent/LLM spans appear in Sentry AI agent monitoring. Anthropic auto-
- * instruments when `@anthropic-ai/sdk` is present; Cursor stays on manual
- * gen_ai spans (see observability.ts).
+ * agent/LLM spans appear in Sentry AI agent monitoring. All providers use the
+ * manual dual-write gen_ai spans in observability.ts — @sentry/node 9.x has no
+ * Anthropic auto-instrumentation, so no LLM data reaches Sentry outside those
+ * spans.
  *
  * PII: prompt/completion capture defaults OFF (CI carries PR diffs). Opt in
- * with SENTRY_AI_RECORD_PROMPTS=true.
+ * with SENTRY_AI_RECORD_PROMPTS=true — enforced where the span attributes are
+ * built (observability.ts), which is the only path that carries prompt content.
  *
  * Telemetry must never break a run — all failures are swallowed.
  */
@@ -36,7 +38,6 @@ export async function initFactorySentry(opts: {
 
   try {
     const Sentry = await import("@sentry/node");
-    const recordPrompts = process.env.SENTRY_AI_RECORD_PROMPTS === "true";
     const serviceName =
       opts.serviceName ??
       process.env.SENTRY_SERVICE_NAME ??
@@ -65,18 +66,9 @@ export async function initFactorySentry(opts: {
         return Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? "1");
       },
       serverName: serviceName,
-      // Prompt capture off by default — PR diffs / agent briefs are sensitive.
-      ...(recordPrompts
-        ? {}
-        : {
-            dataCollection: {
-              genAI: { inputs: false, outputs: false },
-            },
-          }),
-      integrations: (defaults) => {
-        // Anthropic auto-enables when the package is installed; keep defaults.
-        return defaults;
-      },
+      // Prompt capture is gated in observability.ts (SENTRY_AI_RECORD_PROMPTS);
+      // keep default-PII off so nothing else leaks CI content either.
+      sendDefaultPii: false,
     });
 
     initialized = true;

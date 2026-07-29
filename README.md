@@ -29,11 +29,14 @@ end-to-end against a live demo repo. Not a product.
   rollout; on `reverted`, Beacon can start Seer Autofix (`BEACON_SEER_AUTOFIX`).
 - **Phase 3 (flag cleanup):** out of scope; existing LaunchDarkly functionality.
 
-Sentry layer (optional): [ADR 0014](docs/adr/0014-sentry-guardrails-and-agent-monitoring.md) —
+Sentry layer (optional — nothing changes until you opt in): [ADR 0014](docs/adr/0014-sentry-guardrails-and-agent-monitoring.md) —
 app error killswitches via the LD↔Sentry metrics integration, factory LLM traces in Sentry
-AI agent monitoring, Seer on revert. [ADR 0015](docs/adr/0015-sentry-estate-and-dual-export.md) —
+AI agent monitoring, Seer on revert (`BEACON_SEER_AUTOFIX`). [ADR 0015](docs/adr/0015-sentry-estate-and-dual-export.md) —
 Metrics Author `query_sentry` estate picture at author time; dual-export so the same spans
 reach Sentry **and** LD (Sentry does not OTLP-export outbound; `otel*` / KG still need LD o11y).
+The agent-side path lives in a **`sentry` variation** of the Metrics Author AI config —
+LaunchDarkly targeting selects it; the `default` variation is unchanged from the
+non-Sentry factory. Runtime pieces key off `SENTRY_*` env and soft-disable without it.
 
 Node-by-node detail with the exact mechanics: [docs/pipeline-overview.html](docs/pipeline-overview.html).
 Design history: [docs/adr/](docs/adr/).
@@ -186,9 +189,10 @@ To run on the **Cursor** provider instead, copy `bootstrap/github-action-templat
 
 ### 3. Open a pull request
 
-Write the change normally, with no flag. The chain runs when a PR carries the
-`autofactory` label (opened/synchronize/reopened/labeled) and takes a few
-minutes — opt-in for new features, not every PR. On a flag-worthy PR you get:
+Write the change normally, with no flag. The chain runs on every PR
+(opened/synchronize/reopened/labeled) and takes a few minutes. Optional: set the
+repo variable `AUTOFACTORY_REQUIRE_LABEL=true` to gate it on the `autofactory`
+PR label instead (feature PRs only, not docs/chores). On a flag-worthy PR you get:
 
 - a string multivariate flag in the app project (`control` + `v1`), targeting **off** in all
   environments — follow-up PRs iterate it with new variations (`v2`, `v3`, …) or ride an
