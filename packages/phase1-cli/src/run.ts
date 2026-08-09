@@ -28,6 +28,7 @@ import {
   KNOWLEDGE_GRAPH_FLAG_KEY,
   LdClient,
   LdResourceWriter,
+  type ResumeInput,
   type StallInfo,
   appConnection,
   assembleKnowledgeGraph,
@@ -59,6 +60,14 @@ import {
   withProvider,
 } from "@auto-factory/shared";
 import { type CliOptions, EXIT } from "./args.js";
+import {
+  clearWalkState,
+  computeTreeHash,
+  readWalkState,
+  validateWalkState,
+  type WalkStateKeys,
+  writeWalkState,
+} from "./walkState.js";
 import { type RunOutcome, deriveOutcome, writeRunRecord } from "./runRecord.js";
 
 function appBaseUrl(): string {
@@ -89,21 +98,33 @@ function buildWriter(dryRun: boolean): LdResourceWriter | undefined {
 
 
 /**
- * Config-drift check (same contract as the Action's): the CLI runs from a
- * checkout of the tooling repo, so hash the committed config/agentcontrol files
- * three levels up and compare against the `[cfg:…]` stamp that
- * provision/upgrade write onto the live graph's description. Best-effort.
+ * Content hash of this build's committed agent configs. Doubles as a resume
+ * invalidation key: if the configs changed, a saved journal describes a graph that
+ * no longer exists. Cheap enough to call more than once.
  */
-async function detectConfigDrift(graphKey: string): Promise<string | undefined> {
+function localConfigHash(): string | undefined {
   try {
     const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
     const base = join(repoRoot, "config", "agentcontrol");
-    const local = computeConfigHash({
+    return computeConfigHash({
       aiConfigsDir: join(base, "ai-configs"),
       graphsDir: join(base, "graphs"),
       flagsDir: join(base, "flags"),
       toolsDir: join(base, "tools"),
     });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Config-drift check (same contract as the Action's): compare the committed config
+ * hash against the `[cfg:…]` stamp that provision/upgrade write onto the live
+ * graph's description. Best-effort.
+ */
+async function detectConfigDrift(graphKey: string): Promise<string | undefined> {
+  try {
+    const local = localConfigHash();
     if (!local) return undefined;
     const graph = await new LdClient(targetConnection()).getAgentGraph<{ description?: string }>(graphKey);
     if (graph.status !== 200) return undefined;
@@ -303,6 +324,38 @@ async function run(opts: CliOptions): Promise<number> {
       (gate ? ` steps=[${stepsDesc}]; approved: [${[...approvedSteps].join(", ") || "none"}]` : " (no gates)"),
   );
 
+  // Resume: replay the saved journal through the same walk loop, then continue
+  // live from where it stopped. Fail-closed — every key must match, because the
+  // agents' recorded work only means anything against the files it was recorded
+  // from. Refusing costs a re-run; replaying stale state corrupts the result.
+  const stateKeys: WalkStateKeys = {
+    graphKey: opts.graphKey,
+    ...(localConfigHash() ? { configStamp: localConfigHash() } : {}),
+    ...(state.head ? { head: state.head } : {}),
+    ...(computeTreeHash(root) ? { treeHash: computeTreeHash(root) } : {}),
+    policyMode: policy.mode,
+  };
+  let resume: ResumeInput | undefined;
+  if (opts.resume) {
+    const check = validateWalkState(readWalkState(root), stateKeys);
+    if (!check.ok) {
+      console.error(`⛔ cannot resume: ${check.reason}`);
+      console.error("   Run again without --resume to start a fresh walk.");
+      return EXIT.USAGE;
+    }
+    const grants = Object.entries(opts.grantVisits);
+    resume = {
+      journal: check.state.runs,
+      ...(grants.length > 0 ? { extraVisits: opts.grantVisits } : {}),
+      ...(opts.feedback ? { humanFeedback: opts.feedback } : {}),
+    };
+    console.log(
+      `Resuming the walk saved at ${check.state.at}: replaying ${check.state.runs.length} step(s) ` +
+        `(no model calls, no duplicate LaunchDarkly writes), then continuing from '${check.state.haltedAt.node}'.` +
+        (grants.length > 0 ? `\n  Extra loop budget: ${grants.map(([k, n]) => `${k} +${n}`).join(", ")}` : ""),
+    );
+  }
+
   // Judges: agents never commit in workingTree mode, so the verified evidence
   // is the node-scoped working-tree diff instead of the commit-scoped one.
   const judgeCompletion: JudgeCompletion | undefined = createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
@@ -358,7 +411,52 @@ async function run(opts: CliOptions): Promise<number> {
     gate,
     judgeHook,
     verifier,
+    ...(resume ? { resume } : {}),
   });
+
+  // Journal bookkeeping, before any early return. A halted walk saves its journal
+  // so `--resume` can replay it; a walk that reached a real terminal clears it, so
+  // a stale journal can never be replayed against a later run. Dry runs touch
+  // neither: they create nothing, and clearing would discard a real pause.
+  if (!opts.dryRun) {
+    const halt = walk.pendingApproval
+      ? ({ kind: "pending-approval", node: walk.pendingApproval.node } as const)
+      : walk.loopExhausted
+        ? ({ kind: "loop-exhausted", node: walk.loopExhausted.node } as const)
+        : undefined;
+    if (walk.replayDiverged) {
+      clearWalkState(root); // the journal no longer describes this repo
+    } else if (halt) {
+      writeWalkState(root, {
+        graphKey: opts.graphKey,
+        ...(stateKeys.configStamp ? { configStamp: stateKeys.configStamp } : {}),
+        ...(state.branch ? { branch: state.branch } : {}),
+        ...(stateKeys.head ? { head: stateKeys.head } : {}),
+        ...(stateKeys.treeHash ? { treeHash: stateKeys.treeHash } : {}),
+        ...(stateKeys.policyMode ? { policyMode: stateKeys.policyMode } : {}),
+        haltedAt: halt,
+        runs: walk.runs,
+      });
+    } else {
+      clearWalkState(root);
+    }
+  }
+
+  // A diverged replay is a mix of two different walks. Report and stop WITHOUT
+  // writing a run record — like an approval pause or a crash, it is not evidence
+  // that AutoFactory ran on this branch, so the pre-push gate must stay closed.
+  if (walk.replayDiverged) {
+    const d = walk.replayDiverged;
+    console.error(
+      [
+        "",
+        `⛔ Resume aborted at journal position ${d.atIndex}: expected '${d.expected}', the walk re-derived '${d.actual}'.`,
+        `   ${d.detail}`,
+        "   The saved journal has been discarded. Run again without --resume.",
+      ].join("\n"),
+    );
+    return EXIT.FAILED;
+  }
 
   console.log(`\nRan ${walk.runs.length} node(s): ${walk.runs.map((r) => r.configKey).join(" → ")}`);
   if (walk.skipped.length) console.log(`Skipped: ${walk.skipped.join(", ")}`);
@@ -369,14 +467,22 @@ async function run(opts: CliOptions): Promise<number> {
   if (walk.pendingApproval) {
     const node = walk.pendingApproval.node;
     const approveFlags = [...new Set([...approvedSteps, node])].map((s) => `--approve ${s}`).join(" ");
-    console.log(
-      [
-        "",
-        `⏸ Approval required before '${node}'. Nothing was created for this or later steps.`,
-        "If a human approves, re-run past this gate with:",
-        `  autofactory run --graph ${opts.graphKey}${opts.dryRun ? " --dry-run" : ""} ${approveFlags}`,
-      ].join("\n"),
-    );
+    const lines = [
+      "",
+      `⏸ Approval required before '${node}'. Nothing was created for this or later steps.`,
+      "If a human approves, re-run past this gate with:",
+      `  autofactory run --graph ${opts.graphKey}${opts.dryRun ? " --dry-run" : ""} ${approveFlags}`,
+    ];
+    // --resume replays the completed steps instead of re-running them, which also
+    // keeps the planner from re-analysing the agents' own working-tree edits as if
+    // a human had written them.
+    if (!opts.dryRun && walk.runs.length > 0) {
+      lines.push(
+        `Add --resume to replay the ${walk.runs.length} completed step(s) instead of re-running them:`,
+        `  autofactory run --graph ${opts.graphKey} --resume ${approveFlags}`,
+      );
+    }
+    console.log(lines.join("\n"));
     return EXIT.PENDING_APPROVAL;
   }
 
@@ -421,7 +527,18 @@ async function run(opts: CliOptions): Promise<number> {
     const label = iter && iter !== "1" ? `${k} (iter ${iter})` : k;
     lines.push(`Judge: ${label} scored ${score.toFixed(2)}`);
   }
-  if (walk.loopExhausted) lines.push(`⚠ ${describeLoopExhausted(walk.loopExhausted)}`);
+  if (walk.loopExhausted) {
+    lines.push(`⚠ ${describeLoopExhausted(walk.loopExhausted)}`);
+    // Budget alone would repeat the same failure, so the grant requires feedback.
+    if (!opts.dryRun) {
+      const spent = walk.loopExhausted.exhausted[0];
+      const grant = spent ? `${spent.source}:${spent.target}=1` : "<source>:<target>=1";
+      lines.push(
+        `  To give it another pass WITH guidance (replays the completed steps, no duplicate writes):`,
+        `    autofactory run --graph ${opts.graphKey} --resume --grant-visits ${grant} --feedback "what to change"`,
+      );
+    }
+  }
   if (walk.stalledAt) lines.push(`⚠ Stalled: ${describeStall(walk.stalledAt)}`);
   if (walk.verificationFailed) {
     lines.push(

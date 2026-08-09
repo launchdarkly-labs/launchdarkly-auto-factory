@@ -286,9 +286,14 @@ Replay also has a correctness property snapshot re-entry cannot: **replaying a
 completed walk must yield a byte-identical `WalkResult`.** That is a property test,
 and it fails loudly the moment someone adds an unjournaled input.
 
-**It also fixes the per-walk budget scope limit** (see the CHANGELOG's "known scope
-limit"): once traversal counts are re-derived from a persisted log rather than a
-process-local map, `max_visits` becomes per-PR-per-head instead of per-process.
+**It narrows — but does not close — the per-walk budget scope limit** (see the
+CHANGELOG's "known scope limit"). Traversal counts re-derive from the journal, so
+budgets are cumulative *across a resume chain*. They are still per-process for an
+ordinary re-run, because a fresh run has no journal to replay. Closing it fully
+requires re-runs to resume **by default** rather than on request — which on the
+Action means a push auto-resuming, and that is gated behind the Action-side storage
+work. An earlier revision of this doc claimed replay made budgets "per-PR-per-head";
+that was too strong.
 
 ## 2b. What to journal, and what must not be replayed
 
@@ -330,6 +335,24 @@ an edit changes edge order and must be treated as invalidating. Divergence detec
 is the real backstop here.
 
 ## 2c. Sequencing: CLI first, Action last
+
+> **CLI shipped** — `walkState.ts`, `--resume`, `--feedback`,
+> `--grant-visits <source>:<target>=<n>`. Deviations from the plan below:
+>
+> - **`replayDiverged` writes no run record at all**, rather than mapping to
+>   `outcome: "incomplete"` as first proposed. `runRecord.ts` documents itself as not
+>   written for dry runs, approval pauses, or errors — a diverged replay is an error,
+>   and a mix of two walks is not evidence AutoFactory ran on this branch. So the
+>   pre-push gate stays closed and `deriveOutcome` needed no change.
+> - **`--resume` refuses `--grant-visits` without `--feedback`.** Enforced in
+>   `parseArgs`, so it can't be bypassed by a caller assembling flags.
+> - **The journal is cleared on any real terminal**, so a stale journal can never be
+>   replayed against a later run. Dry runs touch neither the write nor the clear:
+>   they create nothing, and clearing would silently discard a real pause.
+> - **An unknown tree hash refuses the resume.** If git can't answer,
+>   `computeTreeHash` returns undefined and validation fails — the one case where
+>   skipping the check would be most dangerous is exactly where a missing value would
+>   otherwise read as "unchanged".
 
 **CLI first.** It is the surface where current behaviour is outright *incorrect*
 rather than merely wasteful. The CLI runs `gitMode: "workingTree"` (`run.ts:280`), so

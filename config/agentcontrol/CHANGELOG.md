@@ -74,6 +74,11 @@ Status legend: ✅ done · 🔜 planned/in progress
   so an approved gated node can be re-entered on every later push, each time after a
   fresh re-plan. Fixing either properly needs cross-run walk state — see
   `docs/phase4-judge-driven-loops.md` Step 2.
+- **Partially addressed** by the CLI's `--resume` (Step 2): a resumed walk re-derives
+  its traversal counts from the saved journal, so budgets are cumulative across a
+  resume chain. An ordinary re-run still starts fresh — it has no journal to replay —
+  so this is narrowed, not closed. Closing it needs re-runs to resume by default,
+  which on the Action depends on the deferred Action-side storage work.
 
 ---
 

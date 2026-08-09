@@ -1,0 +1,198 @@
+/**
+ * Resumable walk state for the CLI, written to
+ * `<git-dir>/autofactory-walk-state.json` — inside `.git/` for the same reason
+ * `runRecord.ts` is: it can never be committed and never dirties the working tree.
+ *
+ * This is NOT an extension of `runRecord.ts`, which is deliberately *not* written
+ * on approval pauses (a pause must not satisfy the pre-push gate). This file has
+ * the opposite policy: it exists only when a walk stopped halfway.
+ *
+ * What it holds is the journal — `WalkResult.runs` verbatim — plus the keys that
+ * decide whether replaying it is still legitimate. The walker re-derives every
+ * internal invariant (tags, inventory, edge budgets, routing snapshots) from the
+ * journal, so nothing about walker internals is persisted here and this format
+ * does not have to change when they do.
+ *
+ * Why a working-tree hash and not just HEAD: the CLI runs `gitMode: "workingTree"`,
+ * so agents mutate files WITHOUT moving HEAD. A head-only check would happily
+ * replay a journal recorded against completely different file contents.
+ */
+
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
+
+import type { NodeRun } from "@auto-factory/shared";
+
+/** Bumped when the shape changes; a mismatch invalidates instead of mis-reading. */
+export const WALK_STATE_VERSION = 1;
+
+const FILE_NAME = "autofactory-walk-state.json";
+
+export interface WalkState {
+  version: number;
+  /** Graph the journal was recorded against. */
+  graphKey: string;
+  /** Committed-config content hash (see configVersion.ts) at the halt. */
+  configStamp?: string;
+  branch?: string;
+  /** HEAD at the halt. */
+  head?: string;
+  /**
+   * Content hash of the working tree at the halt — tracked modifications plus
+   * untracked files. Undefined means it could not be computed, which must FAIL
+   * a resume rather than skip the check.
+   */
+  treeHash?: string;
+  /** Approval mode in force, so a policy change invalidates the journal. */
+  policyMode?: string;
+  /** Why the walk stopped, for the resume hint. */
+  haltedAt: { kind: "pending-approval" | "loop-exhausted"; node: string };
+  /** `WalkResult.runs` verbatim — the replay journal. */
+  runs: NodeRun[];
+  at: string;
+}
+
+/** Keys the current process computes, to compare against a stored state. */
+export interface WalkStateKeys {
+  graphKey: string;
+  configStamp?: string;
+  head?: string;
+  treeHash?: string;
+  policyMode?: string;
+}
+
+function gitDir(root: string): string {
+  const raw = execFileSync("git", ["rev-parse", "--git-dir"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  return isAbsolute(raw) ? raw : resolve(root, raw);
+}
+
+export function walkStatePath(root: string): string {
+  return join(gitDir(root), FILE_NAME);
+}
+
+/**
+ * Hash of everything a walk could have read from the tree: HEAD, the tracked diff
+ * against it, and the path+content of every untracked file. Returns undefined if
+ * git can't answer — callers must treat that as "cannot resume", never as "no
+ * change".
+ */
+export function computeTreeHash(root: string): string | undefined {
+  try {
+    const git = (args: string[]) =>
+      execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const head = git(["rev-parse", "HEAD"]).trim();
+    const trackedDiff = git(["diff", "HEAD"]);
+    const untracked = git(["ls-files", "--others", "--exclude-standard"])
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .sort();
+    let untrackedDigest = "";
+    if (untracked.length > 0) {
+      // Content hashes, so an untracked file's *contents* changing invalidates too.
+      const hashes = git(["hash-object", "--", ...untracked])
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      untrackedDigest = untracked.map((p, i) => `${p}:${hashes[i] ?? "?"}`).join("\n");
+    }
+    return createHash("sha256").update(`${head}\n${trackedDiff}\n${untrackedDigest}`).digest("hex").slice(0, 16);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Best-effort persist; a failure only means the walk can't be resumed. */
+export function writeWalkState(root: string, state: Omit<WalkState, "version" | "at">): void {
+  try {
+    writeFileSync(
+      walkStatePath(root),
+      JSON.stringify({ version: WALK_STATE_VERSION, ...state, at: new Date().toISOString() }, null, 2) + "\n",
+      "utf8",
+    );
+  } catch (e) {
+    console.warn(`could not write walk state (resume will not be available): ${e instanceof Error ? e.message : e}`);
+  }
+}
+
+export function readWalkState(root: string): WalkState | undefined {
+  try {
+    const p = walkStatePath(root);
+    if (!existsSync(p)) return undefined;
+    const parsed = JSON.parse(readFileSync(p, "utf8")) as WalkState;
+    return parsed && Array.isArray(parsed.runs) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Remove the journal. Called once a walk reaches a real terminal, so a stale
+ * journal can never be replayed against a later run.
+ */
+export function clearWalkState(root: string): void {
+  try {
+    rmSync(walkStatePath(root), { force: true });
+  } catch {
+    /* best-effort */
+  }
+}
+
+export type WalkStateCheck = { ok: true; state: WalkState } | { ok: false; reason: string };
+
+/**
+ * Decide whether a stored journal may be replayed. FAIL-CLOSED: every key must be
+ * present and equal. A missing value on either side is a mismatch, not a pass —
+ * an unknown tree hash is exactly the case where replaying is most dangerous.
+ */
+export function validateWalkState(state: WalkState | undefined, keys: WalkStateKeys): WalkStateCheck {
+  if (!state) return { ok: false, reason: "no saved walk state for this repo — nothing to resume" };
+  if (state.version !== WALK_STATE_VERSION) {
+    return { ok: false, reason: `saved walk state is version ${state.version}, this build expects ${WALK_STATE_VERSION}` };
+  }
+  if (state.runs.length === 0) return { ok: false, reason: "saved walk state has an empty journal" };
+  if (state.graphKey !== keys.graphKey) {
+    return { ok: false, reason: `saved walk state is for graph '${state.graphKey}', not '${keys.graphKey}'` };
+  }
+  if (state.configStamp !== keys.configStamp) {
+    return {
+      ok: false,
+      reason: "the agent configs changed since the walk was saved (config stamp differs) — the journal describes a different graph",
+    };
+  }
+  if (state.head !== keys.head) {
+    return { ok: false, reason: `HEAD moved since the walk was saved (${state.head ?? "unknown"} → ${keys.head ?? "unknown"})` };
+  }
+  if (!state.treeHash || !keys.treeHash) {
+    return { ok: false, reason: "could not verify the working tree is unchanged — refusing to resume against unknown file state" };
+  }
+  if (state.treeHash !== keys.treeHash) {
+    return { ok: false, reason: "the working tree changed since the walk was saved — the agents' recorded work no longer matches the files" };
+  }
+  if (state.policyMode !== keys.policyMode) {
+    return {
+      ok: false,
+      reason: `the approval policy changed since the walk was saved ('${state.policyMode ?? "none"}' → '${keys.policyMode ?? "none"}')`,
+    };
+  }
+  return { ok: true, state };
+}
+
+/**
+ * Parse a `--grant-visits <source>:<target>=<n>` value into the walker's
+ * `extraVisits` key (`source→target`). Colon-separated because `→` and `>` are
+ * hostile on a shell command line.
+ */
+export function parseVisitGrant(raw: string): { key: string; visits: number } | { error: string } {
+  const m = /^([^:=]+):([^:=]+)=(\d+)$/.exec(raw.trim());
+  if (!m) return { error: `expected <source>:<target>=<n>, got '${raw}'` };
+  const n = Number(m[3]);
+  if (!Number.isFinite(n) || n < 1) return { error: `visit grant must be at least 1, got '${raw}'` };
+  return { key: `${m[1]}→${m[2]}`, visits: n };
+}

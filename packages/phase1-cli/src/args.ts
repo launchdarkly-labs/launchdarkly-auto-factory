@@ -33,7 +33,23 @@ export interface CliOptions {
   dryRun: boolean;
   /** Gated node keys a human has approved (see EXIT.PENDING_APPROVAL). */
   approve: string[];
+  /**
+   * Replay the saved walk (see walkState.ts) instead of starting over, then
+   * continue live from where it stopped. Refuses if anything the journal depends
+   * on has changed.
+   */
+  resume: boolean;
+  /**
+   * Extra loop-edge budget, keyed `source→target`. Only meaningful with --resume,
+   * and only accepted alongside --feedback: more budget with no new information
+   * re-burns the same loop deterministically.
+   */
+  grantVisits: Record<string, number>;
+  /** Human guidance handed to the first step that runs live on a resume. */
+  feedback?: string;
 }
+
+import { parseVisitGrant } from "./walkState.js";
 
 export type ParseResult = { options: CliOptions } | { help: true } | { error: string };
 
@@ -48,6 +64,10 @@ export function usage(): string {
     "Options:",
     "  --graph <key>       Agent graph to walk (default: $GRAPH_KEY or gha-auto-factory)",
     "  --approve <node>    Approve a gated step; repeat per step (see exit code 3)",
+    "  --resume            Replay the saved half-finished walk, then continue live",
+    "  --feedback <text>   Guidance for the first step that runs live on a resume",
+    "  --grant-visits <s>:<t>=<n>",
+    "                      Extra budget for a loop edge; needs --resume and --feedback",
     "  --dry-run           Read-only: no flags/metrics created, no files edited",
     "  --base <ref>        Base ref to diff against (default: $PR_BASE_REF or main)",
     "  --root <dir>        Repo to operate on (default: current directory)",
@@ -63,6 +83,13 @@ export function usage(): string {
     "  1  review rejected, chain incomplete, or a deterministic check failed",
     "  2  usage/configuration error, or nothing to process",
     "  3  paused at an approval gate — re-run with --approve <node> after a human approves",
+    "",
+    "Resuming:",
+    "  A walk that pauses at a gate or exhausts a loop budget saves its journal to",
+    "  <git-dir>/autofactory-walk-state.json. `--resume` replays it (no LLM calls, no",
+    "  duplicate LaunchDarkly writes) and continues from where it stopped. It refuses",
+    "  if HEAD, the working tree, the agent configs, or the approval policy changed —",
+    "  in that case just run again without --resume.",
   ].join("\n");
 }
 
@@ -77,6 +104,8 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     base: env.PR_BASE_REF || "main",
     dryRun: false,
     approve: [],
+    resume: false,
+    grantVisits: {},
   };
 
   const args = argv.slice(1);
@@ -119,9 +148,35 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
       case "--dry-run":
         options.dryRun = true;
         break;
+      case "--resume":
+        options.resume = true;
+        break;
+      case "--feedback": {
+        const v = next();
+        if (!v) return { error: "--feedback requires text to hand to the resumed step" };
+        options.feedback = v;
+        break;
+      }
+      case "--grant-visits": {
+        const v = next();
+        if (!v) return { error: "--grant-visits requires <source>:<target>=<n>" };
+        const parsed = parseVisitGrant(v);
+        if ("error" in parsed) return { error: `--grant-visits ${parsed.error}` };
+        options.grantVisits[parsed.key] = parsed.visits;
+        break;
+      }
       default:
         return { error: `unknown option '${arg}'` };
     }
+  }
+  if (!options.resume) {
+    if (Object.keys(options.grantVisits).length > 0) return { error: "--grant-visits only applies with --resume" };
+    if (options.feedback !== undefined) return { error: "--feedback only applies with --resume" };
+  }
+  // Extra budget without new information just burns the same loop again, so the
+  // grant is gated on saying something to the agent.
+  if (Object.keys(options.grantVisits).length > 0 && !options.feedback) {
+    return { error: "--grant-visits requires --feedback: more iterations with no new guidance repeats the same failure" };
   }
   return { options };
 }
