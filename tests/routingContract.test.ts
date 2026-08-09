@@ -267,9 +267,7 @@ describe("routing contract: verdict-driven rework loop", () => {
       buildChain(),
       new FakeRunner(reworkScript([{ review_approved: "false", risk_level: "medium" }])),
       { PR_NUMBER: "1" },
-      undefined,
-      undefined,
-      gate,
+      { gate },
     );
     assert.equal(asked, 2, "the gate was consulted again on re-entry");
     assert.equal(w.pendingApproval?.node, KEYS.flag);
@@ -355,11 +353,7 @@ describe("routing contract: deterministic handoff shims halt the walk", () => {
         [KEYS.flag]: { tags: { flag_ready: "true", flag_key: "enable-x" } },
       }),
       { PR_NUMBER: "1" },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      verifier,
+      { verifier },
     );
     assert.deepEqual(path(w), [KEYS.research, KEYS.flag]); // halted at the implementer
     assert.equal(w.verificationFailed?.node, KEYS.flag);
@@ -388,11 +382,7 @@ describe("routing contract: deterministic handoff shims halt the walk", () => {
         [KEYS.review]: { tags: { review_approved: "approve", risk_level: "low" } },
       }),
       { PR_NUMBER: "1" },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      verifier,
+      { verifier },
     );
     assert.deepEqual(path(w), [KEYS.research, KEYS.flag, KEYS.metrics, KEYS.test, KEYS.review]);
     assert.equal(w.verificationFailed, undefined);

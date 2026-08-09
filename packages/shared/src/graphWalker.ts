@@ -132,6 +132,23 @@ export interface LoopExhaustedInfo {
   tags: Record<string, string>;
 }
 
+/**
+ * A resume was attempted but the journal no longer describes this walk — the graph,
+ * configs, or walker logic changed under it. A HARD failure: the caller must discard
+ * the journal and start a fresh run. Never treat a diverged replay as a result, since
+ * the partial state it produced is a mix of two different walks.
+ */
+export interface ReplayDivergence {
+  /** Position in the journal where the mismatch was found. */
+  atIndex: number;
+  /** What the journal said should run there (`configKey#iteration`). */
+  expected: string;
+  /** What the walk re-derived instead. */
+  actual: string;
+  /** Human-readable explanation for reporting. */
+  detail: string;
+}
+
 export interface WalkResult {
   runs: NodeRun[];
   /** Tags accumulated across all nodes (routing tags may have been rewound). */
@@ -172,6 +189,11 @@ export interface WalkResult {
    * if a stale routing tag reads as approved. Undefined for a clean finish.
    */
   loopExhausted?: LoopExhaustedInfo;
+  /**
+   * Set when a resume's journal stopped matching what the walk re-derived. A hard
+   * failure — the run is a mix of two walks and must not be reported as a result.
+   */
+  replayDiverged?: ReplayDivergence;
 }
 
 /**
@@ -205,6 +227,7 @@ export type WalkEvent =
   | { type: "node-verified"; verification: HandoffVerification }
   | { type: "stalled"; stall: StallInfo }
   | { type: "loop-exhausted"; info: LoopExhaustedInfo }
+  | { type: "replay-diverged"; info: ReplayDivergence }
   | { type: "awaiting-approval"; node: string };
 
 /** Human-readable one-liner describing why a loop did not converge. */
@@ -345,6 +368,7 @@ function buildPrompt(
   inventory: Record<string, string>,
   ctx: Record<string, unknown>,
   trigger?: LoopTrigger,
+  humanFeedback?: string,
 ): string {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
@@ -355,6 +379,16 @@ function buildPrompt(
     .join("\n");
   const parts: string[] = [header];
   if (iteration > 1) parts.push(reworkPreamble(iteration, inventory, trigger));
+  // Human guidance from a resume. Its own block, not folded into the rework
+  // preamble, because a gate-halt resume can land on iteration 1 (no preamble at
+  // all) and because a human's instruction outranks an agent's brief.
+  if (humanFeedback) {
+    parts.push(
+      `=== HUMAN GUIDANCE (authoritative — overrides the brief below) ===\n` +
+        `${humanFeedback}\n` +
+        `=== END HUMAN GUIDANCE ===`,
+    );
+  }
   // The root always sees the PR body; a re-entered root keeps it too.
   if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY) parts.push(ctx.PR_BODY);
   // The inbound brief (previous step output): present for non-root nodes and for
@@ -384,27 +418,95 @@ function allNodeKeys(graphDef: AgentGraphDefinition): string[] {
   return [...keys];
 }
 
+/**
+ * Everything nondeterministic or side-effecting that a walk depends on, in one
+ * bundle.
+ *
+ * THE INVARIANT: the walk loop itself is pure — no `Date.now`, no `Math.random`,
+ * and every value it accumulates (`accumulatedTags`, `inventory`, `edgeCounts`,
+ * `routingSnapshots`, envelope inheritance) is a function of the ordered node
+ * results plus the graph. That purity is what makes `resume` replay possible.
+ * So: adding a field here that the walk *branches on* obliges you to journal it
+ * in `ResumeInput`, or replay silently diverges. This bundle exists to make that
+ * obligation visible at the type level rather than in a comment nobody reads.
+ */
+export interface WalkInputs {
+  /**
+   * LaunchDarkly graph tracker (per-edge handoff metrics). NOT called for edges
+   * whose source node was replayed — the original walk already recorded them, and
+   * re-recording double-counts the AI Config monitoring data.
+   */
+  graphTracker?: LDGraphTracker;
+  onEvent?: (event: WalkEvent) => void;
+  gate?: GateController;
+  /**
+   * Judge hook (see judges.ts): after each node completes, runs any judges
+   * attached to that node's AI config in LaunchDarkly and records their scores on
+   * the node's tracker. Judge failures never fail the walk. Skipped for replayed
+   * nodes (their scores were already recorded).
+   *
+   * NOTE for Step 3: once judge scores become a ROUTING input, they must be added
+   * to `ResumeInput` and served from the journal on replay. Skipping them then
+   * would change edge selection.
+   */
+  judgeHook?: JudgeHook;
+  /**
+   * Deterministic handoff shims (see handoffVerifier.ts): after each node
+   * completes, re-derive the claims its tags assert from primary evidence
+   * (LaunchDarkly + the checkout). A failed verification HALTS the walk
+   * (WalkResult.verificationFailed) — unlike judges, these are gates. Skipped for
+   * replayed nodes: a verification failure is not resumable, so every node in a
+   * journal we accept has already passed.
+   */
+  verifier?: HandoffVerifier;
+  /** Resume an interrupted walk instead of starting fresh. */
+  resume?: ResumeInput;
+}
+
+/**
+ * Resume an interrupted walk by replaying its recorded node results through this
+ * same loop, then continuing live from the frontier.
+ *
+ * Only `pendingApproval` and `loopExhausted` walks are resumable. A stall is not
+ * (replaying it reproduces the same missing tag — the fix is upstream), and a
+ * verification failure is not (downstream must not build on an unverified claim —
+ * the fix is a loop).
+ *
+ * Caller obligations, none of which the walker can check: the journal must come
+ * from the same graph and config version, and — because agents mutate the working
+ * tree without moving HEAD — from the same working-tree content. Divergence
+ * between the journal and what the walk re-derives IS detected, and is reported as
+ * `WalkResult.replayDiverged`.
+ */
+export interface ResumeInput {
+  /**
+   * Node results from the interrupted walk, in order — `WalkResult.runs` verbatim.
+   * `iteration` is re-derived rather than trusted, and a mismatch is treated as
+   * divergence.
+   */
+  journal: readonly NodeRun[];
+  /**
+   * Extra loop-edge budget a human granted, keyed `${source}→${target}`. Added on
+   * top of the edge's declared `max_visits` and still clamped to the hard cap, so
+   * a grant can raise a ceiling but never remove it.
+   */
+  extraVisits?: Record<string, number>;
+  /**
+   * Human guidance for the first live node, rendered as its own authoritative
+   * block. This is the point of resuming: extra budget with no new information
+   * burns the same loop again, deterministically.
+   */
+  humanFeedback?: string;
+}
+
 export async function walkGraph(
   graphDef: AgentGraphDefinition,
   runner: AgentRunner,
   context: Record<string, unknown>,
-  graphTracker?: LDGraphTracker,
-  onEvent?: (event: WalkEvent) => void,
-  gate?: GateController,
-  /**
-   * Optional judge hook (see judges.ts): after each node completes, runs any
-   * judges attached to that node's AI config in LaunchDarkly and records their
-   * scores on the node's tracker. Judge failures never fail the walk.
-   */
-  judgeHook?: JudgeHook,
-  /**
-   * Optional deterministic handoff shims (see handoffVerifier.ts): after each
-   * node completes, re-derive the claims its tags assert from primary evidence
-   * (LaunchDarkly + the checkout). A failed verification HALTS the walk
-   * (WalkResult.verificationFailed) — unlike judges, these are gates.
-   */
-  verifier?: HandoffVerifier,
+  inputs: WalkInputs = {},
 ): Promise<WalkResult> {
+  const { graphTracker, onEvent, gate, judgeHook, verifier, resume } = inputs;
+  const journal = resume?.journal ?? [];
   const runs: NodeRun[] = [];
   const accumulatedTags: Record<string, string> = {};
   // Never-rewound mirror of tool-produced facts (the created-resource inventory).
@@ -438,18 +540,31 @@ export async function walkGraph(
   let pendingApproval: { node: string } | undefined;
   let verificationFailed: HandoffVerification | undefined;
   let loopExhausted: LoopExhaustedInfo | undefined;
+  let replayDiverged: ReplayDivergence | undefined;
   // Set when a loop edge is traversed; consumed by the target's next prompt.
   let pendingLoopTrigger: LoopTrigger | undefined;
+  // Human guidance from a resume, delivered to the FIRST live node then cleared.
+  let pendingHumanFeedback = resume?.humanFeedback;
 
   while (node) {
     const key = node.getKey();
+    // This node's result comes from the journal, not the runner. Positional: the
+    // walk is deterministic, so the Nth node it wants to run must be the Nth it
+    // ran before.
+    const replayEntry = runs.length < journal.length ? journal[runs.length] : undefined;
+    const replaying = replayEntry !== undefined;
 
     // Approval gate: before running a gated node, ask the controller — passing
     // the tags accumulated so far, so risk-conditional gates can consult the
     // planner's risk_score. If not approved, halt BEFORE the node runs (so its
     // side effects — flag creation, commits — don't happen). Re-evaluated on each
     // loop re-entry (each re-run can create new side effects).
-    if (gate && gatedSteps.has(key) && !(await gate.resolve(key, accumulatedTags))) {
+    //
+    // Replayed nodes are NEVER re-gated: they already ran, which means they were
+    // already permitted. Re-asking would halt the replay on the same gate that
+    // produced the journal. The FRONTIER node is always gated normally, so a
+    // resume can't become an approval bypass.
+    if (!replaying && gate && gatedSteps.has(key) && !(await gate.resolve(key, accumulatedTags))) {
       pendingApproval = { node: key };
       onEvent?.({ type: "awaiting-approval", node: key });
       break;
@@ -488,23 +603,60 @@ export async function walkGraph(
     const requestType = inboundRequestType ?? entry.requestType;
     const capabilities = inboundCapabilities ?? entry.capabilities;
 
+    // Divergence check, before any work: the journal must describe the node the
+    // walk actually wants to run, at the same iteration the walk re-derived. A
+    // mismatch means the graph, configs, or code changed under the journal — fail
+    // closed rather than continuing against stale state.
+    if (replayEntry && (replayEntry.configKey !== key || replayEntry.iteration !== iteration)) {
+      replayDiverged = {
+        atIndex: runs.length,
+        expected: `${replayEntry.configKey}#${replayEntry.iteration}`,
+        actual: `${key}#${iteration}`,
+        detail:
+          "the journal does not describe the node this walk re-derived — the graph, configs, or walker logic changed. A fresh run is required.",
+      };
+      onEvent?.({ type: "replay-diverged", info: replayDiverged });
+      break;
+    }
+
     onEvent?.({ type: "node-start", configKey: key, index: runs.length });
-    // One tracker per node run, shared between the runner (generation metrics)
-    // and the judge hook (evaluation scores) so both land on the same AI run.
-    const tracker = cfg.createTracker();
+    // One tracker per node run, shared between the runner (generation metrics) and
+    // the judge hook (evaluation scores) so both land on the same AI run. A replayed
+    // node creates NO tracker: its metrics were recorded by the original walk, and
+    // re-recording double-counts the per-variation AI Config monitoring data.
+    const tracker = replaying ? undefined : cfg.createTracker();
     // Consume the loop trigger set when the edge INTO this node was taken. Cleared
     // on read so it can't leak into a later node's preamble (a forward re-entry at
     // iteration > 1 legitimately has no trigger).
     const trigger = pendingLoopTrigger;
     pendingLoopTrigger = undefined;
-    const prompt = buildPrompt(key === rootKey, inboundHandoff !== undefined, iteration, inventory, ctx, trigger);
-    const result = await runner.runNode({
+    // Human guidance is delivered to the first LIVE node only.
+    const humanFeedback = replaying ? undefined : pendingHumanFeedback;
+    if (!replaying) pendingHumanFeedback = undefined;
+    const prompt = buildPrompt(
+      key === rootKey,
+      inboundHandoff !== undefined,
+      iteration,
+      inventory,
+      ctx,
+      trigger,
+      humanFeedback,
+    );
+    const result: AgentNodeResult = replayEntry
+      ? {
+          status: replayEntry.status,
+          // The recorded final text, re-wrapped so the rest of the loop (which reads
+          // it via lastAssistantText) is identical on a replayed and a live run.
+          messages: [{ role: "assistant", content: replayEntry.output, isFinal: true }],
+          tags: replayEntry.tags,
+        }
+      : await runner.runNode({
       configKey: key,
       prompt,
       ...(cfg.instructions ? { instructions: cfg.instructions } : {}),
       ...(cfg.model?.name ? { model: cfg.model.name } : {}),
       ...(cfg.model?.parameters ? { modelParameters: cfg.model.parameters } : {}),
-      tracker,
+      ...(tracker ? { tracker } : {}),
       ...(maxTurns !== undefined ? { maxTurns } : {}),
       ...(requestType ? { requestType } : {}),
       ...(capabilities ? { capabilities } : {}),
@@ -523,7 +675,9 @@ export async function walkGraph(
 
     // Judges attached to this node's config (if any) score the output now, on
     // the same tracker. Defensive: a judge problem must never break the walk.
-    if (judgeHook) {
+    // Skipped on replay: the scores were recorded by the original walk, and they
+    // do not affect routing (see the Step 3 note on WalkInputs.judgeHook).
+    if (judgeHook && tracker) {
       try {
         await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
       } catch (e) {
@@ -536,7 +690,10 @@ export async function walkGraph(
     // build on an unverified claim. (A shim implementation bug — an unexpected
     // throw — logs and does not halt; evidential failures are reported inside
     // the verification, not thrown.)
-    if (verifier) {
+    // Skipped on replay: a verification failure is not resumable, so every node in
+    // an accepted journal already passed. Re-running the shims against a checkout
+    // that may have moved is what the caller's invalidation keys are for.
+    if (verifier && !replaying) {
       try {
         const verification = await verifier({ configKey: key, tags: result.tags });
         if (verification) {
@@ -568,8 +725,11 @@ export async function walkGraph(
       if (skip && tagsMatch(accumulatedTags, skip)) continue;
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== undefined) {
-        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)), MAX_VISITS_HARD_CAP);
         const ek = `${key}→${edge.key}`;
+        // A human's resume grant raises this edge's ceiling but can never remove it:
+        // the hard cap still clamps the total.
+        const grant = Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0));
+        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {
           const trig = describeLoopCondition(h);
@@ -661,9 +821,30 @@ export async function walkGraph(
       };
     }
 
-    if (next) graphTracker?.trackHandoffSuccess(key, next);
+    // Handoff metrics: recorded only when the SOURCE node ran live. If the source
+    // was replayed, the original walk already recorded whatever edge it took, and
+    // re-recording would double-count. Known undercount: when the journal ends at a
+    // loop-exhausted node, the original took no edge, so the one handoff a grant now
+    // unlocks goes untracked. Undercounting one edge beats inflating every replayed
+    // one.
+    if (next && !replaying) graphTracker?.trackHandoffSuccess(key, next);
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
+  }
+
+  // The journal must be fully consumed. Leftover entries mean the walk terminated
+  // earlier than it did before — the graph changed under it, or an edge condition
+  // now resolves differently. Same fail-closed treatment as a positional mismatch.
+  if (!replayDiverged && runs.length < journal.length) {
+    const nextEntry = journal[runs.length];
+    replayDiverged = {
+      atIndex: runs.length,
+      expected: nextEntry ? `${nextEntry.configKey}#${nextEntry.iteration}` : "(entry)",
+      actual: "(walk ended)",
+      detail:
+        "the walk terminated before consuming the whole journal — an edge condition or the graph changed. A fresh run is required.",
+    };
+    onEvent?.({ type: "replay-diverged", info: replayDiverged });
   }
 
   const reached = new Set(runs.map((r) => r.configKey));
@@ -678,5 +859,6 @@ export async function walkGraph(
     ...(pendingApproval ? { pendingApproval } : {}),
     ...(verificationFailed ? { verificationFailed } : {}),
     ...(loopExhausted ? { loopExhausted } : {}),
+    ...(replayDiverged ? { replayDiverged } : {}),
   };
 }

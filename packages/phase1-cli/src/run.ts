@@ -333,12 +333,9 @@ async function run(opts: CliOptions): Promise<number> {
   // code-side checks.
   const verifier = buildHandoffVerifier({ sandboxRoot: root, ...(writer ? { writer } : {}) });
 
-  const walk = await walkGraph(
-    graphDef,
-    runner,
-    context,
+  const walk = await walkGraph(graphDef, runner, context, {
     graphTracker,
-    (event) => {
+    onEvent: (event) => {
       if (event.type === "node-start") console.log(`\n▶ step ${event.index + 1}: ${nodeTitle(event.configKey)}`);
       else if (event.type === "node-complete") {
         console.log(
@@ -354,12 +351,14 @@ async function run(opts: CliOptions): Promise<number> {
         console.log(`⚠ ${describeLoopExhausted(event.info)}`);
       } else if (event.type === "awaiting-approval") {
         console.log(`⏸ approval gate: stopped before ${event.node}`);
+      } else if (event.type === "replay-diverged") {
+        console.log(`⛔ resume aborted: ${event.info.detail}`);
       }
     },
     gate,
     judgeHook,
     verifier,
-  );
+  });
 
   console.log(`\nRan ${walk.runs.length} node(s): ${walk.runs.map((r) => r.configKey).join(" → ")}`);
   if (walk.skipped.length) console.log(`Skipped: ${walk.skipped.join(", ")}`);

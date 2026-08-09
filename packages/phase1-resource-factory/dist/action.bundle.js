@@ -33689,7 +33689,7 @@ ${trigger.detail}` : "";
 This is a re-run of an earlier step; a previous iteration already executed. ${why}${detailBlock}${factBlock}
 === END REWORK CONTEXT ===`;
 }
-function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx, trigger) {
+function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx, trigger, humanFeedback) {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
     ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
@@ -33698,6 +33698,11 @@ function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx, trigger) {
   const parts = [header];
   if (iteration > 1)
     parts.push(reworkPreamble(iteration, inventory, trigger));
+  if (humanFeedback) {
+    parts.push(`=== HUMAN GUIDANCE (authoritative \u2014 overrides the brief below) ===
+${humanFeedback}
+=== END HUMAN GUIDANCE ===`);
+  }
   if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY)
     parts.push(ctx.PR_BODY);
   if (hasInbound) {
@@ -33724,7 +33729,9 @@ function allNodeKeys(graphDef) {
   }
   return [...keys];
 }
-async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate, judgeHook, verifier) {
+async function walkGraph(graphDef, runner, context, inputs = {}) {
+  const { graphTracker, onEvent, gate, judgeHook, verifier, resume } = inputs;
+  const journal = resume?.journal ?? [];
   const runs = [];
   const accumulatedTags = {};
   const inventory = {};
@@ -33743,10 +33750,14 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
   let pendingApproval;
   let verificationFailed;
   let loopExhausted;
+  let replayDiverged;
   let pendingLoopTrigger;
+  let pendingHumanFeedback = resume?.humanFeedback;
   while (node) {
     const key = node.getKey();
-    if (gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
+    const replayEntry = runs.length < journal.length ? journal[runs.length] : void 0;
+    const replaying = replayEntry !== void 0;
+    if (!replaying && gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
       pendingApproval = { node: key };
       onEvent?.({ type: "awaiting-approval", node: key });
       break;
@@ -33775,18 +33786,37 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     const maxTurns = inboundMaxTurns ?? entry.maxTurns;
     const requestType = inboundRequestType ?? entry.requestType;
     const capabilities = inboundCapabilities ?? entry.capabilities;
+    if (replayEntry && (replayEntry.configKey !== key || replayEntry.iteration !== iteration)) {
+      replayDiverged = {
+        atIndex: runs.length,
+        expected: `${replayEntry.configKey}#${replayEntry.iteration}`,
+        actual: `${key}#${iteration}`,
+        detail: "the journal does not describe the node this walk re-derived \u2014 the graph, configs, or walker logic changed. A fresh run is required."
+      };
+      onEvent?.({ type: "replay-diverged", info: replayDiverged });
+      break;
+    }
     onEvent?.({ type: "node-start", configKey: key, index: runs.length });
-    const tracker = cfg.createTracker();
+    const tracker = replaying ? void 0 : cfg.createTracker();
     const trigger = pendingLoopTrigger;
     pendingLoopTrigger = void 0;
-    const prompt = buildPrompt(key === rootKey, inboundHandoff !== void 0, iteration, inventory, ctx, trigger);
-    const result = await runner.runNode({
+    const humanFeedback = replaying ? void 0 : pendingHumanFeedback;
+    if (!replaying)
+      pendingHumanFeedback = void 0;
+    const prompt = buildPrompt(key === rootKey, inboundHandoff !== void 0, iteration, inventory, ctx, trigger, humanFeedback);
+    const result = replayEntry ? {
+      status: replayEntry.status,
+      // The recorded final text, re-wrapped so the rest of the loop (which reads
+      // it via lastAssistantText) is identical on a replayed and a live run.
+      messages: [{ role: "assistant", content: replayEntry.output, isFinal: true }],
+      tags: replayEntry.tags
+    } : await runner.runNode({
       configKey: key,
       prompt,
       ...cfg.instructions ? { instructions: cfg.instructions } : {},
       ...cfg.model?.name ? { model: cfg.model.name } : {},
       ...cfg.model?.parameters ? { modelParameters: cfg.model.parameters } : {},
-      tracker,
+      ...tracker ? { tracker } : {},
       ...maxTurns !== void 0 ? { maxTurns } : {},
       ...requestType ? { requestType } : {},
       ...capabilities ? { capabilities } : {},
@@ -33802,14 +33832,14 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     const run = { configKey: key, status: result.status, output, tags: result.tags, iteration };
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
-    if (judgeHook) {
+    if (judgeHook && tracker) {
       try {
         await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
       } catch (e) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
       }
     }
-    if (verifier) {
+    if (verifier && !replaying) {
       try {
         const verification = await verifier({ configKey: key, tags: result.tags });
         if (verification) {
@@ -33841,8 +33871,9 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
         continue;
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== void 0) {
-        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)), MAX_VISITS_HARD_CAP);
         const ek = `${key}\u2192${edge.key}`;
+        const grant = Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0));
+        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {
           const trig = describeLoopCondition(h);
@@ -33920,10 +33951,20 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
         reason: describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)"
       };
     }
-    if (next)
+    if (next && !replaying)
       graphTracker?.trackHandoffSuccess(key, next);
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
+  }
+  if (!replayDiverged && runs.length < journal.length) {
+    const nextEntry = journal[runs.length];
+    replayDiverged = {
+      atIndex: runs.length,
+      expected: nextEntry ? `${nextEntry.configKey}#${nextEntry.iteration}` : "(entry)",
+      actual: "(walk ended)",
+      detail: "the walk terminated before consuming the whole journal \u2014 an edge condition or the graph changed. A fresh run is required."
+    };
+    onEvent?.({ type: "replay-diverged", info: replayDiverged });
   }
   const reached = new Set(runs.map((r) => r.configKey));
   const skipped = allNodeKeys(graphDef).filter((k) => !reached.has(k));
@@ -33935,7 +33976,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     ...stalledAt ? { stalledAt } : {},
     ...pendingApproval ? { pendingApproval } : {},
     ...verificationFailed ? { verificationFailed } : {},
-    ...loopExhausted ? { loopExhausted } : {}
+    ...loopExhausted ? { loopExhausted } : {},
+    ...replayDiverged ? { replayDiverged } : {}
   };
 }
 
@@ -40142,7 +40184,7 @@ async function main() {
   } : void 0;
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...verifierWriter ? { writer: verifierWriter } : {} });
-  const walk2 = await walkGraph(graphDef, runner, context, graphTracker, void 0, gate, judgeHook, verifier);
+  const walk2 = await walkGraph(graphDef, runner, context, { graphTracker, gate, judgeHook, verifier });
   for (const r of walk2.runs) {
     console.log(`
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 ${r.configKey} [${r.status}] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550`);

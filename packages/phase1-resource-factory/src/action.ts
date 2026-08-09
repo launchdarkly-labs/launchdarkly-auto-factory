@@ -529,7 +529,7 @@ async function main(): Promise<void> {
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...(verifierWriter ? { writer: verifierWriter } : {}) });
 
-  const walk = await walkGraph(graphDef, runner, context, graphTracker, undefined, gate, judgeHook, verifier);
+  const walk = await walkGraph(graphDef, runner, context, { graphTracker, gate, judgeHook, verifier });
 
   // Per-node visibility: dump each agent's terminal status, routing tags, and final output.
   for (const r of walk.runs) {

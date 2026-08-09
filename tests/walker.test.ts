@@ -126,8 +126,8 @@ describe("walkGraph", () => {
 
   it("emits a 'stalled' walk event for live UIs", async () => {
     const events: string[] = [];
-    await walkGraph(buildGraph(), new FakeRunner({ flag: { tags: {} } }), { PR_NUMBER: "1" }, undefined, (e) =>
-      events.push(e.type),
+    await walkGraph(buildGraph(), new FakeRunner({ flag: { tags: {} } }), { PR_NUMBER: "1" }, { onEvent: (e) =>
+      events.push(e.type) },
     );
     assert.ok(events.includes("stalled"), `expected a stalled event, got: ${events.join(", ")}`);
   });
@@ -140,10 +140,10 @@ describe("walkGraph — approval gates", () => {
   };
 
   it("halts BEFORE a gated node when approval is not granted", async () => {
-    const r = await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, undefined, undefined, {
+    const r = await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, { gate: {
       steps: ["flag"],
       resolve: () => false, // not approved
-    });
+    } });
     // Only research ran; the gated flag node and everything after did not.
     assert.deepEqual(
       r.runs.map((x) => x.configKey),
@@ -154,10 +154,10 @@ describe("walkGraph — approval gates", () => {
   });
 
   it("runs the gated node (and continues) once approval is granted", async () => {
-    const r = await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, undefined, undefined, {
+    const r = await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, { gate: {
       steps: ["flag"],
       resolve: () => true, // approved
-    });
+    } });
     assert.deepEqual(
       r.runs.map((x) => x.configKey),
       ["research", "flag", "test", "review"],
@@ -167,13 +167,13 @@ describe("walkGraph — approval gates", () => {
 
   it("only consults the gate for gated nodes, and supports async resolve", async () => {
     const asked: string[] = [];
-    const r = await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, undefined, undefined, {
+    const r = await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, { gate: {
       steps: ["test"],
       resolve: async (node) => {
         asked.push(node);
         return true;
       },
-    });
+    } });
     assert.deepEqual(asked, ["test"]); // never asked about research/flag/review
     assert.deepEqual(
       r.runs.map((x) => x.configKey),
@@ -183,10 +183,10 @@ describe("walkGraph — approval gates", () => {
 
   it("emits an 'awaiting-approval' event when it halts", async () => {
     const events: string[] = [];
-    await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, undefined, (e) => events.push(e.type), {
+    await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, { onEvent: (e) => events.push(e.type), gate: {
       steps: ["flag"],
       resolve: () => false,
-    });
+    } });
     assert.ok(events.includes("awaiting-approval"), `got: ${events.join(", ")}`);
   });
 
@@ -275,7 +275,7 @@ describe("walkGraph — loop-back edges", () => {
       review: [{ tags: { review_approved: "reject" } }, { tags: { review_approved: "approve" } }],
     });
     const tracker = new RecordingTracker();
-    const r = await walkGraph(graphFrom(loopGraph(2)), runner, { PR_NUMBER: "1" }, tracker as unknown as LDGraphTracker);
+    const r = await walkGraph(graphFrom(loopGraph(2)), runner, { PR_NUMBER: "1" }, { graphTracker: tracker as unknown as LDGraphTracker });
     assert.equal(countOf(r, "flag"), 2, "flag re-ran once");
     assert.equal(countOf(r, "review"), 2);
     assert.equal(r.loopExhausted, undefined);
@@ -592,11 +592,223 @@ describe("walkGraph — loop-back edges", () => {
       },
     });
     const tracker = new RecordingTracker();
-    const r = await walkGraph(g, new ScriptedRunner({}), { PR_NUMBER: "1" }, tracker as unknown as LDGraphTracker);
+    const r = await walkGraph(g, new ScriptedRunner({}), { PR_NUMBER: "1" }, { graphTracker: tracker as unknown as LDGraphTracker });
     assert.equal(r.loopExhausted, undefined, "both loops fell through cleanly");
     assert.equal(r.stalledAt, undefined);
     assert.equal(countOf(r, "done"), 1, "reached the terminal via fallthroughs");
     assert.ok(tracker.handoffs.some(([f, t]) => f === "test" && t === "flag"), "inner loop edge fired");
     assert.ok(tracker.handoffs.some(([f, t]) => f === "review" && t === "plan"), "outer loop edge fired");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 Step 2 — resume as event-log replay.
+//
+// The walk loop is pure: every value it accumulates (tags, inventory, edgeCounts,
+// routingSnapshots, envelope inheritance) is a function of the ordered node results
+// plus the graph. So a resume replays the recorded results through the SAME loop and
+// lets it rebuild its own internals, rather than serialising and restoring them.
+// ---------------------------------------------------------------------------
+describe("walkGraph — resume (event-log replay)", () => {
+  /** Fails loudly if the runner is reached; a full replay must not execute anything. */
+  class NeverRunner implements AgentRunner {
+    calls = 0;
+    async runNode(req: AgentNodeRequest): Promise<AgentNodeResult> {
+      this.calls++;
+      throw new Error(`runner must not be called during replay (reached '${req.configKey}')`);
+    }
+  }
+
+  /** research → flag → test → review, with a rework loop on a rejected review. */
+  const reworkGraphValue = (maxVisits: number): LDAgentGraphFlagValue => ({
+    root: "research",
+    edges: {
+      research: [{ key: "flag" }],
+      flag: [{ key: "test" }],
+      test: [{ key: "review" }],
+      review: [{ key: "flag", handoff: { max_visits: maxVisits, require_tags: { review_approved: "false" } } }],
+    },
+  });
+
+  /** A graph whose configs count createTracker() calls (one per LIVE node run). */
+  function countingGraph(value: LDAgentGraphFlagValue): { graph: AgentGraphDefinition; trackers: () => number } {
+    let made = 0;
+    const keys = new Set<string>([value.root ?? ""]);
+    for (const [src, edges] of Object.entries(value.edges ?? {})) {
+      keys.add(src);
+      for (const e of edges) keys.add(e.key);
+    }
+    const configs: Record<string, LDAIAgentConfig> = {};
+    for (const k of keys) {
+      configs[k] = {
+        key: k,
+        enabled: true,
+        instructions: `instructions for ${k}`,
+        model: { name: "Anthropic.claude-sonnet-4-6" },
+        createTracker: () => {
+          made++;
+          return {} as unknown as LDAIConfigTracker;
+        },
+      } as LDAIAgentConfig;
+    }
+    const nodes = AgentGraphDefinition.buildNodes(value, configs);
+    return {
+      graph: new AgentGraphDefinition(value, nodes, true, () => ({}) as unknown as LDGraphTracker),
+      trackers: () => made,
+    };
+  }
+
+  it("1. PROPERTY: replaying a completed walk reproduces it exactly, executing nothing", async () => {
+    // The correctness guarantee snapshot-restore cannot have. If this ever fails,
+    // some input the walk branches on is not in the journal.
+    const script = {
+      flag: { tags: { flag_ready: "true", flag_key: "enable-x" } },
+      review: [{ tags: { review_approved: "false" } }, { tags: { review_approved: "true" } }],
+    };
+    const first = await walkGraph(graphFrom(reworkGraphValue(2)), new ScriptedRunner(script), { PR_NUMBER: "1" });
+    assert.equal(countOf(first, "flag"), 2, "the fixture actually looped");
+
+    const never = new NeverRunner();
+    const replayed = await walkGraph(graphFrom(reworkGraphValue(2)), never, { PR_NUMBER: "1" }, {
+      resume: { journal: first.runs },
+    });
+    assert.equal(never.calls, 0, "a fully-journalled walk executes no nodes");
+    assert.equal(replayed.replayDiverged, undefined);
+    assert.deepEqual(replayed, first, "replay must be indistinguishable from the original walk");
+  });
+
+  it("2. replayed nodes create no trackers, record no handoffs, and run no judges", async () => {
+    // Replaying LD side effects would double-count the per-variation AI Config
+    // monitoring data that the model A/B depends on.
+    const script = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "true" } } };
+    const seed = countingGraph(reworkGraphValue(2));
+    const first = await walkGraph(seed.graph, new ScriptedRunner(script), { PR_NUMBER: "1" });
+    const liveTrackers = seed.trackers();
+    assert.equal(liveTrackers, first.runs.length, "one tracker per live node run");
+
+    const replay = countingGraph(reworkGraphValue(2));
+    const handoffs = new RecordingTracker();
+    let judged = 0;
+    await walkGraph(replay.graph, new NeverRunner(), { PR_NUMBER: "1" }, {
+      graphTracker: handoffs as unknown as LDGraphTracker,
+      judgeHook: async () => {
+        judged++;
+        return [];
+      },
+      resume: { journal: first.runs },
+    });
+    assert.equal(replay.trackers(), 0, "no trackers for replayed nodes");
+    assert.deepEqual(handoffs.handoffs, [], "no handoff metrics re-recorded");
+    assert.equal(judged, 0, "no judges re-run");
+  });
+
+  it("3. resume past a gate halt: replayed nodes are not re-gated, the frontier is", async () => {
+    const g = () => graphFrom(reworkGraphValue(2));
+    const script = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "true" } } };
+    // Gate BOTH research and flag, approving research but withholding flag.
+    const first = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
+      gate: { steps: ["research", "flag"], resolve: async (n) => n === "research" },
+    });
+    assert.deepEqual(first.pendingApproval, { node: "flag" });
+    assert.deepEqual(first.runs.map((r) => r.configKey), ["research"]);
+
+    const asked: string[] = [];
+    const resumed = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
+      gate: {
+        steps: ["research", "flag"],
+        resolve: async (n) => {
+          asked.push(n);
+          return true;
+        },
+      },
+      resume: { journal: first.runs },
+    });
+    // The whole point: 'research' already ran, so it is not re-asked — otherwise a
+    // resume would re-prompt for every approval already given.
+    assert.deepEqual(asked, ["flag"], "only the frontier node was gated");
+    assert.deepEqual(resumed.runs.map((r) => r.configKey), ["research", "flag", "test", "review"]);
+    assert.equal(resumed.pendingApproval, undefined);
+    assert.equal(resumed.replayDiverged, undefined);
+  });
+
+  it("4. resume a loop-exhausted walk with an extraVisits grant, and converge", async () => {
+    const g = () => graphFrom(reworkGraphValue(1));
+    const rejecting = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "false" } } };
+    const first = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" });
+    assert.equal(first.loopExhausted?.reason, "budget");
+    assert.equal(countOf(first, "flag"), 2, "1 initial + max_visits(1)");
+
+    // The human grants one more pass AND the reviewer now approves.
+    const resumed = await walkGraph(g(), new ScriptedRunner({
+      flag: { tags: { flag_ready: "true" } },
+      review: { tags: { review_approved: "true" } },
+    }), { PR_NUMBER: "1" }, {
+      resume: { journal: first.runs, extraVisits: { "review→flag": 1 }, humanFeedback: "scope the flag to the checkout path only" },
+    });
+    assert.equal(resumed.loopExhausted, undefined, "the grant let it converge");
+    assert.equal(resumed.replayDiverged, undefined);
+    assert.equal(countOf(resumed, "flag"), 3, "one more rework pass than before");
+  });
+
+  it("5. humanFeedback reaches the first LIVE node only", async () => {
+    const g = () => graphFrom(reworkGraphValue(2));
+    const script = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "true" } } };
+    const first = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
+      gate: { steps: ["flag"], resolve: async () => false },
+    });
+    assert.deepEqual(first.runs.map((r) => r.configKey), ["research"]);
+
+    const runner = new ScriptedRunner(script);
+    await walkGraph(g(), runner, { PR_NUMBER: "1" }, {
+      gate: { steps: ["flag"], resolve: async () => true },
+      resume: { journal: first.runs, humanFeedback: "USE-THE-EXISTING-FLAG" },
+    });
+    const flagPrompt = (runner.promptsByKey.flag ?? [])[0] ?? "";
+    assert.match(flagPrompt, /=== HUMAN GUIDANCE \(authoritative/);
+    assert.match(flagPrompt, /USE-THE-EXISTING-FLAG/);
+    // Delivered once: the next live node must not inherit it.
+    const testPrompt = (runner.promptsByKey.test ?? [])[0] ?? "";
+    assert.doesNotMatch(testPrompt, /HUMAN GUIDANCE/);
+  });
+
+  it("6. DIVERGENCE: a journal naming a different node fails closed", async () => {
+    const script = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "true" } } };
+    const first = await walkGraph(graphFrom(reworkGraphValue(2)), new ScriptedRunner(script), { PR_NUMBER: "1" });
+    // Corrupt entry 1 as if the graph had been reordered under the journal.
+    const tampered = first.runs.map((r, i) => (i === 1 ? { ...r, configKey: "review" } : r));
+    const never = new NeverRunner();
+    const r = await walkGraph(graphFrom(reworkGraphValue(2)), never, { PR_NUMBER: "1" }, {
+      resume: { journal: tampered },
+    });
+    assert.equal(r.replayDiverged?.atIndex, 1);
+    assert.equal(r.replayDiverged?.expected, "review#1");
+    assert.equal(r.replayDiverged?.actual, "flag#1");
+    assert.match(r.replayDiverged?.detail ?? "", /fresh run is required/);
+    assert.equal(never.calls, 0, "it stops before executing anything");
+  });
+
+  it("7. DIVERGENCE: an unconsumed journal fails closed too", async () => {
+    const script = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "true" } } };
+    const first = await walkGraph(graphFrom(reworkGraphValue(2)), new ScriptedRunner(script), { PR_NUMBER: "1" });
+    // Resume against a graph that now terminates at the root — the rest of the
+    // journal can never be reached, which must not read as a clean short run.
+    const truncated = graphFrom({ root: "research", edges: { research: [] } });
+    const r = await walkGraph(truncated, new NeverRunner(), { PR_NUMBER: "1" }, { resume: { journal: first.runs } });
+    assert.equal(r.replayDiverged?.actual, "(walk ended)");
+    assert.equal(r.replayDiverged?.atIndex, 1);
+    assert.match(r.replayDiverged?.detail ?? "", /before consuming the whole journal/);
+  });
+
+  it("8. an extraVisits grant cannot exceed the hard cap", async () => {
+    // A grant raises a ceiling; it can never remove one.
+    const g = () => graphFrom(reworkGraphValue(2));
+    const rejecting = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "false" } } };
+    const first = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" });
+    const resumed = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" }, {
+      resume: { journal: first.runs, extraVisits: { "review→flag": 1000 } },
+    });
+    assert.equal(resumed.loopExhausted?.reason, "budget");
+    assert.equal(resumed.loopExhausted?.exhausted[0]?.maxVisits, 10, "clamped to MAX_VISITS_HARD_CAP");
+    assert.equal(countOf(resumed, "flag"), 11, "1 initial + 10 reworks, not 1002");
   });
 });

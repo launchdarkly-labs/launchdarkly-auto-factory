@@ -101,12 +101,9 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
   const policy = await resolveApprovalPolicy(ldClient, ldContext);
   const gate = createPolicyGate(policy, (node) => opts.confirmGate?.(node) ?? false);
 
-  const walk = await walkGraph(
-    graphDef,
-    runner,
-    opts.context,
+  const walk = await walkGraph(graphDef, runner, opts.context, {
     graphTracker,
-    (event) => {
+    onEvent: (event) => {
       if (event.type === "node-start") reporter.nodeStart(event.configKey);
       else if (event.type === "node-complete") reporter.nodeComplete(event.run);
       else if (event.type === "node-verified") {
@@ -122,14 +119,15 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
         reporter.log(`⚠ ${describeLoopExhausted(event.info)}`);
       } else if (event.type === "awaiting-approval") {
         reporter.log(`⏸ approval gate: stopped before ${event.node}`);
+      } else if (event.type === "replay-diverged") {
+        reporter.log(`⛔ resume aborted: ${event.info.detail}`);
       }
     },
     gate,
-    undefined,
     // Deterministic handoff shims: LD-side checks need the writer's connection;
     // read-only runs still get the code-side checks.
-    buildHandoffVerifier({ sandboxRoot: opts.workspaceRoot, ...(writer ? { writer } : {}) }),
-  );
+    verifier: buildHandoffVerifier({ sandboxRoot: opts.workspaceRoot, ...(writer ? { writer } : {}) }),
+  });
 
   const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);

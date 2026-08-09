@@ -220,6 +220,27 @@ carry) the gate decision at the resume node, or resume becomes a gate bypass.
 
 ## 2a. Event-log replay through the unmodified walker
 
+> **The primitive is shipped** (`WalkInputs.resume`, `ResumeInput`,
+> `WalkResult.replayDiverged`). CLI persistence and `--resume` are the next commit;
+> nothing calls this yet. Notes on what changed in the building:
+>
+> - **`WalkInputs` landed with it,** not as a follow-up. `walkGraph` had 8 positional
+>   params and callers were passing `undefined` placeholders; adding a 9th was the
+>   forcing function. Only 12 call sites needed updating (most tests pass 3 args).
+> - **The verifier is skipped on replay, not journaled.** A verification failure is
+>   not resumable, so every node in an accepted journal already passed — nothing to
+>   replay. That removed a field from the journal.
+> - **Gate decisions are not journaled either.** A replayed node ran, which means it
+>   was already permitted; the frontier is gated normally. So the journal is exactly
+>   `WalkResult.runs` — no new persistence shape to design.
+> - **`humanFeedback` gets its own prompt block** rather than riding in
+>   `LoopTrigger.detail`: a gate-halt resume can land on iteration 1, where no rework
+>   preamble renders at all. `detail` therefore remains Step 3's (judge reasoning).
+> - **Divergence is detected two ways** — a positional mismatch
+>   (`configKey#iteration`) and an unconsumed journal at walk end. Both fail closed
+>   to `replayDiverged`, which callers must treat as "discard and re-run", never as a
+>   result: the partial state is a mix of two walks.
+
 > **Rev 2 said "mid-walk re-entry, not replay-from-root," on two premises that are
 > false.** (1) "The walk's state is already fully materialised in `WalkResult`
 > (`runs`, `tags`, `inventory`, `skipped`, `routingSnapshots`, `edgeCounts`)" — the
