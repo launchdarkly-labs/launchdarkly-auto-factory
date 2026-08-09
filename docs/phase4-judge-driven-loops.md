@@ -107,8 +107,11 @@ strictly cheaper than reworking approved work that already has LD resources atta
 **Edge order is load-bearing.** The walker takes the first passing edge and `break`s
 (`graphWalker.ts:496`). `code-reviewer` has no other outgoing edge, so 1a is safe —
 but this stops being true the moment a loop edge is added to a node that also has a
-forward edge (see Step 3). Whether `node.getEdges()` preserves JSON declaration order
-is SDK-internal and **unverified**; verify before relying on it.
+forward edge (see Step 3). `node.getEdges()` **does** preserve declaration order —
+verified: it returns the raw served edge array untransformed
+(`@launchdarkly/server-sdk-ai/dist/index.js:325-327`, built from
+`graph.edges?.[key] ?? []` at `:359`). Stable per served payload, with the caveat that
+a LaunchDarkly dashboard edit changes that array.
 
 ## 1b. Loop-trigger feedback into the rework preamble
 
@@ -180,52 +183,165 @@ an exhausted or gate-halted walk is the same human whose approval the gate wante
 one mechanism serves both — and resume must therefore re-evaluate (or explicitly
 carry) the gate decision at the resume node, or resume becomes a gate bypass.
 
-## 2a. Mid-walk re-entry, not replay-from-root
+## 2a. Event-log replay through the unmodified walker
 
-The decision everything else hangs off. **Recommend mid-walk re-entry.** The walk's
-state is already fully materialised in `WalkResult` (`runs`, `tags`, `inventory`,
-`skipped`, `routingSnapshots`, `edgeCounts`), and Phase 2's `runRecord` already
-persists much of it. Replay-from-root with memoisation would require every node's work
-to be idempotent — and flag creation is not, which is the whole reason the gate
-exists.
+> **Rev 2 said "mid-walk re-entry, not replay-from-root," on two premises that are
+> false.** (1) "The walk's state is already fully materialised in `WalkResult`
+> (`runs`, `tags`, `inventory`, `skipped`, `routingSnapshots`, `edgeCounts`)" — the
+> return at `graphWalker.ts:575-584` carries the first four; `routingSnapshots`,
+> `edgeCounts`, and the envelope-inheritance map are locals that never escape, so
+> snapshot re-entry means widening `WalkResult` or exporting internals. (2)
+> "Replay would require every node's work to be idempotent — and flag creation is
+> not": `ldWriter.ts` is idempotent by construction (`create_flag` 409 → "no
+> change", `add_variation` "already exists — safe re-run", `create_metric` 409
+> reported not thrown). The real non-idempotency is `commit_and_push`, and the
+> gate's job is gating *decisions*, not preventing duplicate resources. Both
+> premises were checked against the code and neither holds. Corrected below.
 
-## 2b. What to persist
+**Recommendation: persist the ordered node-result log and replay it through the
+unmodified walker.** On resume, wrap the real `AgentRunner` in a memo that returns
+recorded results for the first N node runs, then goes live at the frontier.
 
-Extend `runRecord`: graph key + config version, resume node, per-edge `edgeCounts`,
-`accumulatedTags`, `inventory`, `routingSnapshots`, `runs` (config key / status / tags
-/ iteration, output truncated), PR number / branch / **head SHA**, approval policy
-mode + threshold, `lastLoopTrigger`.
+The enabling fact: **`walkGraph` has no internal nondeterminism** — no `Date.now`,
+no `Math.random`. Everything it accumulates (`accumulatedTags`, `inventory`,
+`routingSnapshots`, `edgeCounts`, envelope inheritance, `ctx.PREVIOUS_STEP_OUTPUT`)
+is a pure function of the ordered node results plus the graph definition. Tags fold
+in at `:431-433`; `PREVIOUS_STEP_OUTPUT` is exactly `runs[i].output`; edge selection
+reads only `accumulatedTags` + `edgeCounts` and is pure (`:479-499`); the rewind
+block reads only `runs`/`routingSnapshots` (`:548-565`). The runner is the only
+impure step in the loop body.
 
-**Invalidation rule:** if the head SHA moved, refuse to resume — the diff the reviewer
-judged no longer exists. Fail closed and require a fresh run.
+**Why this beats snapshot re-entry — a correctness argument, not an aesthetic one.**
+Snapshot re-entry creates a *second code path* through the walker's subtlest
+invariants, with no forcing function keeping the two in agreement. Two concrete traps
+it walks into:
 
-## 2c. Grant and surface
+- **The rewind trap.** The routing rewind + overlay runs *only on loop-edge
+  traversal* (`:548-565`). A snapshot resume that jumps to the loop target skips it
+  and carries stale routing tags into the next iteration — precisely the bug the
+  rewind exists to prevent. Under replay the walker re-selects the loop edge itself,
+  so the rewind runs in situ.
+- **The consumed visit.** `edgeCounts` increments when the loop edge is *selected*
+  (`:564`), before the target's gate check can halt (`:372`). A gate-halt at a loop
+  target has therefore already spent a visit. Snapshot resume must special-case
+  that; replay reproduces it for free.
+
+Replay also has a correctness property snapshot re-entry cannot: **replaying a
+completed walk must yield a byte-identical `WalkResult`.** That is a property test,
+and it fails loudly the moment someone adds an unjournaled input.
+
+**It also fixes the per-walk budget scope limit** (see the CHANGELOG's "known scope
+limit"): once traversal counts are re-derived from a persisted log rather than a
+process-local map, `max_visits` becomes per-PR-per-head instead of per-process.
+
+## 2b. What to journal, and what must not be replayed
+
+Journal every nondeterministic input the walker branches on:
+
+| Input | Why |
+|---|---|
+| Node results (`status`, `tags`, `output`, `iteration`) | Already exactly `NodeRun` (`:68-75`) |
+| Gate decisions | Human/label input; must not be re-asked for replayed nodes |
+| Judge results | Currently discarded, but they **route** from Step 3 on |
+| Verification results | Derived from a checkout that may have changed |
+
+**Size.** Only the frontier's predecessor needs a *full* output — `buildPrompt` reads
+only `ctx.PREVIOUS_STEP_OUTPUT`, so earlier outputs can be truncated to whatever
+reporting wants. That keeps the log small enough for constrained storage.
+
+**Two things must be suppressed during replay, not replayed:**
+
+- **The LD trackers.** `cfg.createTracker()` per node run (`:415`) and
+  `trackHandoffSuccess` (`:567`) are write-only side effects into LaunchDarkly.
+  Replaying them double-counts generation metrics, handoff metrics, and judge scores
+  — corrupting the per-variation AI Config monitoring data the Composer-vs-Sonnet A/B
+  depends on. Replayed nodes must not track.
+- **The judge hook.** Same reason (it records on the evaluated node's tracker), which
+  is why its results are journaled rather than re-executed.
+
+**Keep the injected seam explicit.** Collapse `runner`/`gate`/`judgeHook`/`verifier`/
+`graphTracker` into one `WalkInputs` bundle so adding a new nondeterministic input
+without journaling it is a *type error* rather than a silent replay divergence.
+
+**Invalidation — fail closed, demand a fresh run, on any of:** config stamp changed
+(`computeConfigHash`/`extractConfigStamp` already exist), graph key changed, head SHA
+moved, working-tree content hash changed (CLI/extension only — see 2c), log schema
+version, or *any* replay/record divergence. Note the config stamp hashes the
+**committed repo**, not the served graph, so a LaunchDarkly dashboard edit to the
+graph between halt and resume is invisible to it — `getEdges()` returns the raw
+served edge array (`server-sdk-ai/dist/index.js:325-327`, built at `:359`), so such
+an edit changes edge order and must be treated as invalidating. Divergence detection
+is the real backstop here.
+
+## 2c. Sequencing: CLI first, Action last
+
+**CLI first.** It is the surface where current behaviour is outright *incorrect*
+rather than merely wasteful. The CLI runs `gitMode: "workingTree"` (`run.ts:280`), so
+agent edits sit uncommitted in the tree, and context is rebuilt from that tree
+(`buildWorkingTreeContext`, `run.ts:208`). A re-run after an approval pause therefore
+has its planner analyse **AutoFactory's own prior edits as if a human wrote them**,
+and the judges' working-tree evidence is polluted the same way. Head-SHA invalidation
+does not catch this — agents mutate the tree without moving HEAD — so a CLI resume
+record needs a working-tree content hash. Storage is also safest here:
+`<git-dir>/autofactory-walk-state.json`, following the `runRecord.ts` idiom (inside
+`.git/`, uncommittable), single user, no tamper surface. Note this is a *new* file:
+`runRecord` deliberately is **not** written on approval pauses (`runRecord.ts:9-12`),
+which is the opposite policy from a resume record.
+
+**Extension: nothing to do.** Its gate is a blocking in-process modal with a per-run
+answer cache (`extension.ts:151-173`), so `pendingApproval` there means a human
+*declined* — a decision, not a pause. Exhaustion inherits whatever the shared walker
+grows.
+
+**Action last, and not in a PR comment.** A bot comment is editable by anyone with
+repo write, so a forged `review_approved` or `inventory` in a resume record is a
+verdict/approval bypass. Action-side state needs an HMAC over a secret, or immutable
+workflow-artifact storage. Until then keep label-driven from-root re-runs, which are
+tolerable at the *default* gate placement (the halt precedes any LD write, so only
+planner + steward are redone) — and add a lint warning when
+`auto-factory-approval-gates` places a gate *downstream* of `flag-implementer`, since
+that configuration lets run 1 create the flag and push commits before halting, and
+the re-run's re-plan can then emit a different `flag_key`. The orphan guard catches
+that loudly (`approval.ts:71-84`) but it is a smoke alarm, not a fix.
+
+**Not resumable, deliberately:** `stalledAt` (resuming replays the same missing tag —
+the fix is upstream) and `verificationFailed` (downstream must not build on an
+unverified claim; the fix is a *loop*, not a resume).
+
+## 2d. Grant and surface
 
 ```ts
-{ extraVisits: { "source→target": N }, humanFeedback?: string, approvedNodes?: string[] }
+{ extraVisits: { "source→target": N }, humanFeedback?: string }
 ```
 
-Bounded by `MAX_VISITS_HARD_CAP` (`graphWalker.ts:33`), accumulated on top of existing
-counts rather than reset — a reset makes "how many times did this actually run"
-unanswerable.
+Bounded by `MAX_VISITS_HARD_CAP` (`:33`), accumulated on top of the replayed counts
+rather than reset — a reset makes "how many times did this actually run" unanswerable.
 
-Surface: `--resume <runId>` on the CLI, plus a PR comment command or label on the
-Action. Phase 2's fail-closed allowlist hook (allow only `approved`/`noop`, else ask)
-already handles a resume-pending outcome correctly with no change.
+Surface: `--resume` on the CLI. Phase 2's fail-closed allowlist hook (allow only
+`approved`/`noop`, else ask) already handles a resume-pending outcome with no change.
 
 `humanFeedback` flows into the rework preamble through Step 1b's `lastLoopTrigger`.
-**Extra budget without extra information just burns the same loop again** — the
-feedback is the point, not the budget.
+**Refuse to grant `extraVisits` without a feedback string** — extra budget with no new
+information burns the same loop again, deterministically.
 
-## 2d. Open questions to settle before building
+**Gate rule, now settled:** replayed (already-executed) nodes are never re-gated; the
+frontier node is *always* re-gated, with the resume grant expressed as an ordinary
+approval (`--approve` / label) so it reuses the existing machinery. Risk-threshold
+gates recompute from tags each time by design (`approvalPolicy.ts:125-141`), and that
+should keep working on resume.
 
-1. Resume at the exhausted node, or at the loop target?
-2. Idempotency against Phase 2's orphan guard — a resumed run must not read as an
+## 2e. Open questions
+
+1. Idempotency against Phase 2's orphan guard — a resumed run must not read as an
    orphaning re-create.
-3. Does a resumed run reuse the original LD trackers or start a new AI run? Affects
+2. Does a resumed run reuse the original LD trackers or start a new AI run? Affects
    whether judge scores across a resume are comparable in AI Config monitoring.
-4. Does the gate re-run at the resume node, or does the grant carry the approval? (See
-   the unifying insight above — likely the latter, but it must be explicit.)
+3. A node killed mid-run is absent from the log (`runs.push` happens only on
+   completion, `:437`) so it re-runs on resume, meeting the 409-idempotent writers and
+   the "no changes to commit" no-op. Graceful in theory — needs a test.
+4. Does a provider switch between halt and resume (the provider flag is re-resolved)
+   matter enough to block, or just to log? Recorded and frontier runs would come from
+   different models, making that walk's A/B data non-comparable.
 
 ---
 
@@ -299,7 +415,8 @@ derived map? Do not decide it incidentally.
 Unlike Step 1a, a `metrics-author` self-loop sits alongside a forward edge whose
 `require_tags: {needs_tests: "true"}` will also be satisfied. Declaration order
 decides which fires — the self-loop must come first, or the forward edge always wins
-at `break` and the loop never evaluates. Verify `getEdges()` ordering first.
+at `break` and the loop never evaluates. Declaration order is authoritative (see the
+`getEdges()` note in Step 1a), so this is a config-authoring rule, not a gamble.
 
 Related: **OR needs no new grammar.** "Loop on a low judge score *or* a reviewer
 rejection" is two sibling edges relying on first-match-wins.

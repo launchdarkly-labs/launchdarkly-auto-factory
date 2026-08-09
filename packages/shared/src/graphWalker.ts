@@ -19,6 +19,8 @@
  *     before it last ran (facts/inventory persist). Termination is guaranteed by
  *     the per-edge cap plus a run-level backstop. An UNMET loop edge is treated
  *     as convergence, not a stall — only unmet forward edges stall the chain.
+ *     SCOPE: `edgeCounts` below is process-local, so the budget bounds ONE walk,
+ *     not one PR — every re-run starts fresh. See the README's scope caveat.
  *
  * One outgoing edge is taken per node. Per-node generation metrics and per-edge
  * handoff metrics are recorded back to LaunchDarkly via the AI-config and graph

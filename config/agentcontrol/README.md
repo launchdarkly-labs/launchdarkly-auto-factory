@@ -132,7 +132,8 @@ Anthropic provider:
 target has already run earlier in the chain — e.g. `code-reviewer →
 research-planner` to re-plan a rejection, or `flag-testing → flag-implementer` to
 fix failing tests) must carry `max_visits: N` to be allowed to loop: it may be
-traversed at most N times (N re-runs; hard-capped at 10 in code). Identification
+traversed at most N times (N re-runs; hard-capped at 10 in code) **per walk** —
+see the scope caveat below. Identification
 is **explicit** — the walker caps only edges that carry `max_visits`, never
 untagged forward/rejoin edges — so tag exactly the loop-closing edge(s); nested
 loops tag each loop edge. This is config, not code: the graph owns *which edges
@@ -160,6 +161,19 @@ never rewound: they accumulate into a run *inventory* that reporting and the
 approval guard read, so a rewind can't erase the record of resources that really
 exist. A re-entered node's prompt gets a `REWORK ITERATION N` preamble listing
 that inventory (see the agents' "Rework iterations" sections).
+
+**Scope caveat — the budget is per walk, not per PR.** The traversal counter is
+process-local (`edgeCounts` in `graphWalker.ts`), created fresh on every
+`walkGraph` call and persisted nowhere. Since the Action re-runs on `synchronize`
+and `labeled`, **each re-run starts with a full budget**: cumulative rework across
+a PR's life is not bounded by `max_visits`. What `max_visits` guarantees is that
+one walk terminates; it is not a per-PR iteration cap. This compounds with
+label-based approval, which persists across pushes (see `labels.ts`) — an
+already-approved gated node can be re-entered on every subsequent push, each time
+preceded by a fresh re-plan. Making budgets cumulative requires persisting
+traversal counts across runs (resumable walk state — see
+`docs/phase4-judge-driven-loops.md` Step 2); until then, the run-level backstop and
+the per-walk cap are the only ceilings.
 
 An unmet loop edge is **convergence, not a stall.** When a `max_visits` edge's
 conditions don't pass, the walker treats it like an intentional `skip_if_tags`

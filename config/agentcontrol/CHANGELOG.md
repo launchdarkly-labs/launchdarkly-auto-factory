@@ -46,6 +46,19 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **`tags.json`:** `review_approved` now declares the edge it gates, and its
   description records the exact-equality-vs-normalization gap.
 
+### ⚠️ Known scope limit: `max_visits` bounds a walk, not a PR
+- The traversal counter is process-local (`edgeCounts` in `graphWalker.ts`) and is
+  persisted nowhere, so **every re-run starts with a full budget**. Because the
+  Action re-runs on `synchronize` and `labeled`, cumulative rework over a PR's life
+  is not capped by `max_visits: 2` — a PR pushed five times can take ten rework
+  passes. Each individual walk still terminates (per-edge cap + run-level backstop),
+  so this is not a runaway risk, but the July entry below and the README previously
+  implied a per-PR guarantee that does not exist. Both are corrected.
+- Compounding factor: approval labels persist across pushes by design (`labels.ts`),
+  so an approved gated node can be re-entered on every later push, each time after a
+  fresh re-plan. Fixing either properly needs cross-run walk state — see
+  `docs/phase4-judge-driven-loops.md` Step 2.
+
 ---
 
 ## 2026-07-28 (bounded loop-back edges)

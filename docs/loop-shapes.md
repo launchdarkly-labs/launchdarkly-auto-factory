@@ -203,8 +203,13 @@ requires no change to a protective halt.
 - **Edge order is load-bearing.** The walker takes the first passing edge and
   `break`s (`graphWalker.ts:496`). A self-loop on `flag-implementer` sits alongside a
   forward edge whose `require_tags: {flag_ready: "true"}` will also be satisfied — so
-  declaration order decides which fires. Whether `node.getEdges()` preserves JSON
-  declaration order is SDK-internal and unverified.
+  declaration order decides which fires. `getEdges()` returns the raw served edge
+  array untransformed (`@launchdarkly/server-sdk-ai/dist/index.js:325-327`, built at
+  `:359`), so declaration order is authoritative — and a LaunchDarkly dashboard edit
+  to the served graph can reorder it.
+- **`max_visits` bounds a walk, not a PR.** `edgeCounts` is process-local
+  (`graphWalker.ts:340`) and persisted nowhere, so every re-run starts with a full
+  budget. Cumulative rework across a PR is uncapped until walk state persists.
 - **OR needs no new grammar.** `require_tags` is AND-only, but "loop on a low judge
   score *or* on a reviewer rejection" is two sibling edges relying on
   first-match-wins.
