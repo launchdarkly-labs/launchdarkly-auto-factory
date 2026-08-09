@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 import { intentIsDefault, intentSkeleton, normalizeReleaseIntent } from "@auto-factory/shared";
@@ -77,5 +79,68 @@ describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
     assert.equal(intentIsDefault(normalizeReleaseIntent({ action: "hold" }).intent), false);
     assert.equal(intentIsDefault(normalizeReleaseIntent({ notes: "child of flag-xyz" }).intent), false);
     assert.equal(intentIsDefault(normalizeReleaseIntent({ prerequisites: ["flag-x"] }).intent), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `notBefore` is a CALENDAR date, so it must normalize identically in every
+// timezone. The in-process cases above only catch the bug east of UTC (the
+// original code turned "Aug 1 2026" into 2026-07-31 under BST but passed under
+// UTC, which is why CI never saw it). TZ is read at interpreter start, so each
+// zone gets its own child process.
+// ---------------------------------------------------------------------------
+describe("normalizeNotBefore is timezone-independent", () => {
+  const MODULE = fileURLToPath(new URL("../packages/shared/dist/releaseIntent.js", import.meta.url));
+  const CASES = ["2026-08-01", "Aug 1 2026", "2026-01-01", "Dec 31 2026"];
+  // Sign, magnitude, a half-hour offset, and both extremes of the UTC range.
+  const ZONES = [
+    "UTC",
+    "Europe/London",
+    "Asia/Tokyo",
+    "Asia/Kolkata",
+    "America/Los_Angeles",
+    "Pacific/Kiritimati",
+    "Etc/GMT+12",
+  ];
+
+  /** Normalize every case in a child process pinned to `tz`. */
+  function notBeforeIn(tz: string): Record<string, string> {
+    const script = `
+      const { normalizeReleaseIntent } = await import(${JSON.stringify(MODULE)});
+      const out = {};
+      for (const c of ${JSON.stringify(CASES)}) out[c] = normalizeReleaseIntent({ notBefore: c }).intent.notBefore;
+      process.stdout.write(JSON.stringify(out));
+    `;
+    const raw = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+      env: { ...process.env, TZ: tz },
+    });
+    return JSON.parse(raw) as Record<string, string>;
+  }
+
+  it("every accepted date shape yields the same calendar date in all zones", () => {
+    const expected = { "2026-08-01": "2026-08-01", "Aug 1 2026": "2026-08-01", "2026-01-01": "2026-01-01", "Dec 31 2026": "2026-12-31" };
+    for (const tz of ZONES) {
+      assert.deepEqual(notBeforeIn(tz), expected, `notBefore drifted under TZ=${tz}`);
+    }
+  });
+
+  it("an impossible calendar date is still rejected, in every zone", () => {
+    for (const tz of ZONES) {
+      const script = `
+        const { normalizeReleaseIntent } = await import(${JSON.stringify(MODULE)});
+        const r = normalizeReleaseIntent({ action: "auto", notBefore: "2026-02-30" });
+        process.stdout.write(JSON.stringify({ action: r.intent.action, issues: r.issues.length }));
+      `;
+      const out = JSON.parse(
+        execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+          encoding: "utf8",
+          env: { ...process.env, TZ: tz },
+        }),
+      ) as { action: string; issues: number };
+      // Fail-closed: an unparseable date holds the release and reports the problem.
+      assert.equal(out.action, "hold", `TZ=${tz}`);
+      assert.ok(out.issues > 0, `TZ=${tz}`);
+    }
   });
 });

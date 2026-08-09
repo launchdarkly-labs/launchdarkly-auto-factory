@@ -33489,14 +33489,26 @@ function normalizePrerequisites(v, issues) {
   }
   return { value: out, coerced };
 }
+var ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 function normalizeNotBefore(v, issues) {
   if (v === void 0 || v === null || v === "")
     return { value: "", coerced: false };
   const raw = String(v).trim();
-  const parsed = new Date(raw);
-  if (!Number.isNaN(parsed.getTime())) {
-    const iso = parsed.toISOString().slice(0, 10);
-    return { value: iso, coerced: iso !== raw };
+  if (ISO_DATE_RE.test(raw)) {
+    const utc = /* @__PURE__ */ new Date(`${raw}T00:00:00Z`);
+    if (!Number.isNaN(utc.getTime()) && utc.toISOString().slice(0, 10) === raw) {
+      return { value: raw, coerced: false };
+    }
+  } else {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) {
+      const iso = [
+        parsed.getFullYear(),
+        String(parsed.getMonth() + 1).padStart(2, "0"),
+        String(parsed.getDate()).padStart(2, "0")
+      ].join("-");
+      return { value: iso, coerced: iso !== raw };
+    }
   }
   issues.push(`notBefore '${raw}' is not a parseable date (use YYYY-MM-DD) \u2014 treated as unintelligible`);
   return { value: raw, coerced: false };
