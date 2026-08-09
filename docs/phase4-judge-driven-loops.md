@@ -426,102 +426,163 @@ should keep working on resume.
 
 # Step 3 — Judge-driven self-loops
 
-Now correctly scoped: **self-loops on the two nodes that have judges.**
+Revised against what Steps 1–2 actually shipped. Three findings changed it; the
+superseded reasoning is kept inline so it is not reinvented.
 
 | Loop | Judge | Reachable |
 |---|---|---|
 | `metrics-author → metrics-author` | metrics-quality @1.0 | **Yes, today** — not gated, and `[V]` passes when events are emitted but poorly chosen |
-| `flag-implementer → flag-implementer` | implementation-quality @1.0 | Needs Step 2 — `[G]` halts on re-entry |
+| `flag-implementer → flag-implementer` | implementation-quality @1.0 | **Yes, with one human approval per iteration.** `[G]` still halts each re-entry, but `--resume` (Step 2) makes recovery a replay rather than a full re-run. Previously listed as blocked. |
 
-## 3a. Capture the score
+## 3a. Capture the score — onto `NodeRun`, which IS the journal
 
-`graphWalker.ts:443` already calls the hook and discards its return value;
-`JudgeHook` is typed `=> Promise<LDJudgeResult[]>` (`judges.ts:155`). Capture it,
-keeping the existing non-fatal try/catch.
+> **The journaling obligation solves itself.** Step 2 made the resume journal
+> literally `WalkResult.runs` — a `NodeRun[]`. So putting scores on `NodeRun` (which
+> 3c already proposed, for reporting) means they are journaled by construction: no
+> `ResumeInput` field, no change to `walkState.ts`, no new persistence shape. The note
+> on `WalkInputs.judgeHook` saying scores "must be added to `ResumeInput`" is
+> imprecise and should say `NodeRun`.
 
-**Usable score:** `sampled === true && success === true && typeof score === "number"`.
-Anything else is invisible to routing. One judge per node today — take that score. If
-a second is ever attached, decide aggregation then; do not build policy for a case
-that does not exist.
+`graphWalker.ts` already calls the hook and discards its return value; `JudgeHook` is
+typed `=> Promise<LDJudgeResult[]>` (`judges.ts:155`). Capture it, keeping the
+existing non-fatal try/catch, and record the usable scores on the run:
+
+```ts
+/** Judge key → score, for the scores that are usable (see 3b). Absent if none. */
+judgeScores?: Record<string, number>;
+```
+
+**Attach by mutation, after the `node-complete` event.** The hook currently runs
+after `runs.push(run)` by design — moving it earlier would delay `node-complete` by a
+full judge call and regress live progress on every surface. Mutating the pushed
+object is correct: same reference, `routingSnapshots` alignment untouched, and
+reporting reads `walk.runs` at the end.
+
+**On replay, serve scores from `replayEntry`** rather than calling the hook (which is
+skipped). Forgetting this is caught rather than silent: an absent score fails open →
+the loop edge doesn't fire → the walk takes the forward edge → the journal goes
+unconsumed → `replayDiverged`, and the identity property test fails loudly. The
+obligation is enforced by a test, not a comment.
 
 **New handoff field `loop_if_judge_below: N`** (`N` in `[0, 1]`), evaluated against
-the just-completed node's usable score. Named for its inverted polarity — a *low*
-score takes the edge — because that is unmissable at the config site.
+the just-completed node's usable score. Condition order in edge selection:
+`require_tags` → `skip_if_tags` → `loop_if_judge_below` → `max_visits` budget.
 
-Condition order in edge selection (`graphWalker.ts:472-497`): `require_tags` →
-`skip_if_tags` → `loop_if_judge_below` → `max_visits`. Budget last, so a spent budget
-on an otherwise-passing judge edge still lands in `budgetBlocked` and reports as
-`loopExhausted` rather than a silent terminal.
+**Aggregation:** the minimum usable score. One judge per node today, so this is
+trivially that judge's score; the minimum is the rule so that adding a second judge
+later cannot let a high scorer mask a low one.
 
 ## 3b. Fail-open is normative
 
 `judges.ts` states a judge failure "records a failed evaluation but never fails the
-chain," and judges are sampled. Routing on them inverts that contract, so: **no usable
-score → condition false → edge not taken.** Every absence mode gets a discriminating
-test (3d, tests 1–4).
+chain," and judges are sampled. Routing on them inverts that contract, so a score is
+**usable** only when `sampled === true && success === true && typeof score ===
+"number"`. No usable score → condition false → edge not taken.
 
 **The sampling hazard.** Both judges are at rate 1 today, but `samplingRate` lives in
-LaunchDarkly, not the repo — `check-configs` cannot see it, so this cannot be a build
-check. If it drops below 1, loops become stochastic, and worse: on iteration 2 an
-unsampled judge makes the condition false, the walk terminates cleanly, and quality was
-never re-verified — a **silent** pass. Mitigation: when a node has a judge-triggered
-loop edge and its judge returns unsampled, log loudly and record it as a reporting
-caveat on the run.
+LaunchDarkly, not the repo — `check-configs` cannot see it. If it drops below 1,
+loops become stochastic, and worse: on iteration 2 an unsampled judge makes the
+condition false, the walk proceeds, and quality was never re-verified. Mitigation:
+when a node has an outgoing `loop_if_judge_below` edge and no usable score came back,
+log loudly.
 
-## 3c. The score is not a tag
+## 3c. Judge loops are ADVISORY in this graph — and that needs new reporting
+
+> **This invalidated the planned test.** The old 3e test 8 expected "score stays low
+> past budget → `loopExhausted`". It cannot pass. `budgetBlocked` becomes
+> `loopExhausted` only when NO edge is taken (`graphWalker.ts`, inside `if (!next)`),
+> and `metrics-author` has a forward edge (`require_tags: needs_tests=true`). A spent
+> judge budget therefore falls through to `flag-testing` and the walk completes
+> normally — the existing "retry-then-fallback" case already pins that behaviour.
+
+Generalising: every node except `code-reviewer` has a forward edge, and
+code-reviewer's spare capacity is the verdict loop. So **any** judge self-loop here is
+advisory — "try to improve N times, then proceed regardless." Making one a gate would
+require the loop edge to be a node's only outgoing edge, which contradicts forward
+progress.
+
+Advisory is the right semantic: a middling metrics-quality score should not hard-fail
+a PR the way a rejected review does. But it creates **silent quality degradation** —
+`budgetBlocked` is discarded when a fallback edge is taken, so "we tried twice, the
+score never improved, we shipped anyway" appears nowhere.
+
+**So Step 3 must add non-terminal reporting**, or the first judge loop makes the
+pipeline quietly worse at telling the truth:
+
+```ts
+/** Loop edges whose budget was spent, whether or not the walk continued past them. */
+loopBudgetSpent?: Array<{ source: string; target: string; traversals: number; maxVisits: number; trigger?: string }>;
+```
+
+Deduplicated per edge (a node can be revisited). `loopExhausted.exhausted` remains
+the subset that *ended* the walk; `loopBudgetSpent` is the complete record, and is
+informational — never a failure.
+
+## 3d. The score is not a tag
 
 Rev 1 proposed a `production: "judge"` tag class. Dropped, for a bug it would have
-shipped: the rewind block reads `pickRouting(runs[runs.length - 1]?.tags ?? {})` —
-the **agent's** result tags. A judge score is walker-computed and never appears there,
-so adding it to the rewound set would delete `judge_score` and fail to restore it,
-losing the trigger value exactly when the loop needs it.
-
-The score is read once, at edge-selection time, in the same scope where the results
-are a local. Expose it as a typed `NodeRun.judgeScores` field for reporting —
-precedent: Phase 2 moved resource links to read `walk.inventory` rather than tags.
-This deletes the whole tag-class workstream: no third `production` class, no
-`check-configs` 6c change, no disjointness assertions, no rewind semantics question.
+shipped: the rewind reads `pickRouting(runs[last].tags)` — the **agent's** result
+tags. A walker-computed score never appears there, so adding it to the rewound set
+would delete `judge_score` and fail to restore it, losing the trigger value exactly
+when the loop needs it. A typed `NodeRun` field avoids all of that (precedent: Phase 2
+moved resource links to read `walk.inventory` rather than tags).
 
 **Derived-signal note.** The problem relocates rather than vanishes. Any future
 walker-*derived* routing tag — e.g. a normalised `review_verdict` fixing Step 1a's
-string fragility — hits the same overlay hole. The decision to make deliberately at
-that point: do derived tags get merged into `NodeRun.tags` at record time (before the
-FACT mirror and before the routing snapshot), or does `pickRouting` consult a separate
-derived map? Do not decide it incidentally.
+string fragility — hits the same overlay hole. Decide it deliberately then: do derived
+tags get merged into `NodeRun.tags` at record time (before the FACT mirror and the
+routing snapshot), or does `pickRouting` consult a separate derived map?
 
-## 3d. Edge order becomes live
+## 3e. The 1b/1c machinery needs the runtime score
+
+`describeLoopCondition` reads only `require_tags`/`skip_if_tags` from the handoff, so a
+judge-only loop edge returns `undefined` — which means 1b's rework preamble falls back
+to the generic *"the loop edge fired (budget-bounded)"* and 1c's `— trigger:` clause
+is omitted entirely. Both features go blank exactly where they are most informative.
+
+The string worth showing (*"metrics-quality scored 0.55, below the 0.70 threshold"*)
+needs the **runtime** score, which a config-only describer cannot have. Thread it in
+at traversal time, where the score is in scope, rather than extending
+`describeLoopCondition`.
+
+This is also what finally exercises `LoopTrigger.detail`: the judge's `reasoning`
+string is guidance that is genuinely *not* in the inbound brief. It has been Step 3's
+sole consumer since `humanFeedback` got its own prompt block in Step 2.
+
+## 3f. Edge order is load-bearing here
 
 Unlike Step 1a, a `metrics-author` self-loop sits alongside a forward edge whose
-`require_tags: {needs_tests: "true"}` will also be satisfied. Declaration order
-decides which fires — the self-loop must come first, or the forward edge always wins
-at `break` and the loop never evaluates. Declaration order is authoritative (see the
-`getEdges()` note in Step 1a), so this is a config-authoring rule, not a gamble.
+`require_tags: {needs_tests: "true"}` will also be satisfied. The walker takes the
+first passing edge and `break`s, so **the self-loop must be declared first** or the
+forward edge always wins and the loop never evaluates. `getEdges()` returns the raw
+served edge array untransformed, so declaration order is authoritative — pin it with a
+test on the committed graph rather than trusting review.
 
-Related: **OR needs no new grammar.** "Loop on a low judge score *or* a reviewer
-rejection" is two sibling edges relying on first-match-wins.
+Start at **`max_visits: 1`**: one retry, then proceed. Cheaper, and it matches the
+advisory semantics more honestly than 2.
 
-## 3e. Tests
+## 3g. Tests
 
 | # | Case | Expect |
 |---|------|--------|
 | 1 | No judge attached | Not taken (fail-open) |
-| 2 | Judge not sampled | Not taken |
+| 2 | Judge not sampled | Not taken, and a loud warning |
 | 3 | Eval failed (`success: false`) | Not taken |
 | 4 | `score` undefined | Not taken |
 | 5 | Score below threshold | Self-loop taken, iteration 2 runs |
-| 6 | Score above threshold | Not taken, clean terminal |
+| 6 | Score above threshold | Not taken, forward edge taken |
 | 7 | Iteration 2 scores high | Converges, walk completes cleanly |
-| 8 | Score stays low past budget | `loopExhausted` with score + threshold in the trigger description |
+| 8 | Score stays low past budget | **Falls through** to the forward edge; no `loopExhausted`; `loopBudgetSpent` records it |
 | 9 | Judge hook throws | Non-fatal, no loop, walk continues |
-| 10 | Unsampled on iteration 2 after looping | Warning logged + reporting caveat recorded |
-| 11 | Self-loop rewind | Judge score absent from `inventory` **and** from `walk.tags` |
-| 12 | Iteration-2 prompt | Contains the judge's reasoning via `lastLoopTrigger` |
-| 13 | Forward edge declared before self-loop | Self-loop never fires — pins the ordering hazard |
+| 10 | Two judges, one low one high | Min wins → loops |
+| 11 | Scores survive a resume | Journalled on `NodeRun`; replay reproduces routing without calling the hook |
+| 12 | Routing on a score, but not served on replay | `replayDiverged` (the obligation is enforced) |
+| 13 | Iteration-2 prompt | Contains the judge's reasoning via `LoopTrigger.detail` and the score in the reason line |
+| 14 | Forward edge declared before the self-loop | Self-loop never fires — pins the ordering hazard |
+| 15 | Committed graph | Declares the self-loop before `metrics-author → flag-testing` |
 
 Tests 1–4 are the fail-open contract and must be discriminating (fail if the condition
 is hard-coded either way).
-
----
 
 # Cross-cutting
 

@@ -135,8 +135,29 @@ const MAX_VISITS_HARD_CAP = 10;
 for (const file of listJson(GRAPH_DIR)) {
   const graph = JSON.parse(readFileSync(file, "utf8"));
   const adjUntagged = new Map(); // source -> [target] for edges WITHOUT max_visits
+  // 6d: `loop_if_judge_below` must be a number in [0, 1] and only on a budgeted edge
+  // (an unbudgeted judge loop would run to the node-run cap). 6e: a judge loop edge
+  // must be declared BEFORE any other edge from the same source — the walker takes
+  // the first passing edge, so a later declaration silently never fires.
+  const seenSourceEdge = new Set();
   for (const edge of graph.edges ?? []) {
     const mv = edge.handoff?.max_visits;
+    const below = edge.handoff?.loop_if_judge_below;
+    if (below !== undefined) {
+      if (typeof below !== "number" || !Number.isFinite(below) || below < 0 || below > 1) {
+        fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has loop_if_judge_below=${JSON.stringify(below)} (must be a number in [0, 1]).`);
+      }
+      if (mv === undefined) {
+        fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has loop_if_judge_below but no max_visits — an unbudgeted quality loop runs to the node-run cap.`);
+      }
+      if (seenSourceEdge.has(edge.sourceConfig)) {
+        fail(
+          `graph: the judge loop edge ${edge.sourceConfig} → ${edge.targetConfig} is declared AFTER another edge from '${edge.sourceConfig}'. ` +
+            `The walker takes the first passing edge, so this loop would never fire — move it above the others.`,
+        );
+      }
+    }
+    seenSourceEdge.add(edge.sourceConfig);
     if (mv !== undefined) {
       if (!Number.isInteger(mv) || mv < 1 || mv > MAX_VISITS_HARD_CAP) {
         fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has max_visits=${JSON.stringify(mv)} (must be an integer in [1, ${MAX_VISITS_HARD_CAP}]).`);

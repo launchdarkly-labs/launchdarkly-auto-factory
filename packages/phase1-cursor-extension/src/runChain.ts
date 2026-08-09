@@ -19,6 +19,7 @@ import {
   buildHandoffVerifier,
   createPolicyGate,
   decideApproval,
+  describeLoopBudgetSpent,
   describeLoopExhausted,
   getLdSdk,
   interpretWalk,
@@ -128,6 +129,10 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
     // read-only runs still get the code-side checks.
     verifier: buildHandoffVerifier({ sandboxRoot: opts.workspaceRoot, ...(writer ? { writer } : {}) }),
   });
+
+  // Advisory quality loops that gave up. The walk finished normally, so nothing
+  // else would mention them.
+  if (walk.loopBudgetSpent) for (const l of describeLoopBudgetSpent(walk.loopBudgetSpent)) reporter.log(`⚠ ${l}`);
 
   const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);

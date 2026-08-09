@@ -39,6 +39,7 @@ import {
   computeConfigHash,
   createPolicyGate,
   decideApproval,
+  describeLoopBudgetSpent,
   describeLoopExhausted,
   extractConfigStamp,
   getLdSdk,
@@ -562,7 +563,13 @@ async function main(): Promise<void> {
   // surface it as an error annotation and fail the run below, so it can never
   // read as a clean success even if a stale routing tag looks approved.
   const loopText = walk.loopExhausted ? describeLoopExhausted(walk.loopExhausted) : "";
+  // Advisory quality loops that spent their budget and let the chain proceed. Not a
+  // failure, so it never reaches loopText — but it must not vanish either.
+  const advisoryLoopText = walk.loopBudgetSpent ? describeLoopBudgetSpent(walk.loopBudgetSpent) : [];
   if (loopText) console.log(`::error::AutoFactory: ${loopText}`);
+  // Warning, not error: the run is not failed by an advisory loop, but a reviewer
+  // should know quality retries were exhausted.
+  for (const l of advisoryLoopText) console.log(`::warning::AutoFactory: ${l}`);
 
   // Halted at an approval gate: report what's pending + how to approve, then
   // stop. The flag/code for the gated step have NOT been created. A re-run once
@@ -658,6 +665,7 @@ async function main(): Promise<void> {
       : "",
     walk.skipped.length ? `**Skipped:** ${walk.skipped.join(", ")}` : "",
     loopText ? `**⟳ Loop did not converge:** ${loopText}` : "",
+    ...advisoryLoopText.map((l) => `**⟳ Quality retries exhausted:** ${l}`),
     stallText ? `**⚠ Stalled:** ${stallText}` : "",
     verifyText ? `**⛔ Deterministic check failed:** ${verifyText}` : "",
     "",

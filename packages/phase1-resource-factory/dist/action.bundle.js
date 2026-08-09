@@ -33609,6 +33609,7 @@ function extractConfigStamp(description) {
 }
 
 // ../shared/dist/graphWalker.js
+var JUDGE_REASONING_MAX = 1e3;
 var MAX_VISITS_HARD_CAP = 10;
 var ROUTING_TAGS = /* @__PURE__ */ new Set([
   "skip_flagging",
@@ -33629,6 +33630,9 @@ var FACT_TAGS = /* @__PURE__ */ new Set([
   "metric_event_keys",
   "tests_last_run"
 ]);
+function describeLoopBudgetSpent(spent) {
+  return spent.map((e) => `quality loop ${e.source} \u2192 ${e.target} used all ${e.maxVisits} attempt(s) without converging` + (e.trigger ? ` (${e.trigger})` : "") + " \u2014 the chain continued anyway.");
+}
 function describeLoopExhausted(info) {
   if (info.reason === "run-cap") {
     return `loop did not converge at '${info.node}': the run hit the total-node-run cap \u2014 likely an untagged cycle in the graph.`;
@@ -33664,6 +33668,31 @@ function handoffString(handoff, field) {
 function handoffStringArray(handoff, field) {
   const v = handoff?.[field];
   return Array.isArray(v) ? v.filter((x) => typeof x === "string") : void 0;
+}
+function usableJudgeScores(results) {
+  const out = {};
+  for (const r of results) {
+    if (r.sampled && r.success && typeof r.score === "number" && Number.isFinite(r.score)) {
+      out[r.judgeConfigKey ?? "judge"] = r.score;
+    }
+  }
+  return out;
+}
+function routingJudgeScore(scores) {
+  if (!scores)
+    return void 0;
+  const values = Object.values(scores);
+  return values.length > 0 ? Math.min(...values) : void 0;
+}
+function describeJudgeCondition(handoff, scores) {
+  const below = handoffNumber(handoff, "loop_if_judge_below");
+  if (below === void 0)
+    return void 0;
+  const entries = Object.entries(scores ?? {});
+  if (entries.length === 0)
+    return `no usable judge score (threshold ${below})`;
+  const [lowestKey, lowestScore] = entries.reduce((lo, e) => e[1] < lo[1] ? e : lo);
+  return `${lowestKey} scored ${lowestScore.toFixed(2)}, below ${below}`;
 }
 function describeLoopCondition(handoff) {
   const require2 = handoffTags(handoff, "require_tags");
@@ -33738,6 +33767,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
   const ctx = { ...context };
   const gatedSteps = new Set(gate?.steps ?? []);
   const edgeCounts = /* @__PURE__ */ new Map();
+  const budgetSpent = /* @__PURE__ */ new Map();
   const routingSnapshots = [];
   const entryEdgeFields = /* @__PURE__ */ new Map();
   const runCountByKey = /* @__PURE__ */ new Map();
@@ -33830,13 +33860,31 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
     const run = { configKey: key, status: result.status, output, tags: result.tags, iteration };
+    if (replayEntry?.judgeScores && Object.keys(replayEntry.judgeScores).length > 0) {
+      run.judgeScores = { ...replayEntry.judgeScores };
+      if (replayEntry.judgeReasoning)
+        run.judgeReasoning = replayEntry.judgeReasoning;
+    }
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
     if (judgeHook && tracker) {
+      let judgeResults = [];
       try {
-        await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
+        judgeResults = await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
       } catch (e) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
+      }
+      const scores = usableJudgeScores(judgeResults);
+      if (Object.keys(scores).length > 0) {
+        run.judgeScores = scores;
+        const lowestKey = Object.entries(scores).reduce((lo, e) => e[1] < lo[1] ? e : lo)[0];
+        const reasoning = judgeResults.find((r) => (r.judgeConfigKey ?? "judge") === lowestKey)?.reasoning;
+        if (reasoning)
+          run.judgeReasoning = reasoning.slice(0, JUDGE_REASONING_MAX);
+      }
+      const routesOnJudge = node.getEdges().some((e) => handoffNumber(e.handoff, "loop_if_judge_below") !== void 0);
+      if (routesOnJudge && Object.keys(scores).length === 0) {
+        console.warn(`[judge] '${key}' has a judge-driven loop edge but produced NO usable score (unsampled, failed, or no judge attached) \u2014 the quality loop cannot fire and this run is unverified.`);
       }
     }
     if (verifier && !replaying) {
@@ -33860,6 +33908,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let next = null;
     let nextHandoff;
     let nextIsLoopEdge = false;
+    let nextJudgeThreshold;
     const budgetBlocked = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
@@ -33869,6 +33918,12 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const skip = handoffTags(h, "skip_if_tags");
       if (skip && tagsMatch(accumulatedTags, skip))
         continue;
+      const below = handoffNumber(h, "loop_if_judge_below");
+      if (below !== void 0) {
+        const score = routingJudgeScore(run.judgeScores);
+        if (score === void 0 || score >= below)
+          continue;
+      }
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== void 0) {
         const ek = `${key}\u2192${edge.key}`;
@@ -33876,20 +33931,23 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {
-          const trig = describeLoopCondition(h);
-          budgetBlocked.push({
+          const trig = describeJudgeCondition(h, run.judgeScores) ?? describeLoopCondition(h);
+          const spent = {
             source: key,
             target: edge.key,
             traversals,
             maxVisits,
             ...trig ? { trigger: trig } : {}
-          });
+          };
+          budgetBlocked.push(spent);
+          budgetSpent.set(`${key}\u2192${edge.key}`, spent);
           continue;
         }
       }
       next = edge.key;
       nextHandoff = h;
       nextIsLoopEdge = rawMax !== void 0;
+      nextJudgeThreshold = handoffNumber(h, "loop_if_judge_below");
       break;
     }
     if (!next) {
@@ -33946,9 +34004,11 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       }
       const ek = `${key}\u2192${next}`;
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
+      const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
       pendingLoopTrigger = {
         source: key,
-        reason: describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)"
+        reason: judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+        ...nextJudgeThreshold !== void 0 && run.judgeReasoning ? { detail: run.judgeReasoning } : {}
       };
     }
     if (next && !replaying)
@@ -33977,7 +34037,8 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     ...pendingApproval ? { pendingApproval } : {},
     ...verificationFailed ? { verificationFailed } : {},
     ...loopExhausted ? { loopExhausted } : {},
-    ...replayDiverged ? { replayDiverged } : {}
+    ...replayDiverged ? { replayDiverged } : {},
+    ...budgetSpent.size > 0 ? { loopBudgetSpent: [...budgetSpent.values()] } : {}
   };
 }
 
@@ -40199,7 +40260,9 @@ async function main() {
   const verifyText = walk2.verificationFailed ? `deterministic check failed after '${walk2.verificationFailed.node}': ` + walk2.verificationFailed.failures.map((f) => `[${f.name}] ${f.detail}`).join("; ") : "";
   if (verifyText) console.log(`::error::AutoFactory: ${verifyText}`);
   const loopText = walk2.loopExhausted ? describeLoopExhausted(walk2.loopExhausted) : "";
+  const advisoryLoopText = walk2.loopBudgetSpent ? describeLoopBudgetSpent(walk2.loopBudgetSpent) : [];
   if (loopText) console.log(`::error::AutoFactory: ${loopText}`);
+  for (const l of advisoryLoopText) console.log(`::warning::AutoFactory: ${l}`);
   if (walk2.pendingApproval) {
     const node = walk2.pendingApproval.node;
     const label = approveLabel(node);
@@ -40265,6 +40328,7 @@ async function main() {
     kg ? `**Knowledge graph:** on \u2014 ${kg.graph.edges.filter((e) => e.kind === "service_calls").length} service edges (traces), ${kg.graph.edges.filter((e) => e.kind === "flag_wraps").length} wrap points (code refs)` + (kg.warnings.length ? `; \u26A0 ${kg.warnings.map((w) => w.split(" \u2014 ")[0]).join("; \u26A0 ")}` : "") : "",
     walk2.skipped.length ? `**Skipped:** ${walk2.skipped.join(", ")}` : "",
     loopText ? `**\u27F3 Loop did not converge:** ${loopText}` : "",
+    ...advisoryLoopText.map((l) => `**\u27F3 Quality retries exhausted:** ${l}`),
     stallText ? `**\u26A0 Stalled:** ${stallText}` : "",
     verifyText ? `**\u26D4 Deterministic check failed:** ${verifyText}` : "",
     "",

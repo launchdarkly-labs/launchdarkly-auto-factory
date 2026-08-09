@@ -46,6 +46,30 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **`tags.json`:** `review_approved` now declares the edge it gates, and its
   description records the exact-equality-vs-normalization gap.
 
+### ✅ `loop_if_judge_below` — judge-driven quality retries
+- **Why:** judge scores were computed, recorded to LaunchDarkly, and then **discarded**
+  by the walker. They are the only evaluation signal in the pipeline grounded in
+  verified evidence (real commits/diff, not the agent's claims), so routing on them
+  turns monitoring into control.
+- **New handoff field `loop_if_judge_below: N`** (`N` in `[0, 1]`): take this edge only
+  when the just-completed node scored below `N`. A judge scores the node it is attached
+  to, so these are **self-loops**. Committed: `metrics-author → metrics-author`,
+  `max_visits: 1`, threshold `0.7`.
+- **Fail-open:** a score counts only when sampled + successful + numeric; otherwise the
+  edge is not taken. The **minimum** across a node's judges decides. `samplingRate`
+  lives in LaunchDarkly, so this can't be a build check — the walker logs loudly when a
+  judge-routing node yields no usable score.
+- **These loops are advisory.** The node also has a forward edge, so a spent budget
+  falls through and the walk finishes normally — no `loopExhausted`. New
+  `loopBudgetSpent` records the attempt and surfaces as a warning on all four front
+  ends, so "quality retries exhausted" can't pass as a clean first-pass run.
+- **Scores + reasoning ride on `NodeRun`**, which is also the resume journal, so a
+  routing input is persisted and replayed by construction. A tag would have been
+  deleted by the routing rewind.
+- **`check:configs`** now enforces the `[0, 1]` range, that a judge loop carries
+  `max_visits`, and that it is declared **before** any other edge from the same node
+  (the walker takes the first passing edge, so a late declaration silently never fires).
+
 ### ✅ Rework prompts say who sent them back and why
 - **Why:** a re-entered node's preamble said only "The brief below explains what to
   change" — nothing marked the brief as a *rejection*, named the node that produced

@@ -812,3 +812,184 @@ describe("walkGraph — resume (event-log replay)", () => {
     assert.equal(countOf(resumed, "flag"), 11, "1 initial + 10 reworks, not 1002");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 4 Step 3 — judge-driven self-loops.
+//
+// A judge scores the output of the node it is attached to, so a judge-triggered
+// edge means "THIS node did poorly" and the remedy is re-running that node. And
+// because every such node also has a forward edge, these loops are ADVISORY: when
+// the budget runs out the walk falls through and finishes normally.
+// ---------------------------------------------------------------------------
+describe("walkGraph — judge-driven loops", () => {
+  /** metrics → (self-loop, declared first) → testing. Mirrors the committed shape. */
+  const judgeGraph = (below: number, maxVisits = 1): LDAgentGraphFlagValue => ({
+    root: "metrics",
+    edges: {
+      metrics: [
+        { key: "metrics", handoff: { max_visits: maxVisits, loop_if_judge_below: below } },
+        { key: "testing", handoff: { require_tags: { needs_tests: "true" } } },
+      ],
+      testing: [],
+    },
+  });
+
+  /** A judge hook returning scripted results per call (one per node run). */
+  const judgeReturning = (
+    perCall: Array<Array<{ judgeConfigKey?: string; sampled: boolean; success: boolean; score?: number; reasoning?: string }>>,
+  ) => {
+    let n = 0;
+    const hook = async () => {
+      const r = perCall[Math.min(n, perCall.length - 1)] ?? [];
+      n++;
+      return r as unknown as Awaited<ReturnType<NonNullable<Parameters<typeof walkGraph>[3]>["judgeHook"] & object>>;
+    };
+    return hook as unknown as NonNullable<NonNullable<Parameters<typeof walkGraph>[3]>["judgeHook"]>;
+  };
+
+  const usable = (score: number, reasoning?: string) => [
+    { judgeConfigKey: "metrics-quality", sampled: true, success: true, score, ...(reasoning ? { reasoning } : {}) },
+  ];
+  const script = { metrics: { tags: { needs_tests: "true" } } };
+  const runWith = (value: LDAgentGraphFlagValue, judgeHook?: NonNullable<Parameters<typeof walkGraph>[3]>["judgeHook"]) =>
+    walkGraph(graphFrom(value), new ScriptedRunner(script), { PR_NUMBER: "1" }, { ...(judgeHook ? { judgeHook } : {}) });
+
+  // --- fail-open contract: every absence mode means "no signal" ---------------
+  it("1. no judge attached → no loop (fail-open)", async () => {
+    const r = await runWith(judgeGraph(0.7));
+    assert.equal(countOf(r, "metrics"), 1);
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["metrics", "testing"]);
+  });
+
+  it("2. judge not sampled → no loop", async () => {
+    const r = await runWith(judgeGraph(0.7), judgeReturning([[{ judgeConfigKey: "j", sampled: false, success: true, score: 0.1 }]]));
+    assert.equal(countOf(r, "metrics"), 1, "an unsampled judge must not trigger rework");
+    assert.equal(r.runs[0]?.judgeScores, undefined);
+  });
+
+  it("3. evaluation failed → no loop", async () => {
+    const r = await runWith(judgeGraph(0.7), judgeReturning([[{ judgeConfigKey: "j", sampled: true, success: false, score: 0.1 }]]));
+    assert.equal(countOf(r, "metrics"), 1);
+  });
+
+  it("4. score missing or non-finite → no loop", async () => {
+    const r = await runWith(judgeGraph(0.7), judgeReturning([[{ judgeConfigKey: "j", sampled: true, success: true }]]));
+    assert.equal(countOf(r, "metrics"), 1);
+    const nan = await runWith(judgeGraph(0.7), judgeReturning([[{ judgeConfigKey: "j", sampled: true, success: true, score: Number.NaN }]]));
+    assert.equal(countOf(nan, "metrics"), 1);
+  });
+
+  it("5. judge hook throws → non-fatal, no loop, walk continues", async () => {
+    const boom = (async () => {
+      throw new Error("judge exploded");
+    }) as unknown as NonNullable<NonNullable<Parameters<typeof walkGraph>[3]>["judgeHook"]>;
+    const r = await runWith(judgeGraph(0.7), boom);
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["metrics", "testing"]);
+  });
+
+  // --- the loop itself -------------------------------------------------------
+  it("6. score below threshold re-runs the node; a good score on the retry converges", async () => {
+    const r = await runWith(judgeGraph(0.7), judgeReturning([usable(0.4, "events are too coarse"), usable(0.9)]));
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["metrics", "metrics", "testing"]);
+    assert.deepEqual(r.runs[0]?.judgeScores, { "metrics-quality": 0.4 });
+    assert.equal(r.runs[0]?.judgeReasoning, "events are too coarse");
+    assert.equal(r.loopExhausted, undefined);
+    assert.equal(r.loopBudgetSpent, undefined, "budget was never spent — it converged");
+  });
+
+  it("7. score at or above the threshold takes the forward edge immediately", async () => {
+    const r = await runWith(judgeGraph(0.7), judgeReturning([usable(0.7)]));
+    assert.equal(countOf(r, "metrics"), 1, "0.7 is not BELOW 0.7");
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["metrics", "testing"]);
+  });
+
+  it("8. ADVISORY: a persistently low score falls through and is recorded, not failed", async () => {
+    // The finding that reshaped this step. Because `metrics` also has a forward
+    // edge, a spent budget does NOT produce loopExhausted — the walk proceeds. Only
+    // loopBudgetSpent preserves the fact that quality never got there.
+    const r = await runWith(judgeGraph(0.7), judgeReturning([usable(0.2), usable(0.2), usable(0.2)]));
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["metrics", "metrics", "testing"]);
+    assert.equal(r.loopExhausted, undefined, "advisory loops do not fail the run");
+    assert.deepEqual(r.loopBudgetSpent, [
+      { source: "metrics", target: "metrics", traversals: 1, maxVisits: 1, trigger: "metrics-quality scored 0.20, below 0.7" },
+    ]);
+  });
+
+  it("9. the minimum score across judges decides, so a high scorer can't mask a low one", async () => {
+    const r = await runWith(
+      judgeGraph(0.7),
+      judgeReturning([
+        [
+          { judgeConfigKey: "strict", sampled: true, success: true, score: 0.3, reasoning: "thin coverage" },
+          { judgeConfigKey: "lenient", sampled: true, success: true, score: 0.95 },
+        ],
+        usable(0.9),
+      ]),
+    );
+    assert.equal(countOf(r, "metrics"), 2, "the 0.3 triggered rework");
+    assert.equal(r.runs[0]?.judgeReasoning, "thin coverage", "reasoning follows the LOWEST score");
+  });
+
+  it("10. the rework prompt carries the score and the judge's reasoning", async () => {
+    const runner = new ScriptedRunner(script);
+    await walkGraph(graphFrom(judgeGraph(0.7)), runner, { PR_NUMBER: "1" }, {
+      judgeHook: judgeReturning([usable(0.55, "pick an event the checkout path actually emits"), usable(0.9)]),
+    });
+    const rework = (runner.promptsByKey.metrics ?? [])[1] ?? "";
+    assert.match(rework, /=== REWORK ITERATION 2 ===/);
+    assert.match(rework, /Sent back by 'metrics' because metrics-quality scored 0\.55, below 0\.7/);
+    // detail: guidance that is genuinely NOT in the inbound brief.
+    assert.match(rework, /Additional guidance for this iteration:/);
+    assert.match(rework, /pick an event the checkout path actually emits/);
+  });
+
+  it("11. edge order is load-bearing: a forward edge declared first wins forever", async () => {
+    const wrong: LDAgentGraphFlagValue = {
+      root: "metrics",
+      edges: {
+        metrics: [
+          { key: "testing", handoff: { require_tags: { needs_tests: "true" } } },
+          { key: "metrics", handoff: { max_visits: 1, loop_if_judge_below: 0.7 } },
+        ],
+        testing: [],
+      },
+    };
+    const r = await runWith(wrong, judgeReturning([usable(0.1)]));
+    assert.equal(countOf(r, "metrics"), 1, "the loop never evaluated — this is what check-configs 6e prevents");
+  });
+
+  // --- resume interaction ----------------------------------------------------
+  it("12. scores and reasoning survive a resume, so replay routes identically", async () => {
+    const first = await runWith(judgeGraph(0.7), judgeReturning([usable(0.4, "too coarse"), usable(0.9)]));
+    assert.equal(countOf(first, "metrics"), 2);
+
+    // No judge hook at all on the resume: routing must come from the journal.
+    const replayed = await walkGraph(graphFrom(judgeGraph(0.7)), new NeverRunnerForJudges(), { PR_NUMBER: "1" }, {
+      resume: { journal: first.runs },
+    });
+    assert.equal(replayed.replayDiverged, undefined, "the journalled score reproduced the loop decision");
+    assert.deepEqual(replayed, first);
+  });
+
+  it("13. a journal WITHOUT scores diverges instead of silently failing open", async () => {
+    // The obligation the WalkInputs bundle exists to enforce: if a routing input is
+    // not journalled, replay takes a different edge — and that is caught, loudly.
+    const first = await runWith(judgeGraph(0.7), judgeReturning([usable(0.4), usable(0.9)]));
+    const stripped = first.runs.map((r) => {
+      const { judgeScores: _s, judgeReasoning: _r, ...rest } = r;
+      return rest;
+    });
+    const r = await walkGraph(graphFrom(judgeGraph(0.7)), new NeverRunnerForJudges(), { PR_NUMBER: "1" }, {
+      resume: { journal: stripped },
+    });
+    assert.ok(r.replayDiverged, "an unjournalled routing input must not pass silently");
+    assert.equal(r.replayDiverged?.expected, "metrics#2");
+  });
+});
+
+/** Replay-only runner: reaching it means the journal was not honoured. */
+class NeverRunnerForJudges implements AgentRunner {
+  async runNode(req: AgentNodeRequest): Promise<AgentNodeResult> {
+    throw new Error(`runner must not be called during replay (reached '${req.configKey}')`);
+  }
+}

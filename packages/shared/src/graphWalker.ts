@@ -12,6 +12,10 @@
  *   - skip_if_tags: do NOT take the edge if ALL listed tags are present/equal
  *     (e.g. research sets {skip_flagging: "true"} → the flagging edge is skipped,
  *      short-circuiting the chain — "this PR needs no flag")
+ *   - loop_if_judge_below: take the edge only if the just-completed node's judge
+ *     score is below N (fail-open — no usable score means no signal). Pairs with
+ *     max_visits; on a node that also has a forward edge the loop is ADVISORY (a
+ *     spent budget falls through and is recorded in WalkResult.loopBudgetSpent).
  *   - max_visits: caps how many times THIS edge may be traversed. An edge that
  *     carries max_visits is the author-designated loop-back edge; untagged edges
  *     (forward / rejoin) are never capped. This is how bounded loops work — a
@@ -31,6 +35,9 @@ import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker } from "@laun
 import type { AgentNodeResult, AgentRunner } from "./agentRunner.js";
 import type { HandoffVerification, HandoffVerifier } from "./handoffVerifier.js";
 import type { JudgeHook } from "./judges.js";
+
+/** Bound on a journalled judge `reasoning` string, so the resume journal stays small. */
+const JUDGE_REASONING_MAX = 1000;
 
 /** Hard ceiling on any declared `max_visits`, so config can't remove the guarantee. */
 const MAX_VISITS_HARD_CAP = 10;
@@ -74,6 +81,25 @@ export interface NodeRun {
   tags: Record<string, string>;
   /** 1-based run count for this node key in this walk (>1 means a loop re-run). */
   iteration: number;
+  /**
+   * Judge key → score, for scores that are USABLE as routing input (sampled,
+   * successful, numeric — see `usableJudgeScores`). Absent when no judge is
+   * attached, none was sampled, or every evaluation failed.
+   *
+   * On `NodeRun` rather than in tags, and deliberately: `NodeRun[]` IS the resume
+   * journal (`ResumeInput.journal`), so a score that routes is persisted and
+   * replayed by construction. A tag would instead be deleted by the routing rewind,
+   * which reads the agent's own result tags and so never sees a walker-computed one.
+   */
+  judgeScores?: Record<string, number>;
+  /**
+   * The lowest-scoring usable judge's `reasoning`, truncated. Journalled alongside
+   * the scores because it is the substance of a judge-driven rework: if a resume
+   * replays up to a loop target and then runs it live, dropping this would hand the
+   * re-run extra budget with no explanation — the exact failure the whole feedback
+   * channel exists to prevent.
+   */
+  judgeReasoning?: string;
 }
 
 /** An outgoing edge that could NOT be taken because its `require_tags` weren't met. */
@@ -194,6 +220,23 @@ export interface WalkResult {
    * failure — the run is a mix of two walks and must not be reported as a result.
    */
   replayDiverged?: ReplayDivergence;
+  /**
+   * Every loop edge whose budget was spent, WHETHER OR NOT the walk continued past
+   * it. Informational, never a failure.
+   *
+   * Why this exists: a loop edge on a node that also has a forward edge is
+   * ADVISORY — when the budget runs out the walk falls through and finishes
+   * normally, so `loopExhausted` never fires. Without this record, "we tried N
+   * times to improve quality, never got there, and shipped anyway" would appear
+   * nowhere. `loopExhausted.exhausted` is the subset that actually ended the walk.
+   */
+  loopBudgetSpent?: Array<{
+    source: string;
+    target: string;
+    traversals: number;
+    maxVisits: number;
+    trigger?: string;
+  }>;
 }
 
 /**
@@ -229,6 +272,20 @@ export type WalkEvent =
   | { type: "loop-exhausted"; info: LoopExhaustedInfo }
   | { type: "replay-diverged"; info: ReplayDivergence }
   | { type: "awaiting-approval"; node: string };
+
+/**
+ * One line per advisory loop that ran out of budget WITHOUT failing the run. These
+ * are the quality retries that gave up and let the chain proceed — invisible unless
+ * something says so, since the walk itself finished normally.
+ */
+export function describeLoopBudgetSpent(spent: NonNullable<WalkResult["loopBudgetSpent"]>): string[] {
+  return spent.map(
+    (e) =>
+      `quality loop ${e.source} → ${e.target} used all ${e.maxVisits} attempt(s) without converging` +
+      (e.trigger ? ` (${e.trigger})` : "") +
+      " — the chain continued anyway.",
+  );
+}
 
 /** Human-readable one-liner describing why a loop did not converge. */
 export function describeLoopExhausted(info: LoopExhaustedInfo): string {
@@ -295,6 +352,58 @@ export interface LoopTrigger {
    * feedback on a resume and by a judge's reasoning.
    */
   detail?: string;
+}
+
+/**
+ * The judge scores a node run may route on. A score counts only when the judge was
+ * SAMPLED, the evaluation SUCCEEDED, and the score is numeric.
+ *
+ * This is the fail-open contract in one place: `judges.ts` promises that a judge
+ * failure never fails the chain, and judges are sampled, so routing on them must
+ * treat every absence as "no signal" rather than as a low score. An unsampled or
+ * broken judge must never be able to trigger rework.
+ */
+export function usableJudgeScores(
+  results: ReadonlyArray<{ judgeConfigKey?: string; sampled: boolean; success: boolean; score?: number }>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const r of results) {
+    if (r.sampled && r.success && typeof r.score === "number" && Number.isFinite(r.score)) {
+      out[r.judgeConfigKey ?? "judge"] = r.score;
+    }
+  }
+  return out;
+}
+
+/**
+ * The score a `loop_if_judge_below` edge is compared against: the MINIMUM usable
+ * score, so that adding a second judge later can never let a high scorer mask a low
+ * one. One judge per node today, so this is trivially that judge's score.
+ * Undefined when there is nothing usable — which fails open.
+ */
+function routingJudgeScore(scores: Record<string, number> | undefined): number | undefined {
+  if (!scores) return undefined;
+  const values = Object.values(scores);
+  return values.length > 0 ? Math.min(...values) : undefined;
+}
+
+/**
+ * Describe a judge-driven loop edge's condition, including the RUNTIME score — the
+ * part a config-only describer can't know, and the part a human actually needs
+ * ("scored 0.55, below 0.70" beats "judge score was low"). Undefined when the edge
+ * carries no judge threshold, so callers fall back to the tag describer.
+ */
+function describeJudgeCondition(
+  handoff: Record<string, unknown> | undefined,
+  scores: Record<string, number> | undefined,
+): string | undefined {
+  const below = handoffNumber(handoff, "loop_if_judge_below");
+  if (below === undefined) return undefined;
+  const entries = Object.entries(scores ?? {});
+  if (entries.length === 0) return `no usable judge score (threshold ${below})`;
+  // Name the judge that actually tripped it, not just the number.
+  const [lowestKey, lowestScore] = entries.reduce((lo, e) => (e[1] < lo[1] ? e : lo));
+  return `${lowestKey} scored ${lowestScore.toFixed(2)}, below ${below}`;
 }
 
 /**
@@ -445,9 +554,10 @@ export interface WalkInputs {
    * the node's tracker. Judge failures never fail the walk. Skipped for replayed
    * nodes (their scores were already recorded).
    *
-   * NOTE for Step 3: once judge scores become a ROUTING input, they must be added
-   * to `ResumeInput` and served from the journal on replay. Skipping them then
-   * would change edge selection.
+   * Judge scores ARE a routing input (`loop_if_judge_below`), and the obligation
+   * above is met by carrying them on `NodeRun` — which is itself the resume journal,
+   * so they are persisted and replayed without a separate `ResumeInput` field. On
+   * replay they are served from the journal instead of re-running the hook.
    */
   judgeHook?: JudgeHook;
   /**
@@ -517,6 +627,8 @@ export async function walkGraph(
   // Per-edge traversal counts (key `${source}→${target}`) — only loop edges (those
   // carrying max_visits) are ever consulted/capped.
   const edgeCounts = new Map<string, number>();
+  // Loop edges whose budget ran out, keyed per edge so a revisited node records once.
+  const budgetSpent = new Map<string, NonNullable<WalkResult["loopBudgetSpent"]>[number]>();
   // Routing-tag state captured just before each run (parallel to `runs`), so a
   // loop re-entry can restore the target's pre-run routing state.
   const routingSnapshots: Array<Record<string, string>> = [];
@@ -670,18 +782,51 @@ export async function walkGraph(
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
     const run: NodeRun = { configKey: key, status: result.status, output, tags: result.tags, iteration };
+    // A replayed node's scores come from the journal, because the hook below is
+    // skipped. This is what keeps judge-driven ROUTING deterministic across a
+    // resume; drop it and the loop edge silently fails open on replay.
+    if (replayEntry?.judgeScores && Object.keys(replayEntry.judgeScores).length > 0) {
+      run.judgeScores = { ...replayEntry.judgeScores };
+      if (replayEntry.judgeReasoning) run.judgeReasoning = replayEntry.judgeReasoning;
+    }
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
 
     // Judges attached to this node's config (if any) score the output now, on
     // the same tracker. Defensive: a judge problem must never break the walk.
-    // Skipped on replay: the scores were recorded by the original walk, and they
-    // do not affect routing (see the Step 3 note on WalkInputs.judgeHook).
+    // Skipped on replay: the scores were recorded by the original walk (and served
+    // from the journal above), so re-running them would double-record on the
+    // tracker without changing any decision.
+    //
+    // Ordering note: this runs AFTER runs.push + node-complete on purpose — moving
+    // it earlier would delay the "step done" event by a full judge call on every
+    // surface. Scores are therefore attached by mutating the pushed run, which is
+    // the same object reference and leaves routingSnapshots alignment untouched.
     if (judgeHook && tracker) {
+      let judgeResults: Awaited<ReturnType<JudgeHook>> = [];
       try {
-        await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
+        judgeResults = await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
       } catch (e) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
+      }
+      const scores = usableJudgeScores(judgeResults);
+      if (Object.keys(scores).length > 0) {
+        run.judgeScores = scores;
+        // The reasoning that goes with the score a loop edge would fire on.
+        const lowestKey = Object.entries(scores).reduce((lo, e) => (e[1] < lo[1] ? e : lo))[0];
+        const reasoning = judgeResults.find((r) => (r.judgeConfigKey ?? "judge") === lowestKey)?.reasoning;
+        if (reasoning) run.judgeReasoning = reasoning.slice(0, JUDGE_REASONING_MAX);
+      }
+      // The sampling hazard, surfaced at runtime because it can't be a build check:
+      // `samplingRate` lives in LaunchDarkly, not the repo. If a node routes on a
+      // judge score and none came back, the loop silently won't fire and quality
+      // goes unverified — so say so loudly rather than proceeding quietly.
+      const routesOnJudge = node.getEdges().some((e) => handoffNumber(e.handoff, "loop_if_judge_below") !== undefined);
+      if (routesOnJudge && Object.keys(scores).length === 0) {
+        console.warn(
+          `[judge] '${key}' has a judge-driven loop edge but produced NO usable score ` +
+            `(unsampled, failed, or no judge attached) — the quality loop cannot fire and this run is unverified.`,
+        );
       }
     }
 
@@ -716,6 +861,8 @@ export async function walkGraph(
     let next: string | null = null;
     let nextHandoff: Record<string, unknown> | undefined;
     let nextIsLoopEdge = false;
+    // The judge threshold the taken loop edge fired on, for the trigger message.
+    let nextJudgeThreshold: number | undefined;
     const budgetBlocked: LoopExhaustedInfo["exhausted"] = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
@@ -723,6 +870,14 @@ export async function walkGraph(
       if (require && !tagsMatch(accumulatedTags, require)) continue;
       const skip = handoffTags(h, "skip_if_tags");
       if (skip && tagsMatch(accumulatedTags, skip)) continue;
+      // Quality gate: take this edge only when the just-completed node scored BELOW
+      // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
+      // not taken (an unsampled or broken judge must never trigger rework).
+      const below = handoffNumber(h, "loop_if_judge_below");
+      if (below !== undefined) {
+        const score = routingJudgeScore(run.judgeScores);
+        if (score === undefined || score >= below) continue;
+      }
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
@@ -732,20 +887,27 @@ export async function walkGraph(
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {
-          const trig = describeLoopCondition(h);
-          budgetBlocked.push({
+          const trig = describeJudgeCondition(h, run.judgeScores) ?? describeLoopCondition(h);
+          const spent = {
             source: key,
             target: edge.key,
             traversals,
             maxVisits,
             ...(trig ? { trigger: trig } : {}),
-          });
+          };
+          budgetBlocked.push(spent);
+          // Recorded whether or not the walk continues past this edge. An advisory
+          // loop (one whose node also has a forward edge) falls through and finishes
+          // normally, so this is the only place that "we gave up on quality" is
+          // written down. Keyed per edge so a revisited node doesn't duplicate it.
+          budgetSpent.set(`${key}→${edge.key}`, spent);
           continue;
         }
       }
       next = edge.key;
       nextHandoff = h;
       nextIsLoopEdge = rawMax !== undefined;
+      nextJudgeThreshold = handoffNumber(h, "loop_if_judge_below");
       break;
     }
 
@@ -815,9 +977,14 @@ export async function walkGraph(
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
       // Tell the re-entered node who sent it back and why. `detail` stays empty for
       // a verdict loop: the inbound brief already carries this node's full report.
+      // A judge-driven edge describes itself with the runtime score; a tag-driven one
+      // with the tags that matched. `detail` carries the judge's reasoning, which —
+      // unlike a verdict loop's critique — is NOT in the inbound brief.
+      const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
       pendingLoopTrigger = {
         source: key,
-        reason: describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+        reason: judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+        ...(nextJudgeThreshold !== undefined && run.judgeReasoning ? { detail: run.judgeReasoning } : {}),
       };
     }
 
@@ -860,5 +1027,6 @@ export async function walkGraph(
     ...(verificationFailed ? { verificationFailed } : {}),
     ...(loopExhausted ? { loopExhausted } : {}),
     ...(replayDiverged ? { replayDiverged } : {}),
+    ...(budgetSpent.size > 0 ? { loopBudgetSpent: [...budgetSpent.values()] } : {}),
   };
 }

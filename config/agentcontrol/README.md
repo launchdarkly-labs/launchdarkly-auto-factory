@@ -175,6 +175,41 @@ traversal counts across runs (resumable walk state — see
 `docs/phase4-judge-driven-loops.md` Step 2); until then, the run-level backstop and
 the per-walk cap are the only ceilings.
 
+### `loop_if_judge_below` — judge-driven quality retries
+
+`loop_if_judge_below: N` (a number in `[0, 1]`) makes a loop edge fire only when the
+just-completed node's **judge score** is below `N`. Since a judge scores the output of
+the node it is attached to, these edges are **self-loops**: "this node did poorly, run
+it again." The committed graph ships one — `metrics-author → metrics-author`,
+`max_visits: 1`, threshold `0.7` — against the `autofactory-judge-metrics-quality`
+judge.
+
+Three things to understand before adding one:
+
+1. **It fails open.** A score counts only if the judge was *sampled*, the evaluation
+   *succeeded*, and the score is numeric. Anything else means "no signal" and the edge
+   is not taken — an unsampled or broken judge can never trigger rework. With multiple
+   judges on a node the **minimum** usable score decides, so a lenient judge can't mask
+   a strict one. Because `samplingRate` lives in LaunchDarkly rather than the repo,
+   `check:configs` cannot verify it; instead the walker logs loudly at runtime when a
+   node with a judge loop produces no usable score.
+2. **These loops are ADVISORY, not gates.** The node also has a forward edge, and the
+   walker takes the first passing edge — so once the budget is spent the walk *falls
+   through* and finishes normally. It does **not** report `loopExhausted`. What it does
+   report is `loopBudgetSpent`, surfaced as a warning on every front end ("quality loop
+   used all 1 attempt(s) without converging"). Without that the run would look
+   identical to one that passed on the first try.
+3. **Declaration order is load-bearing.** A judge self-loop must be declared **before**
+   any other edge from the same node, or the forward edge — whose conditions are also
+   satisfied — always wins and the loop never evaluates. `check:configs` enforces this,
+   along with the `[0, 1]` range and the requirement that a judge loop carry
+   `max_visits`.
+
+The re-entered node's rework preamble names the score and the judge
+(*"Sent back by 'metrics-author' because metrics-quality scored 0.55, below 0.7"*) and
+carries the judge's **reasoning** as additional guidance — the one piece of feedback
+that is genuinely not already in the inbound brief.
+
 An unmet loop edge is **convergence, not a stall.** When a `max_visits` edge's
 conditions don't pass, the walker treats it like an intentional `skip_if_tags`
 short-circuit rather than a blocked chain — so giving a previously-terminal node a

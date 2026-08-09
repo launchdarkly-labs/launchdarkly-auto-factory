@@ -42,6 +42,7 @@ import {
   createPolicyGate,
   createWorkingTreeEvidence,
   decideApproval,
+  describeLoopBudgetSpent,
   describeLoopExhausted,
   extractConfigStamp,
   getLdSdk,
@@ -527,6 +528,9 @@ async function run(opts: CliOptions): Promise<number> {
     const label = iter && iter !== "1" ? `${k} (iter ${iter})` : k;
     lines.push(`Judge: ${label} scored ${score.toFixed(2)}`);
   }
+  // Advisory quality loops that gave up. Not a failure, but the run is worse than a
+  // clean first pass and nothing else would say so.
+  if (walk.loopBudgetSpent) for (const l of describeLoopBudgetSpent(walk.loopBudgetSpent)) lines.push(`⚠ ${l}`);
   if (walk.loopExhausted) {
     lines.push(`⚠ ${describeLoopExhausted(walk.loopExhausted)}`);
     // Budget alone would repeat the same failure, so the grant requires feedback.
