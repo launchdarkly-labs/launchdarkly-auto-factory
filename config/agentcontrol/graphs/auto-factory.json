@@ -81,6 +81,26 @@
           "flag_ready": "true"
         }
       }
+    },
+    {
+      "key": "edge-autofactory-code-reviewer-autofactory-flag-implementer",
+      "sourceConfig": "autofactory-code-reviewer",
+      "targetConfig": "autofactory-flag-implementer",
+      "handoff": {
+        "max_turns": 20,
+        "request_type": "Fix",
+        "capabilities": [
+          "create_flag",
+          "flag_state",
+          "edit_files",
+          "write_manifest",
+          "read_docs"
+        ],
+        "require_tags": {
+          "review_approved": "false"
+        },
+        "max_visits": 2
+      }
     }
   ]
 }

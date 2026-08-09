@@ -374,6 +374,75 @@ describe("walkGraph — loop-back edges", () => {
     assert.equal(countOf(r, "flag"), 2, "loop fired once (max_visits:1), then fell through");
   });
 
+  // Phase 4 Step 1a discovered this: giving a previously-terminal node a loop-back
+  // edge made every clean run report `stalledAt`, because an unmet require_tags was
+  // read as "the chain can't advance". For a LOOP edge, unmet means the rework
+  // trigger didn't fire — convergence, not a stall.
+  describe("5b. an unmet loop edge is convergence, not a stall", () => {
+    it("a node whose only edge is an unmet loop edge terminates cleanly", async () => {
+      const g = graphFrom({
+        root: "research",
+        edges: {
+          research: [{ key: "flag" }],
+          flag: [{ key: "test" }],
+          test: [{ key: "review" }],
+          review: [{ key: "flag", handoff: { max_visits: 2, require_tags: { review_approved: "false" } } }],
+        },
+      });
+      const runner = new ScriptedRunner({ review: { tags: { review_approved: "true" } } }); // approves
+      const r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+      assert.equal(r.stalledAt, undefined, "an approved run must not look stalled");
+      assert.equal(r.loopExhausted, undefined);
+      assert.equal(countOf(r, "flag"), 1, "the loop never fired");
+      assert.deepEqual(r.skipped, []);
+    });
+
+    it("an unmet FORWARD edge still stalls, and the stall names only that edge", async () => {
+      // Discriminating: the suppression must be scoped to max_visits edges, or a
+      // genuinely blocked chain would go silent — the exact failure mode issue #9
+      // asked to surface.
+      const g = graphFrom({
+        root: "research",
+        edges: {
+          research: [{ key: "flag" }],
+          flag: [{ key: "test" }],
+          test: [{ key: "review" }],
+          review: [
+            { key: "flag", handoff: { max_visits: 2, require_tags: { review_approved: "false" } } }, // loop, unmet
+            { key: "done", handoff: { require_tags: { ship: "true" } } }, // forward, unmet
+          ],
+        },
+      });
+      const runner = new ScriptedRunner({ review: { tags: { review_approved: "true" } } });
+      const r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+      assert.equal(r.stalledAt?.node, "review");
+      assert.deepEqual(
+        r.stalledAt?.unmet,
+        [{ target: "done", requireMissing: { ship: "true" } }],
+        "the unmet loop edge is not reported as a cause of the stall",
+      );
+    });
+
+    it("a budget-SPENT loop edge still reports loopExhausted (suppression is only for unmet)", async () => {
+      const g = graphFrom({
+        root: "research",
+        edges: {
+          research: [{ key: "flag" }],
+          flag: [{ key: "test" }],
+          test: [{ key: "review" }],
+          review: [{ key: "flag", handoff: { max_visits: 1, require_tags: { review_approved: "false" } } }],
+        },
+      });
+      const runner = new ScriptedRunner({ review: { tags: { review_approved: "false" } } }); // never converges
+      const r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+      assert.equal(r.stalledAt, undefined);
+      assert.equal(r.loopExhausted?.reason, "budget");
+      assert.deepEqual(r.loopExhausted?.exhausted, [
+        { source: "review", target: "flag", traversals: 1, maxVisits: 1 },
+      ]);
+    });
+  });
+
   it("9. envelope inheritance: a re-run inherits the first-entry max_turns/capabilities", async () => {
     const g = graphFrom({
       root: "research",

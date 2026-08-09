@@ -15,6 +15,39 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-09 (the graph actually loops)
+
+### ✅ First loop edge: `code-reviewer → flag-implementer` on a rejected review
+- **Why:** `max_visits` shipped in July, but no committed edge used it — the graph
+  was still a DAG, so the loop machinery was untested in production. Separately,
+  `review_approved` was **routed on by nothing**: a rejection just reported RED to a
+  human, and the reviewer's findings were discarded. This edge makes the verdict
+  actionable, and it needs no new signal — the reviewer is an independent node
+  evaluating the implementer's work with the full diff in hand.
+- **The edge:** `max_visits: 2`, `require_tags: { review_approved: "false" }` — at
+  most one rework pass. Capabilities mirror the steward → implementer envelope minus
+  `query_repos` (cross-repo research is a first-pass concern).
+- **Polarity is deliberate:** it fires only on the literal `"false"`. The approval
+  gate normalizes verdicts (`reject`/`rejected` also read as rejections), so a
+  drifted verdict still reports REJECTED but skips the rework. The alternative
+  (`skip_if_tags: { review_approved: "approve" }`) loops on anything that isn't the
+  exact approval string, which would rework work the reviewer *accepted* — the more
+  expensive mistake, since iteration 2 can attach new LD resources.
+- **Gate interaction:** the implementer is in `DEFAULT_GATED_STEPS`, and the walker
+  re-asks the gate on every loop re-entry (a re-run can create new side effects). So
+  in non-`yolo` modes this loop halts at the gate rather than completing inside one
+  walk. Resolving that needs resumable walk state — see
+  `docs/phase4-judge-driven-loops.md` Step 2.
+- **Walker fix this surfaced (`graphWalker.ts`):** an unmet loop edge is now treated
+  as **convergence, not a stall**. Previously, giving a terminal node a loop-back
+  edge made every *approved* run report `stalledAt` → INCOMPLETE, because an unmet
+  `require_tags` was read as "the chain can't advance". Unmet forward edges still
+  stall; only `max_visits` edges are exempt. The dual of the capping rule.
+- **`tags.json`:** `review_approved` now declares the edge it gates, and its
+  description records the exact-equality-vs-normalization gap.
+
+---
+
 ## 2026-07-28 (bounded loop-back edges)
 
 ### ✅ `max_visits` handoff field + rework-aware agents

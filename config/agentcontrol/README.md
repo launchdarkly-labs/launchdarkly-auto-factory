@@ -139,6 +139,18 @@ loops tag each loop edge. This is config, not code: the graph owns *which edges
 loop and their budget*; the code owns the guarantees (the per-edge hard cap and a
 run-level backstop) that a graph edit can't disable.
 
+The committed graph ships **one** loop edge: `code-reviewer → flag-implementer`
+with `max_visits: 2` and `require_tags: { review_approved: "false" }` — a rejected
+review sends the work back to the implementer for at most one rework pass. Note the
+polarity: it fires only on the literal `"false"`. The approval gate *normalizes* the
+verdict (`reject`/`rejected` also count as a rejection), so a reviewer that drifts
+off the instructed `true`/`false` still reports REJECTED but skips the rework. That
+is the deliberate trade — `skip_if_tags: { review_approved: "approve" }` would loop
+on anything that isn't the exact approval string, and reworking work the reviewer
+*accepted* is the more expensive mistake. Also note the implementer is
+`DEFAULT_GATED_STEPS`, so in non-`yolo` modes this loop halts at the approval gate on
+re-entry rather than completing inside one walk.
+
 When a loop re-enters a node, the walker **rewinds routing/verdict tags** (the
 `production: "llm"` tags — `review_approved`, `risk_score`, …) to the state before
 that node last ran, then overlays the loop source's routing tags as the trigger,
@@ -148,6 +160,15 @@ never rewound: they accumulate into a run *inventory* that reporting and the
 approval guard read, so a rewind can't erase the record of resources that really
 exist. A re-entered node's prompt gets a `REWORK ITERATION N` preamble listing
 that inventory (see the agents' "Rework iterations" sections).
+
+An unmet loop edge is **convergence, not a stall.** When a `max_visits` edge's
+conditions don't pass, the walker treats it like an intentional `skip_if_tags`
+short-circuit rather than a blocked chain — so giving a previously-terminal node a
+loop-back edge doesn't make every clean run report as stalled. Unmet *forward*
+edges still stall (that's the "silently stalled" case the walker exists to
+surface); only `max_visits` edges are exempt. This is the dual of the capping
+rule: untagged forward edges are never budget-capped, and loop edges never
+manufacture a stall.
 
 If a loop does not converge within budget — or an untagged cycle runs to the
 run-level cap — the run reports `loopExhausted`: a hard failure (red PR check,

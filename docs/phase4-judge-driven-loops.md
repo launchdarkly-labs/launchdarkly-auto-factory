@@ -49,7 +49,15 @@ Rev 1's `production: "judge"` tag class is dropped entirely; see Step 3.
 
 The first real loop, at near-zero cost. Two commits: config, then feedback.
 
-## 1a. The edge (config only)
+## 1a. The edge
+
+> **Shipped.** Predicted as config-only; it was not. Adding an outgoing edge to a
+> previously-terminal node made every **approved** run report `stalledAt` →
+> INCOMPLETE, because an unmet `require_tags` reads as "the chain can't advance."
+> Fixed in the walker: an unmet `max_visits` edge is convergence, not a stall
+> (unmet *forward* edges still stall). Caught by the existing "flag-worthy PR
+> APPROVES" contract test on the first run — worth noting that the pre-existing
+> fixture suite, not a new test, is what caught it.
 
 `config/agentcontrol/graphs/auto-factory.json`:
 
@@ -81,10 +89,20 @@ extension/CLI path first.
 
 **Known fragility, accepted for 1a.** `require_tags` is exact equality, but
 `approval.ts:111-119` tolerates `approve`/`approved`/`true`/`rejected` because agents
-drift off the instructed `true`/`false`. A drifted verdict silently fails to loop and
-reports INCOMPLETE. That fails *safe*, so accept it here and revisit under Step 3's
-derived-signal note rather than bolting on a normalizer now. Test 3 below pins the
-behaviour so it is a known gap, not a surprise.
+drift off the instructed `true`/`false`. A drifted verdict (`"rejected"`) is still read
+as a rejection by approval — the run reports REJECTED, and a human sees it — but no
+rework loop is attempted. That fails *safe* (no wasted iteration, nothing reports
+success), so accept it here and revisit under Step 3's derived-signal note rather than
+bolting on a normalizer now. Test 3 below pins the behaviour so it is a known gap, not
+a surprise.
+
+**Polarity choice.** `require_tags: {review_approved: "false"}` rather than
+`skip_if_tags: {review_approved: "approve"}` (the convention in the existing synthetic
+walker tests). The two differ in failure mode: `skip_if_tags` loops on *anything* that
+isn't the exact approval string, so a drifted `"approved"` would rework work the
+reviewer accepted — re-running the implementer against an approved flag. `require_tags`
+errs the other way: a drifted rejection misses the rework. Missing an iteration is
+strictly cheaper than reworking approved work that already has LD resources attached.
 
 **Edge order is load-bearing.** The walker takes the first passing edge and `break`s
 (`graphWalker.ts:496`). `code-reviewer` has no other outgoing edge, so 1a is safe —

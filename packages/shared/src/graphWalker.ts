@@ -17,7 +17,8 @@
  *     (forward / rejoin) are never capped. This is how bounded loops work — a
  *     re-entered node re-runs, and its routing tags are rewound to the state
  *     before it last ran (facts/inventory persist). Termination is guaranteed by
- *     the per-edge cap plus a run-level backstop.
+ *     the per-edge cap plus a run-level backstop. An UNMET loop edge is treated
+ *     as convergence, not a stall — only unmet forward edges stall the chain.
  *
  * One outgoing edge is taken per node. Per-node generation metrics and per-edge
  * handoff metrics are recorded back to LaunchDarkly via the AI-config and graph
@@ -507,6 +508,14 @@ export async function walkGraph(
         const h = edge.handoff;
         const skip = handoffTags(h, "skip_if_tags");
         if (skip && tagsMatch(accumulatedTags, skip)) continue; // intentionally skipped
+        // A LOOP edge whose conditions are unmet is CONVERGENCE, not a stall: the
+        // rework trigger simply didn't fire (e.g. the reviewer approved). Without
+        // this, giving a previously-terminal node a loop-back edge would report
+        // every clean run as stalled. The dual of the rule in the edge-selection
+        // loop above: untagged forward edges are never budget-capped, and
+        // max_visits edges never manufacture a stall. Budget-spent loop edges are
+        // still reported — via budgetBlocked/loopExhausted, not here.
+        if (handoffNumber(h, "max_visits") !== undefined) continue;
         const require = handoffTags(h, "require_tags");
         if (require && !tagsMatch(accumulatedTags, require)) {
           const requireMissing: Record<string, string> = {};

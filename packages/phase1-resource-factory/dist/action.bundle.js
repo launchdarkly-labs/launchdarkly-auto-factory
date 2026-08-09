@@ -33829,6 +33829,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
         const skip = handoffTags(h, "skip_if_tags");
         if (skip && tagsMatch(accumulatedTags, skip))
           continue;
+        if (handoffNumber(h, "max_visits") !== void 0)
+          continue;
         const require2 = handoffTags(h, "require_tags");
         if (require2 && !tagsMatch(accumulatedTags, require2)) {
           const requireMissing = {};
