@@ -13,7 +13,7 @@ import type {
   AgentNodeResult,
   AgentRunner,
 } from "@auto-factory/shared";
-import { walkGraph } from "@auto-factory/shared";
+import { describeLoopExhausted, walkGraph } from "@auto-factory/shared";
 
 /**
  * Fake runner: returns a scripted `{status, tags}` per config key (no network,
@@ -292,10 +292,43 @@ describe("walkGraph — loop-back edges", () => {
     assert.equal(r.stalledAt, undefined);
     assert.equal(r.loopExhausted?.reason, "budget");
     assert.deepEqual(r.loopExhausted?.exhausted, [
-      { source: "review", target: "flag", traversals: 2, maxVisits: 2 },
+      // A skip_if loop edge fires on the ABSENCE of its exit condition, so the
+      // trigger is phrased as the exit that never happened.
+      { source: "review", target: "flag", traversals: 2, maxVisits: 2, trigger: "review_approved never became approve" },
     ]);
     // max_visits:2 → the loop edge fired exactly twice (flag ran 1 + 2 = 3 times).
     assert.equal(countOf(r, "flag"), 3);
+    // The human-facing one-liner names the condition, not just the spent counter:
+    // "budget exhausted" alone tells a reader nothing about what to fix.
+    const msg = describeLoopExhausted(r.loopExhausted!);
+    assert.match(msg, /trigger: review_approved never became approve/);
+    assert.match(msg, /2\/2 traversals/);
+  });
+
+  it("2b. describeLoopExhausted omits the trigger clause when there is no condition", async () => {
+    // An unconditional loop edge (max_visits only) has nothing to name, and the
+    // message must not grow a dangling "trigger:".
+    const g = graphFrom({
+      root: "research",
+      edges: {
+        research: [{ key: "flag" }],
+        flag: [{ key: "test" }],
+        test: [{ key: "review" }],
+        review: [{ key: "flag", handoff: { max_visits: 1 } }],
+      },
+    });
+    const r = await walkGraph(g, new ScriptedRunner({}), { PR_NUMBER: "1" });
+    assert.equal(r.loopExhausted?.reason, "budget");
+    assert.equal(r.loopExhausted?.exhausted[0]?.trigger, undefined);
+    assert.doesNotMatch(describeLoopExhausted(r.loopExhausted!), /trigger:/);
+  });
+
+  it("2c. run-cap exhaustion keeps its own message (no trigger clause)", async () => {
+    // a ⇄ b with no max_visits — the run-level backstop, not a per-edge budget.
+    const g = graphFrom({ root: "a", edges: { a: [{ key: "b" }], b: [{ key: "a" }] } });
+    const r = await walkGraph(g, new ScriptedRunner({}), { PR_NUMBER: "1" });
+    assert.equal(r.loopExhausted?.reason, "run-cap");
+    assert.match(describeLoopExhausted(r.loopExhausted!), /total-node-run cap/);
   });
 
   it("3. untagged cycle → run-cap backstop", async () => {
@@ -438,7 +471,7 @@ describe("walkGraph — loop-back edges", () => {
       assert.equal(r.stalledAt, undefined);
       assert.equal(r.loopExhausted?.reason, "budget");
       assert.deepEqual(r.loopExhausted?.exhausted, [
-        { source: "review", target: "flag", traversals: 1, maxVisits: 1 },
+        { source: "review", target: "flag", traversals: 1, maxVisits: 1, trigger: "review_approved=false" },
       ]);
     });
   });
@@ -535,8 +568,8 @@ describe("walkGraph — loop-back edges", () => {
     const r = await walkGraph(g, new ScriptedRunner({}), { PR_NUMBER: "1" });
     assert.equal(r.loopExhausted?.reason, "budget");
     assert.deepEqual(r.loopExhausted?.exhausted, [
-      { source: "review", target: "flag", traversals: 1, maxVisits: 1 },
-      { source: "review", target: "test", traversals: 2, maxVisits: 2 },
+      { source: "review", target: "flag", traversals: 1, maxVisits: 1, trigger: "d1 never became true" },
+      { source: "review", target: "test", traversals: 2, maxVisits: 2, trigger: "d2 never became true" },
     ]);
   });
 

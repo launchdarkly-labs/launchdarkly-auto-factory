@@ -46,6 +46,22 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **`tags.json`:** `review_approved` now declares the edge it gates, and its
   description records the exact-equality-vs-normalization gap.
 
+### ✅ Rework prompts say who sent them back and why
+- **Why:** a re-entered node's preamble said only "The brief below explains what to
+  change" — nothing marked the brief as a *rejection*, named the node that produced
+  it, or stated which condition fired. The agent could read the reviewer's critique
+  as a fresh task rather than a change request.
+- The preamble now reads *"Sent back by 'autofactory-code-reviewer' because
+  `review_approved=false`. The brief below is that step's own report — treat it as the
+  change request, not a new task."* The reason is derived from the edge's own
+  conditions, so it works for any loop edge; a `skip_if_tags` edge is phrased as the
+  exit that never happened (`review_approved never became approve`).
+- **Not** carried as a tag, and the critique itself is **not** duplicated — the inbound
+  brief already carries the loop source's full report.
+- **Exhaustion messaging:** `describeLoopExhausted` now appends `— trigger: <condition>`,
+  so a non-converged loop reports why it kept firing instead of only that the budget
+  ran out. All four surfaces inherit it through the shared helper.
+
 ### ⚠️ Known scope limit: `max_visits` bounds a walk, not a PR
 - The traversal counter is process-local (`edgeCounts` in `graphWalker.ts`) and is
   persisted nowhere, so **every re-run starts with a full budget**. Because the

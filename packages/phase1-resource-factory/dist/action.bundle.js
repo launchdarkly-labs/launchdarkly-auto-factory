@@ -33633,7 +33633,10 @@ function describeLoopExhausted(info) {
   if (info.reason === "run-cap") {
     return `loop did not converge at '${info.node}': the run hit the total-node-run cap \u2014 likely an untagged cycle in the graph.`;
   }
-  const edges = info.exhausted.map((e) => `edge \u2192 ${e.target} spent its budget (${e.traversals}/${e.maxVisits} traversals)`).join("; ");
+  const edges = info.exhausted.map((e) => {
+    const why = e.trigger ? ` \u2014 trigger: ${e.trigger}` : "";
+    return `edge \u2192 ${e.target} spent its budget (${e.traversals}/${e.maxVisits} traversals)${why}`;
+  }).join("; ");
   return `loop did not converge at '${info.node}'; ${edges}. The chain could not advance within budget.`;
 }
 function tagsMatch(tags, cond) {
@@ -33662,16 +33665,31 @@ function handoffStringArray(handoff, field) {
   const v = handoff?.[field];
   return Array.isArray(v) ? v.filter((x) => typeof x === "string") : void 0;
 }
-function reworkPreamble(iteration, inventory) {
+function describeLoopCondition(handoff) {
+  const require2 = handoffTags(handoff, "require_tags");
+  if (require2 && Object.keys(require2).length > 0) {
+    return Object.entries(require2).map(([k, v]) => `${k}=${v}`).join(", ");
+  }
+  const skip = handoffTags(handoff, "skip_if_tags");
+  if (skip && Object.keys(skip).length > 0) {
+    return Object.entries(skip).map(([k, v]) => `${k} never became ${v}`).join(", ");
+  }
+  return void 0;
+}
+function reworkPreamble(iteration, inventory, trigger) {
   const facts = Object.entries(inventory).filter(([, v]) => v).map(([k, v]) => `- ${k}: ${v}`);
   const factBlock = facts.length ? `
 Resources already created in a prior iteration (amend or reuse \u2014 do NOT recreate):
 ${facts.join("\n")}` : "";
+  const why = trigger ? `Sent back by '${trigger.source}' because ${trigger.reason}. The brief below is that step's own report \u2014 treat it as the change request, not a new task.` : `The brief below explains what to change.`;
+  const detailBlock = trigger?.detail ? `
+Additional guidance for this iteration:
+${trigger.detail}` : "";
   return `=== REWORK ITERATION ${iteration} ===
-This is a re-run of an earlier step; a previous iteration already executed. The brief below explains what to change.${factBlock}
+This is a re-run of an earlier step; a previous iteration already executed. ${why}${detailBlock}${factBlock}
 === END REWORK CONTEXT ===`;
 }
-function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx) {
+function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx, trigger) {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
     ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
@@ -33679,7 +33697,7 @@ function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx) {
   ].filter(Boolean).join("\n");
   const parts = [header];
   if (iteration > 1)
-    parts.push(reworkPreamble(iteration, inventory));
+    parts.push(reworkPreamble(iteration, inventory, trigger));
   if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY)
     parts.push(ctx.PR_BODY);
   if (hasInbound) {
@@ -33725,6 +33743,7 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
   let pendingApproval;
   let verificationFailed;
   let loopExhausted;
+  let pendingLoopTrigger;
   while (node) {
     const key = node.getKey();
     if (gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
@@ -33758,7 +33777,9 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     const capabilities = inboundCapabilities ?? entry.capabilities;
     onEvent?.({ type: "node-start", configKey: key, index: runs.length });
     const tracker = cfg.createTracker();
-    const prompt = buildPrompt(key === rootKey, inboundHandoff !== void 0, iteration, inventory, ctx);
+    const trigger = pendingLoopTrigger;
+    pendingLoopTrigger = void 0;
+    const prompt = buildPrompt(key === rootKey, inboundHandoff !== void 0, iteration, inventory, ctx, trigger);
     const result = await runner.runNode({
       configKey: key,
       prompt,
@@ -33824,7 +33845,14 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
         const ek = `${key}\u2192${edge.key}`;
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {
-          budgetBlocked.push({ source: key, target: edge.key, traversals, maxVisits });
+          const trig = describeLoopCondition(h);
+          budgetBlocked.push({
+            source: key,
+            target: edge.key,
+            traversals,
+            maxVisits,
+            ...trig ? { trigger: trig } : {}
+          });
           continue;
         }
       }
@@ -33887,6 +33915,10 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
       }
       const ek = `${key}\u2192${next}`;
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
+      pendingLoopTrigger = {
+        source: key,
+        reason: describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)"
+      };
     }
     if (next)
       graphTracker?.trackHandoffSuccess(key, next);

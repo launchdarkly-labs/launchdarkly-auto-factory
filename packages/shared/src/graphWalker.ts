@@ -113,8 +113,19 @@ export interface LoopExhaustedInfo {
   node: string;
   /** Which ceiling stopped it. */
   reason: "budget" | "run-cap";
-  /** Budget-exhausted loop edges that otherwise passed their tag conditions. */
-  exhausted: Array<{ source: string; target: string; traversals: number; maxVisits: number }>;
+  /**
+   * Budget-exhausted loop edges that otherwise passed their tag conditions.
+   * `trigger` describes the condition that kept firing (e.g. `review_approved=false`)
+   * — present only when the edge has a describable condition, so "budget spent"
+   * can be reported as *why* rather than just *that*.
+   */
+  exhausted: Array<{
+    source: string;
+    target: string;
+    traversals: number;
+    maxVisits: number;
+    trigger?: string;
+  }>;
   /** Any edges also blocked by unmet require_tags at the same point (context). */
   alsoUnmet?: UnmetEdge[];
   /** Tags present at exhaustion. */
@@ -202,7 +213,12 @@ export function describeLoopExhausted(info: LoopExhaustedInfo): string {
     return `loop did not converge at '${info.node}': the run hit the total-node-run cap — likely an untagged cycle in the graph.`;
   }
   const edges = info.exhausted
-    .map((e) => `edge → ${e.target} spent its budget (${e.traversals}/${e.maxVisits} traversals)`)
+    .map((e) => {
+      // Name the condition that kept firing, so the reader learns what to FIX,
+      // not merely that a counter ran out.
+      const why = e.trigger ? ` — trigger: ${e.trigger}` : "";
+      return `edge → ${e.target} spent its budget (${e.traversals}/${e.maxVisits} traversals)${why}`;
+    })
     .join("; ");
   return `loop did not converge at '${info.node}'; ${edges}. The chain could not advance within budget.`;
 }
@@ -238,21 +254,79 @@ function handoffStringArray(handoff: Record<string, unknown> | undefined, field:
 }
 
 /**
+ * Why a loop edge fired, carried from the loop source to the re-entered node's
+ * rework preamble. Deliberately NOT a tag: tags are `Record<string, string>`,
+ * feed edge matching, and are registry-validated, so prose has no place there —
+ * and a walker-computed tag would be dropped by the routing rewind, which reads
+ * the agent's own result tags.
+ */
+export interface LoopTrigger {
+  /** The node whose run satisfied the loop edge's conditions. */
+  source: string;
+  /** The condition that fired, e.g. `review_approved=false`. */
+  reason: string;
+  /**
+   * Guidance for this iteration that is NOT already in the inbound brief.
+   * A verdict loop leaves this empty on purpose — the brief is the loop source's
+   * own full report, so repeating it here would duplicate it. Populated by human
+   * feedback on a resume and by a judge's reasoning.
+   */
+  detail?: string;
+}
+
+/**
+ * Describe a loop edge's firing condition for humans. `require_tags` is the
+ * trigger (all pairs had to match); a `max_visits`-only edge loops until budget,
+ * which is worth saying out loud rather than leaving blank.
+ */
+function describeLoopCondition(handoff: Record<string, unknown> | undefined): string | undefined {
+  const require = handoffTags(handoff, "require_tags");
+  if (require && Object.keys(require).length > 0) {
+    return Object.entries(require)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(", ");
+  }
+  // A skip_if loop edge fires on the ABSENCE of its exit condition, so describe it
+  // as the exit that never happened rather than as a double negative.
+  const skip = handoffTags(handoff, "skip_if_tags");
+  if (skip && Object.keys(skip).length > 0) {
+    return Object.entries(skip)
+      .map(([k, v]) => `${k} never became ${v}`)
+      .join(", ");
+  }
+  return undefined;
+}
+
+/**
  * A rework preamble injected into a re-entered node's prompt so the agent knows
  * it is iteration N with prior work to amend (not a fresh first pass). Lists the
- * created-resource inventory as "reuse, don't recreate" facts.
+ * created-resource inventory as "reuse, don't recreate" facts, and — when the
+ * re-entry came from a loop edge — names WHO sent it back and WHY. Without that,
+ * the loop source's report arrives as an undifferentiated brief and reads like a
+ * fresh task rather than a change request.
  */
-function reworkPreamble(iteration: number, inventory: Record<string, string>): string {
+function reworkPreamble(
+  iteration: number,
+  inventory: Record<string, string>,
+  trigger?: LoopTrigger,
+): string {
   const facts = Object.entries(inventory)
     .filter(([, v]) => v)
     .map(([k, v]) => `- ${k}: ${v}`);
   const factBlock = facts.length
     ? `\nResources already created in a prior iteration (amend or reuse — do NOT recreate):\n${facts.join("\n")}`
     : "";
+  const why = trigger
+    ? `Sent back by '${trigger.source}' because ${trigger.reason}. ` +
+      `The brief below is that step's own report — treat it as the change request, not a new task.`
+    : `The brief below explains what to change.`;
+  const detailBlock = trigger?.detail
+    ? `\nAdditional guidance for this iteration:\n${trigger.detail}`
+    : "";
   return (
     `=== REWORK ITERATION ${iteration} ===\n` +
     `This is a re-run of an earlier step; a previous iteration already executed. ` +
-    `The brief below explains what to change.${factBlock}\n` +
+    `${why}${detailBlock}${factBlock}\n` +
     `=== END REWORK CONTEXT ===`
   );
 }
@@ -270,6 +344,7 @@ function buildPrompt(
   iteration: number,
   inventory: Record<string, string>,
   ctx: Record<string, unknown>,
+  trigger?: LoopTrigger,
 ): string {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
@@ -279,7 +354,7 @@ function buildPrompt(
     .filter(Boolean)
     .join("\n");
   const parts: string[] = [header];
-  if (iteration > 1) parts.push(reworkPreamble(iteration, inventory));
+  if (iteration > 1) parts.push(reworkPreamble(iteration, inventory, trigger));
   // The root always sees the PR body; a re-entered root keeps it too.
   if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY) parts.push(ctx.PR_BODY);
   // The inbound brief (previous step output): present for non-root nodes and for
@@ -363,6 +438,8 @@ export async function walkGraph(
   let pendingApproval: { node: string } | undefined;
   let verificationFailed: HandoffVerification | undefined;
   let loopExhausted: LoopExhaustedInfo | undefined;
+  // Set when a loop edge is traversed; consumed by the target's next prompt.
+  let pendingLoopTrigger: LoopTrigger | undefined;
 
   while (node) {
     const key = node.getKey();
@@ -415,7 +492,12 @@ export async function walkGraph(
     // One tracker per node run, shared between the runner (generation metrics)
     // and the judge hook (evaluation scores) so both land on the same AI run.
     const tracker = cfg.createTracker();
-    const prompt = buildPrompt(key === rootKey, inboundHandoff !== undefined, iteration, inventory, ctx);
+    // Consume the loop trigger set when the edge INTO this node was taken. Cleared
+    // on read so it can't leak into a later node's preamble (a forward re-entry at
+    // iteration > 1 legitimately has no trigger).
+    const trigger = pendingLoopTrigger;
+    pendingLoopTrigger = undefined;
+    const prompt = buildPrompt(key === rootKey, inboundHandoff !== undefined, iteration, inventory, ctx, trigger);
     const result = await runner.runNode({
       configKey: key,
       prompt,
@@ -490,7 +572,14 @@ export async function walkGraph(
         const ek = `${key}→${edge.key}`;
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {
-          budgetBlocked.push({ source: key, target: edge.key, traversals, maxVisits });
+          const trig = describeLoopCondition(h);
+          budgetBlocked.push({
+            source: key,
+            target: edge.key,
+            traversals,
+            maxVisits,
+            ...(trig ? { trigger: trig } : {}),
+          });
           continue;
         }
       }
@@ -564,6 +653,12 @@ export async function walkGraph(
       }
       const ek = `${key}→${next}`;
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
+      // Tell the re-entered node who sent it back and why. `detail` stays empty for
+      // a verdict loop: the inbound brief already carries this node's full report.
+      pendingLoopTrigger = {
+        source: key,
+        reason: describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+      };
     }
 
     if (next) graphTracker?.trackHandoffSuccess(key, next);

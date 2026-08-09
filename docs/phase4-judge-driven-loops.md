@@ -115,33 +115,68 @@ a LaunchDarkly dashboard edit changes that array.
 
 ## 1b. Loop-trigger feedback into the rework preamble
 
-A verdict loop without the reviewer's reasons is just "do it again." This is the one
-code change Step 1 needs, and it is the part that makes any loop useful.
+> **Shipped, smaller than specced.** The plan was to carry a truncated slice of the
+> reviewer's output as `detail`. That would have **duplicated the prompt**: the
+> walker sets `ctx.PREVIOUS_STEP_OUTPUT` after every node run (`graphWalker.ts:437`)
+> and `buildPrompt` includes it as the inbound brief whenever `hasInbound` — which is
+> true for a loop edge. So iteration 2 already received the reviewer's *full*
+> critique; adding a truncated copy would have shown the agent the same text twice at
+> two different lengths. The real gap was **framing**, not content.
 
-`reworkPreamble(iteration, inventory)` (`graphWalker.ts:242`) currently lists
-inventory facts. Add a walker-held value, set when a loop edge is taken and consumed
-by the target's next run:
+`reworkPreamble` previously said only "The brief below explains what to change" —
+generic, with no signal that the brief is a rejection or which condition fired. Now a
+walker-held value is set when a loop edge is traversed and consumed by the target's
+next run:
 
 ```ts
-lastLoopTrigger?: { source: string; reason: string; detail?: string }
+export interface LoopTrigger {
+  source: string;    // the node whose run satisfied the loop edge
+  reason: string;    // the condition that fired, e.g. `review_approved=false`
+  detail?: string;   // guidance NOT already in the brief — see below
+}
 ```
 
-For 1a, `reason` is the rejected verdict and `detail` is a truncated slice
-(~1000 chars) of the reviewer's output — the actual critique. Rendered as a
-`WHY THIS ITERATION` block above the existing facts.
+The preamble now reads *"Sent back by 'autofactory-code-reviewer' because
+review_approved=false. The brief below is that step's own report — treat it as the
+change request, not a new task."*
 
-**Do not put this in a tag.** Tags are `Record<string, string>`, feed edge matching,
-and are registry-validated; prose has no business there. This same channel carries
-judge reasoning (Step 3) and human feedback (Step 2), which is why it is built once,
-here.
+`reason` is derived generically from the edge's own conditions
+(`describeLoopCondition`), so it works for any loop edge without the walker knowing
+what a reviewer is. A `skip_if_tags` loop edge — which fires on the *absence* of its
+exit condition — is phrased as the exit that never happened (`review_approved never
+became approve`) rather than as a double negative.
+
+**Consumed once, cleared on read**, so a trigger can't leak into a later node's
+preamble. A node re-entered at iteration > 1 via a *forward* edge legitimately has no
+trigger and keeps the generic wording — pinned by a test.
+
+**`detail` is deliberately empty for a verdict loop** and is the extension point for
+the two sources that are *not* in the brief: `humanFeedback` on a resume (Step 2) and
+a judge's `reasoning` string (Step 3). It is currently **unexercised** — the render
+branch exists but nothing populates it until Step 2.
+
+**Not a tag,** for two reasons: tags are `Record<string, string>`, feed edge matching,
+and are registry-validated, so prose has no business there — and a walker-computed tag
+would be dropped by the routing rewind, which reads the agent's own result tags
+(`pickRouting(runs[last].tags)`).
 
 ## 1c. Reporting
 
-`describeLoopExhausted` (shared, Phase 2) should name the trigger — "the reviewer
-rejected 2 iterations without converging" beats "budget exhausted." Extend
-`LoopExhaustedInfo.exhausted` entries with an optional trigger description
-(`graphWalker.ts:105-118`). Surface the per-iteration verdict in the agent table
-(rows are already iteration-labelled from Phase 2 workstream I).
+> **Shipped.** `LoopExhaustedInfo.exhausted` entries gained an optional `trigger`, and
+> `describeLoopExhausted` appends `— trigger: <condition>` so an exhausted loop reports
+> *why* it kept firing rather than only that a counter ran out. All four surfaces
+> (Action check-run, CLI, cursor panel, extension) pick this up for free — they already
+> route through the shared helper.
+
+The clause is omitted when an edge has no describable condition (an unconditional
+`max_visits`-only edge), and the `run-cap` message is untouched, since a run-cap
+exhaustion has no per-edge trigger to name. Both pinned by tests.
+
+Note this changed the shape of `exhausted`, which four existing tests asserted with
+`deepEqual` — expected churn for a new field, and updating them documents it.
+
+Still open: surfacing the per-iteration verdict in the agent table (rows are already
+iteration-labelled from Phase 2 workstream I).
 
 ## 1d. Tests
 

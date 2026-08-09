@@ -235,7 +235,9 @@ describe("routing contract: verdict-driven rework loop", () => {
     assert.equal(w.stalledAt, undefined);
     assert.equal(w.loopExhausted?.reason, "budget");
     assert.deepEqual(w.loopExhausted?.exhausted, [
-      { source: KEYS.review, target: KEYS.flag, traversals: 2, maxVisits: 2 },
+      // `trigger` names the condition that kept firing, so the report says WHY the
+      // budget ran out rather than only that it did.
+      { source: KEYS.review, target: KEYS.flag, traversals: 2, maxVisits: 2, trigger: "review_approved=false" },
     ]);
   });
 
@@ -275,7 +277,45 @@ describe("routing contract: verdict-driven rework loop", () => {
     assert.equal(w.loopExhausted, undefined, "halted by the gate, not by the budget");
   });
 
-  it("7. a rework that creates a DIFFERENT flag is caught by the orphan guard", async () => {
+  it("7. the re-run is told WHO sent it back and WHY, and that the brief is a change request", async () => {
+    // Without this the reviewer's report arrives as an undifferentiated brief and
+    // reads like a fresh task. Note the critique itself is NOT duplicated into the
+    // preamble — ctx.PREVIOUS_STEP_OUTPUT already carries the reviewer's full text.
+    const runner = new FakeRunner(
+      reworkScript([
+        { review_approved: "false", risk_level: "medium" },
+        { review_approved: "true", risk_level: "low" },
+      ]),
+    );
+    await walkGraph(buildChain(), runner, { PR_NUMBER: "1" });
+    const prompts = runner.promptsByKey[KEYS.flag] ?? [];
+    assert.equal(prompts.length, 2);
+    assert.doesNotMatch(prompts[0] ?? "", /REWORK ITERATION/, "the first pass is not a rework");
+    const rework = prompts[1] ?? "";
+    assert.match(rework, /=== REWORK ITERATION 2 ===/);
+    assert.match(rework, /Sent back by 'autofactory-code-reviewer' because review_approved=false/);
+    assert.match(rework, /treat it as the change request, not a new task/);
+    // The inbound brief (the reviewer's own report) is still present alongside it.
+    assert.match(rework, /done: autofactory-code-reviewer #1/);
+    // And the inventory facts survive the rewind, so it amends rather than recreates.
+    assert.match(rework, /flag_key: enable-x/);
+  });
+
+  it("8. a loop trigger does not leak into the next node's preamble", async () => {
+    // The trigger is consumed once, by the node the loop edge re-entered. The
+    // metrics author also runs twice, but via a FORWARD edge — it must not be told
+    // the reviewer sent it back.
+    const runner = new FakeRunner(
+      reworkScript([{ review_approved: "false" }, { review_approved: "true", risk_level: "low" }]),
+    );
+    await walkGraph(buildChain(), runner, { PR_NUMBER: "1" });
+    const metricsRework = (runner.promptsByKey[KEYS.metrics] ?? [])[1] ?? "";
+    assert.match(metricsRework, /=== REWORK ITERATION 2 ===/, "it is still iteration 2");
+    assert.doesNotMatch(metricsRework, /Sent back by/, "but nothing sent it back");
+    assert.match(metricsRework, /The brief below explains what to change/, "generic wording instead");
+  });
+
+  it("9. a rework that creates a DIFFERENT flag is caught by the orphan guard", async () => {
     // Phase 3 instructs the implementer to amend (use_existing_flag/add_variation)
     // on a rework. If it creates a second flag instead, the never-rewound
     // inventory exposes the orphan and the run reports INCOMPLETE, not success.
