@@ -604,7 +604,14 @@ async function run(opts: CliOptions): Promise<number> {
         console.log(`⚠ release intent in ${manifestRel} needs attention (Beacon will HOLD the release): ${issues.join("; ")}`);
       }
     } catch (e) {
-      console.log(`⚠ could not validate ${manifestRel} (non-fatal): ${e instanceof Error ? e.message : e}`);
+      // Non-fatal by design (this check is advisory), but say what it costs: Beacon
+      // SKIPS a manifest it cannot parse, so an unfixed file means the flag never
+      // releases. The manifest is machine-written, so reaching here usually means a
+      // human edited it by hand.
+      console.log(
+        `⚠ could not validate ${manifestRel} (non-fatal here, but Beacon will SKIP an unparseable ` +
+          `manifest at deploy time and the flag will never release): ${e instanceof Error ? e.message : e}`,
+      );
     }
   }
 
