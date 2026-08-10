@@ -31,8 +31,12 @@ import type { NodeRun } from "@auto-factory/shared";
  * v2 added `grants` (cumulative loop-budget grants) and `base`. Both are load-bearing:
  * a v2 journal read by a v1 build would silently drop the grants and then diverge
  * mid-replay, which is a confusing failure rather than a clean refusal.
+ *
+ * v3 added `haltedAt.exhaustedEdges`, which bounds what a grant may target. A v3 journal
+ * read by a v2 build would accept a grant that build cannot validate, so the same
+ * reasoning applies.
  */
-export const WALK_STATE_VERSION = 2;
+export const WALK_STATE_VERSION = 3;
 
 const FILE_NAME = "autofactory-walk-state.json";
 
@@ -62,8 +66,20 @@ export interface WalkState {
    * took and report it as divergence, capping grant-and-feedback at one round.
    */
   grants?: Record<string, number>;
-  /** Why the walk stopped, for the resume hint. */
-  haltedAt: { kind: "pending-approval" | "loop-exhausted"; node: string };
+  /**
+   * Why the walk stopped. `exhaustedEdges` (keys `${source}→${target}`) are the loop
+   * edges whose budget ENDED this walk — the only edges a resume grant may target.
+   *
+   * Deliberately not every edge that spent its budget: an ADVISORY loop that exhausted
+   * and fell through has recorded downstream work in this journal, so granting it more
+   * budget would mean re-running it and invalidating everything after — a partial
+   * re-run, not a resume. There is no correct result to compute, so it is refused.
+   */
+  haltedAt: {
+    kind: "pending-approval" | "loop-exhausted";
+    node: string;
+    exhaustedEdges?: string[];
+  };
   /** `WalkResult.runs` verbatim — the replay journal. */
   runs: NodeRun[];
   at: string;
@@ -239,6 +255,54 @@ export function validateWalkState(state: WalkState | undefined, keys: WalkStateK
     };
   }
   return { ok: true, state };
+}
+
+/**
+ * The loop edges a resume may grant extra budget to: those whose exhaustion ended the
+ * saved walk. Empty for a gate halt — nothing was blocked by budget, so nothing is
+ * grantable.
+ */
+export function grantableEdges(state: WalkState): Set<string> {
+  return new Set(state.haltedAt.exhaustedEdges ?? []);
+}
+
+export type GrantCheck = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Validate a resume's requested grants against what the saved walk actually halted on.
+ *
+ * This is what keeps the walker's UNIFORM application of prior grants correct. A grant
+ * confined to the halting edge can only change the decision at the frontier: that edge's
+ * first budget-block IS the halt, so at every earlier journal position its traversal
+ * count was already below the cap and raising the cap changes nothing. Allow a grant on
+ * any other edge and that stops being true — replay re-derives a loop the recorded walk
+ * fell through, reports it as divergence, and (because the journal is kept and every
+ * invalidation key still matches) keeps re-diverging on every later attempt.
+ */
+export function validateGrants(state: WalkState, grants: Record<string, number>): GrantCheck {
+  const requested = Object.keys(grants);
+  if (requested.length === 0) return { ok: true };
+  const grantable = grantableEdges(state);
+  const bad = requested.filter((e) => !grantable.has(e));
+  if (bad.length === 0) return { ok: true };
+  const asFlag = (edge: string) => edge.replace("→", ":");
+  if (grantable.size === 0) {
+    return {
+      ok: false,
+      reason:
+        `the saved walk stopped at ${state.haltedAt.kind === "pending-approval" ? "an approval gate" : "a loop"} ` +
+        `('${state.haltedAt.node}') with no loop budget exhausted, so there is nothing to grant. ` +
+        `Resume without --grant-visits.`,
+    };
+  }
+  return {
+    ok: false,
+    reason:
+      `--grant-visits ${bad.map(asFlag).join(", ")} does not name a loop edge that ended the saved walk. ` +
+      `Grantable: ${[...grantable].map(asFlag).join(", ")}. ` +
+      `An advisory loop that already fell through cannot be topped up — its downstream work is in the journal, ` +
+      `so re-running it would invalidate the rest. Start a fresh run for that.`,
+  };
 }
 
 /** Sum two grant maps; used to carry a resume's new grant into the saved state. */

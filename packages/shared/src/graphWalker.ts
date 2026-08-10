@@ -990,9 +990,18 @@ export async function walkGraph(
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
-        // Prior grants apply everywhere (so replay re-derives the original
-        // decisions); a NEW grant applies only from the frontier on. The hard cap
-        // still clamps the total, so a grant raises a ceiling but never removes it.
+        // Prior grants apply everywhere (so replay re-derives the original decisions); a
+        // NEW grant applies only from the frontier on. The hard cap still clamps the
+        // total, so a grant raises a ceiling but never removes it.
+        //
+        // Applying prior grants UNIFORMLY across the journal is only sound because the
+        // caller bounds a grant to the edge whose exhaustion ended the walk (see
+        // walkState.ts `validateGrants`). For that edge the first budget-block IS the
+        // halt, so at every earlier position its traversal count was already below the
+        // cap and raising the cap changes no decision; traversal counts only increase, so
+        // there is no second case. Permit a grant on any other edge and this breaks:
+        // replay re-derives a loop the recorded walk fell through and reports it as
+        // divergence, permanently.
         const priorGrant = Math.max(0, Math.floor(resume?.priorExtraVisits?.[ek] ?? 0));
         const newGrant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
         const grant = priorGrant + newGrant;

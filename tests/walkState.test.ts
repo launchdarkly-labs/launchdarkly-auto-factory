@@ -75,15 +75,16 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
   });
 
   it("a journal from an older schema version is REFUSED, not misread", () => {
-    // v2 added `grants` and `base`. A v1 journal read as if it were v2 would silently
-    // carry no grants and then diverge mid-replay — a confusing failure instead of a
-    // clean refusal. (Written as a raw file: writeWalkState always stamps the current
-    // version, so only an older build could have produced this.)
+    // Each bump added a load-bearing field (v2: grants + base, v3: exhaustedEdges). An
+    // older journal read as if it were current would silently lose one and then either
+    // diverge mid-replay or accept a grant it can't validate — confusing failures instead
+    // of a clean refusal. Written raw, since writeWalkState always stamps the current
+    // version. Deliberately relative to the constant so a future bump doesn't break it.
     const dir = repo();
     writeFileSync(
       walkStatePath(dir),
       JSON.stringify({
-        version: 1,
+        version: WALK_STATE_VERSION - 1,
         graphKey: "g",
         configStamp: "cfg123",
         head: "sha1",
@@ -103,7 +104,10 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
       base: "main",
     });
     assert.equal(r.ok, false);
-    assert.match((r as { reason: string }).reason, /version 1, this build expects 2/);
+    assert.match(
+      (r as { reason: string }).reason,
+      new RegExp(`version ${WALK_STATE_VERSION - 1}, this build expects ${WALK_STATE_VERSION}`),
+    );
   });
 
   it("a corrupt file reads as absent rather than throwing", () => {

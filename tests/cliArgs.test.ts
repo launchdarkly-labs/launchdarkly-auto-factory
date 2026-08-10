@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { EXIT, WALK_STATE_VERSION, parseArgs, validateWalkState } from "@auto-factory/phase1-cli";
+import {
+  EXIT,
+  WALK_STATE_VERSION,
+  type WalkState,
+  grantableEdges,
+  parseArgs,
+  validateGrants,
+  validateWalkState,
+} from "@auto-factory/phase1-cli";
 
 describe("autofactory CLI args", () => {
   it("defaults: graph, base, cwd root, no approvals, not dry-run", () => {
@@ -230,5 +238,78 @@ describe("autofactory CLI args — --flag=value", () => {
     const o = ok(["run", "--graph", "g2", "--resume", "--feedback", "narrow the flag"]);
     assert.equal(o.graphKey, "g2");
     assert.equal(o.feedback, "narrow the flag");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A grant may only target a loop edge whose exhaustion ENDED the saved walk. This is
+// what keeps the walker's uniform application of prior grants correct — and the case
+// below is the exact sequence a review found producing permanent divergence.
+// ---------------------------------------------------------------------------
+describe("resume grants are bounded to the halting edge", () => {
+  const state = (haltedAt: WalkState["haltedAt"]): WalkState => ({
+    version: WALK_STATE_VERSION,
+    graphKey: "g",
+    configStamp: "cfg",
+    head: "sha",
+    treeHash: "tree",
+    policyMode: "always",
+    base: "main",
+    haltedAt,
+    runs: [{ configKey: "n", status: "completed", output: "o", tags: {}, iteration: 1 }],
+    at: "2026-08-10T00:00:00.000Z",
+  });
+  const exhausted = state({
+    kind: "loop-exhausted",
+    node: "autofactory-code-reviewer",
+    exhaustedEdges: ["autofactory-code-reviewer→autofactory-flag-implementer"],
+  });
+  const gated = state({ kind: "pending-approval", node: "autofactory-flag-implementer" });
+
+  it("allows a grant on the edge that ended the walk", () => {
+    const r = validateGrants(exhausted, { "autofactory-code-reviewer→autofactory-flag-implementer": 1 });
+    assert.equal(r.ok, true);
+  });
+
+  it("allows a resume with no grant at all, whatever the halt", () => {
+    assert.equal(validateGrants(exhausted, {}).ok, true);
+    assert.equal(validateGrants(gated, {}).ok, true);
+  });
+
+  it("REFUSES a grant when the walk halted at a gate — nothing was budget-blocked", () => {
+    // The repro: an advisory loop spends its budget mid-walk and falls through, the walk
+    // later halts at a gate, and the human grants the advisory edge because the run
+    // warned about it. Previously accepted and persisted, which made every later resume
+    // diverge with "the graph changed" — unrecoverable short of a fresh run.
+    const r = validateGrants(gated, { "autofactory-metrics-author→autofactory-metrics-author": 1 });
+    assert.equal(r.ok, false);
+    assert.match((r as { reason: string }).reason, /nothing to grant/);
+    assert.match((r as { reason: string }).reason, /approval gate/);
+  });
+
+  it("REFUSES a grant on an edge other than the one that ended the walk, and says what is grantable", () => {
+    const r = validateGrants(exhausted, { "autofactory-metrics-author→autofactory-metrics-author": 1 });
+    assert.equal(r.ok, false);
+    const reason = (r as { reason: string }).reason;
+    // Message uses the CLI's own colon syntax so it can be copied straight back.
+    assert.match(reason, /autofactory-metrics-author:autofactory-metrics-author/);
+    assert.match(reason, /Grantable: autofactory-code-reviewer:autofactory-flag-implementer/);
+    assert.match(reason, /cannot be topped up/);
+  });
+
+  it("REFUSES when one of several grants is ungrantable", () => {
+    const r = validateGrants(exhausted, {
+      "autofactory-code-reviewer→autofactory-flag-implementer": 1,
+      "a→b": 1,
+    });
+    assert.equal(r.ok, false);
+    assert.match((r as { reason: string }).reason, /a:b/);
+  });
+
+  it("a pre-v3 halt (no exhaustedEdges) grants nothing rather than everything", () => {
+    // Forward-degrades safely: an older journal can't justify a grant, so it refuses.
+    const legacy = state({ kind: "loop-exhausted", node: "n" });
+    assert.equal(validateGrants(legacy, { "a→b": 1 }).ok, false);
+    assert.equal(grantableEdges(legacy).size, 0);
   });
 });

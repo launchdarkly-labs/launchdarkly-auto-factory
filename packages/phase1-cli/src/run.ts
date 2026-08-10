@@ -66,6 +66,7 @@ import {
   computeTreeHash,
   mergeGrants,
   readWalkState,
+  validateGrants,
   validateWalkState,
   type WalkStateKeys,
   writeWalkState,
@@ -353,6 +354,14 @@ async function run(opts: CliOptions): Promise<number> {
       console.error("   Run again without --resume to start a fresh walk.");
       return EXIT.USAGE;
     }
+    // A grant may only target a loop edge whose exhaustion ENDED the saved walk. Any
+    // other edge is incoherent to grant (see validateGrants) and would make every later
+    // resume diverge, so refuse before doing any work.
+    const grantCheck = validateGrants(check.state, opts.grantVisits);
+    if (!grantCheck.ok) {
+      console.error(`⛔ cannot resume: ${grantCheck.reason}`);
+      return EXIT.USAGE;
+    }
     const grants = Object.entries(opts.grantVisits);
     priorGrants = check.state.grants ?? {};
     resume = {
@@ -436,7 +445,13 @@ async function run(opts: CliOptions): Promise<number> {
     const halt = walk.pendingApproval
       ? ({ kind: "pending-approval", node: walk.pendingApproval.node } as const)
       : walk.loopExhausted
-        ? ({ kind: "loop-exhausted", node: walk.loopExhausted.node } as const)
+        ? ({
+            kind: "loop-exhausted",
+            node: walk.loopExhausted.node,
+            // Only the edges that ENDED this walk — not `loopBudgetSpent`, which includes
+            // advisory loops that fell through and whose downstream work is recorded.
+            exhaustedEdges: walk.loopExhausted.exhausted.map((e) => `${e.source}→${e.target}`),
+          } as const)
         : undefined;
     if (walk.replayDiverged) {
       // Left in place, NOT deleted: the cause may be reversible (a served-graph edit
