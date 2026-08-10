@@ -33650,6 +33650,15 @@ function describeLoopExhausted(info) {
   }).join("; ");
   return `loop did not converge at '${info.node}'; ${edges}. The chain could not advance within budget.`;
 }
+function withFreshRouting(accumulated, own) {
+  const out = {};
+  for (const [k, v] of Object.entries(accumulated))
+    if (!ROUTING_TAGS.has(k))
+      out[k] = v;
+  for (const [k, v] of Object.entries(own))
+    out[k] = v;
+  return out;
+}
 function tagsMatch(tags, cond) {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
 }
@@ -33920,11 +33929,13 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     const budgetBlocked = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
+      const isLoop = handoffNumber(h, "max_visits") !== void 0;
+      const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
       const require2 = handoffTags(h, "require_tags");
-      if (require2 && !tagsMatch(accumulatedTags, require2))
+      if (require2 && !tagsMatch(matchAgainst, require2))
         continue;
       const skip = handoffTags(h, "skip_if_tags");
-      if (skip && tagsMatch(accumulatedTags, skip))
+      if (skip && tagsMatch(matchAgainst, skip))
         continue;
       const below = handoffNumber(h, "loop_if_judge_below");
       if (below !== void 0) {

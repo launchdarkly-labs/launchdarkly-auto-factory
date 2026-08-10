@@ -22,7 +22,10 @@
  *     re-entered node re-runs, and its routing tags are rewound to the state
  *     before it last ran (facts/inventory persist). Termination is guaranteed by
  *     the per-edge cap plus a run-level backstop. An UNMET loop edge is treated
- *     as convergence, not a stall — only unmet forward edges stall the chain.
+ *     as convergence, not a stall — only unmet forward edges stall the chain. A loop
+ *     edge's ROUTING conditions are matched against the just-completed run's OWN
+ *     tags, so a stale verdict can't re-fire the loop; FACT conditions may still
+ *     come from upstream.
  *     SCOPE: `edgeCounts` below is process-local, so the budget bounds ONE walk,
  *     not one PR — every re-run starts fresh. See the README's scope caveat.
  *
@@ -301,6 +304,25 @@ export function describeLoopExhausted(info: LoopExhaustedInfo): string {
     })
     .join("; ");
   return `loop did not converge at '${info.node}'; ${edges}. The chain could not advance within budget.`;
+}
+
+/**
+ * `accumulated`, but with every ROUTING tag replaced by what the just-completed run
+ * emitted — so a routing tag the run didn't emit reads as ABSENT rather than as its
+ * stale accumulated value. Fact tags pass through untouched, since they are never
+ * rewound and legitimately originate upstream.
+ *
+ * Used only for LOOP-edge conditions: re-firing a loop on a verdict the source node
+ * didn't repeat costs a full live iteration and mis-attributes the reason.
+ */
+function withFreshRouting(
+  accumulated: Record<string, string>,
+  own: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(accumulated)) if (!ROUTING_TAGS.has(k)) out[k] = v;
+  for (const [k, v] of Object.entries(own)) out[k] = v;
+  return out;
 }
 
 /** All key/value pairs in `cond` are present and equal in `tags`. */
@@ -874,10 +896,22 @@ export async function walkGraph(
     const budgetBlocked: LoopExhaustedInfo["exhausted"] = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
+      const isLoop = handoffNumber(h, "max_visits") !== undefined;
+      // A LOOP edge's ROUTING conditions must be satisfied by the just-completed
+      // run's OWN tags, not by whatever is left in accumulatedTags.
+      //
+      // Why: routing tags are exactly the ones that go stale (it's why they're
+      // rewound). Matching a loop condition against accumulatedTags means a verdict
+      // from iteration 1, re-overlaid by the rewind, can re-fire the loop when the
+      // node that owns that verdict said nothing this time — burning a full live
+      // iteration per pass and then attributing it to a critique nobody made. FACT
+      // tags are exempt: they're never rewound and legitimately come from upstream
+      // nodes, so a loop edge may still gate on e.g. flag_ready.
+      const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
       const require = handoffTags(h, "require_tags");
-      if (require && !tagsMatch(accumulatedTags, require)) continue;
+      if (require && !tagsMatch(matchAgainst, require)) continue;
       const skip = handoffTags(h, "skip_if_tags");
-      if (skip && tagsMatch(accumulatedTags, skip)) continue;
+      if (skip && tagsMatch(matchAgainst, skip)) continue;
       // Quality gate: take this edge only when the just-completed node scored BELOW
       // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
       // not taken (an unsampled or broken judge must never trigger rework).

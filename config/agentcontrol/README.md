@@ -222,6 +222,20 @@ The re-entered node's rework preamble names the score and the judge
 carries the judge's **reasoning** as additional guidance — the one piece of feedback
 that is genuinely not already in the inbound brief.
 
+**A loop edge's routing conditions must be met by the run that just finished.** A
+`require_tags`/`skip_if_tags` condition on a *routing* tag (`production: "llm"`) is
+matched against the source node's own emitted tags, not against everything
+accumulated so far. Otherwise a rejection from iteration 1 — which the rewind
+deliberately overlays as the trigger — could re-fire the loop on a later pass where
+the reviewer emitted nothing, spending a full iteration and then blaming a critique
+nobody made. Conditions on *fact* tags (`production: "tool"`, e.g. `flag_ready`) are
+exempt: they are never rewound and legitimately originate upstream.
+
+One imprecision this leaves: if the verdict-producing node goes silent on the final
+pass, `walk.tags` still carries the earlier verdict, so the run reports REJECTED
+rather than "no verdict recorded". Wrong label, right outcome — nothing reports
+success.
+
 An unmet loop edge is **convergence, not a stall.** When a `max_visits` edge's
 conditions don't pass, the walker treats it like an intentional `skip_if_tags`
 short-circuit rather than a blocked chain — so giving a previously-terminal node a

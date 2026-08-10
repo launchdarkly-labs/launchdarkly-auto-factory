@@ -241,14 +241,72 @@ describe("routing contract: verdict-driven rework loop", () => {
     ]);
   });
 
-  it("5. a reviewer that emits no verdict on iteration 2 exhausts rather than passing silently", async () => {
-    // The rejection overlaid onto the loop target survives (accumulatedTags is
-    // only rewound ON traversal), so a silent reviewer re-fires the loop and
-    // burns the budget. The failure direction is exhaustion, never false success.
+  it("5. a reviewer that emits no verdict on iteration 2 does NOT re-fire the loop", async () => {
+    // A loop edge's routing conditions match the just-completed run's OWN tags, so
+    // the iteration-1 rejection that the rewind overlaid cannot re-trigger rework
+    // when the reviewer said nothing this pass.
+    //
+    // This used to burn a second full live iteration (four nodes, real LaunchDarkly
+    // writes) and then attribute it to a critique the reviewer never made — the
+    // rework preamble read "Sent back by 'code-reviewer' because
+    // review_approved=false" on a pass where it produced no verdict at all.
     const w = await runShape(reworkScript([{ review_approved: "false" }, {}]));
-    assert.equal(w.loopExhausted?.reason, "budget");
-    assert.equal(countOf(w, KEYS.flag), 2);
-    assert.notEqual(decide(w).apply, true);
+    assert.equal(countOf(w, KEYS.flag), 2, "one rework, then it stopped");
+    assert.equal(w.loopExhausted, undefined, "no budget burned chasing a stale verdict");
+    assert.equal(w.stalledAt, undefined, "an unmet loop edge is convergence, not a stall");
+    // Non-green either way. Known imprecision: the REASON is the stale rejection
+    // rather than "no verdict", because walk.tags still carries the overlaid value
+    // from iteration 1. Wrong label, right outcome — nothing reports success.
+    const d = decide(w);
+    assert.equal(d.apply, false);
+    assert.equal(d.noop, false);
+  });
+
+  it("5b. a loop edge may still gate on an upstream FACT tag across iterations", async () => {
+    // The freshness rule is scoped to ROUTING tags. Fact tags are never rewound and
+    // legitimately come from other nodes, so requiring the reviewer to re-emit
+    // `flag_ready` (which only the implementer sets) would break real configs.
+    const factLoop = (): AgentGraphDefinition => {
+      const flagValue: LDAgentGraphFlagValue = {
+        root: KEYS.research,
+        edges: {
+          [KEYS.research]: [{ key: KEYS.flag }],
+          [KEYS.flag]: [{ key: KEYS.review }],
+          // Loops while a FACT set by the implementer holds, exiting on the verdict.
+          [KEYS.review]: [
+            {
+              key: KEYS.flag,
+              handoff: { max_visits: 1, require_tags: { flag_ready: "true" }, skip_if_tags: { review_approved: "true" } },
+            },
+          ],
+        },
+      };
+      const cfg = (key: string): LDAIAgentConfig =>
+        ({
+          key,
+          enabled: true,
+          instructions: `instructions for ${key}`,
+          model: { name: "Anthropic.claude-sonnet-4-6" },
+          createTracker: () => ({}) as unknown as LDAIConfigTracker,
+        }) as LDAIAgentConfig;
+      const configs = Object.fromEntries(Object.values(KEYS).map((k) => [k, cfg(k)]));
+      return new AgentGraphDefinition(
+        flagValue,
+        AgentGraphDefinition.buildNodes(flagValue, configs),
+        true,
+        () => ({}) as unknown as LDGraphTracker,
+      );
+    };
+    const w = await walkGraph(
+      factLoop(),
+      new FakeRunner({
+        [KEYS.flag]: { tags: { flag_ready: "true" } },
+        [KEYS.review]: [{ tags: {} }, { tags: { review_approved: "true" } }],
+      }),
+      { PR_NUMBER: "1" },
+    );
+    // The reviewer never emits flag_ready, yet the loop fires on the implementer's.
+    assert.equal(countOf(w, KEYS.flag), 2, "the fact-gated loop still works");
   });
 
   it("6a. the walker DOES re-ask the gate on re-entry (a controller that changes its mind can halt)", async () => {
