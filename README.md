@@ -55,9 +55,6 @@ flowchart LR
 
     B4 -->|"code + contract"| D1
     D4 -->|"deploy succeeded"| R1
-    R6 -.->|"learn"| B1
-    R7 -.->|"adjust"| B1
-    R8 -.->|"repair"| B1
 ```
 
 ## The opinion
