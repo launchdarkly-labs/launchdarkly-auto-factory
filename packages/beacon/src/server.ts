@@ -16,7 +16,7 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import { LdClient, findActiveRelease, targetConnection } from "@auto-factory/shared";
+import { type AutomatedRelease, LdClient, findActiveRelease, targetConnection } from "@auto-factory/shared";
 import express, { type Express, type Request, type Response } from "express";
 import { type BeaconConfig, loadBeaconConfig } from "./config.js";
 import { discoverNewReleaseFlags } from "./discovery.js";
@@ -114,6 +114,12 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     store.record(n.service, n.environment, n.sha);
 
     const outcomes: FlagOutcome[] = [];
+    // Set when an idempotency check could not be completed. The response then carries a
+    // RETRIABLE status so the provider redelivers — which is the retry mechanism for
+    // everything else here too, and which the state store's two-deep history exists to
+    // make safe (a re-POST of the same SHA re-diffs the same range and rediscovers the
+    // flags we skipped; anything that did release comes back as `already_running`).
+    let guardUnverifiable = false;
     for (const flag of discovered) {
       const scope = flag.scope ?? "frontend";
       const decision = decideScope(scope, service.side);
@@ -140,8 +146,31 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       }
       try {
         // Idempotency: a re-delivered notification must not double-trigger.
-        // Best-effort check (on read failure, proceed to trigger).
-        const active = await findActiveRelease(ld, flag.flagKey, n.environment).catch(() => null);
+        //
+        // FAIL CLOSED. This was `.catch(() => null)`, which answered the question "does
+        // this flag already have an active release?" with "no" whenever the read failed —
+        // and then performed a write. That is the destructive branch: the read fails
+        // precisely during rate limiting and outages, which is exactly when providers
+        // redeliver. Skipping and asking for a redelivery risks a delayed release; guessing
+        // "none" risks a SECOND concurrent release on a live flag, and (via a `noop`
+        // result) repointing child flags to a variation the running release may still
+        // revert.
+        let active: AutomatedRelease | null;
+        try {
+          active = await findActiveRelease(ld, flag.flagKey, n.environment);
+        } catch (e) {
+          guardUnverifiable = true;
+          console.warn(
+            `[beacon] idempotency check failed for '${flag.flagKey}' — release NOT started (retriable): ${String(e)}`,
+          );
+          outcomes.push({
+            flag: flag.flagKey,
+            scope,
+            action: "error",
+            detail: `idempotency check failed — release NOT started; redeliver this notification to retry: ${String(e)}`,
+          });
+          continue;
+        }
         if (active) {
           outcomes.push({ flag: flag.flagKey, scope, action: "already_running", detail: { releaseId: active.id } });
           onReleaseStarted(flag.flagKey, n.environment); // re-attach monitoring (e.g. after a Beacon restart)
@@ -187,7 +216,10 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     }
 
     return {
-      status: 200,
+      // 503 when any idempotency check could not be completed: the work is unfinished and
+      // redelivery is how it gets retried. Answering 200 would tell the provider the
+      // notification was handled, stranding those flags until a manual re-POST.
+      status: guardUnverifiable ? 503 : 200,
       body: {
         service: n.service,
         environment: n.environment,

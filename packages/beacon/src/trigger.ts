@@ -310,6 +310,12 @@ export async function triggerRelease(
   // The policy carries one value for the whole set while the API is per-metric, so this
   // is a fan-out. With no policy there is nothing to inherit, so keep the previous
   // default (true) rather than trading known behaviour for an unknown server-side one.
+  // Default stays AUTO-ROLLBACK when the choice is unknown: reverting to a known-good
+  // variation is the safer direction for users, and a paused release here has no pager —
+  // `monitorRelease` writes to the console and nothing else. But when drift is what hid the
+  // choice, an absent field is evidence of a RENAME rather than of "not configured", so the
+  // run must say that a configured pause-and-wait may have been overridden.
+  const rollbackUncertain = policyRead.status === "ok" && policyRead.rollbackChoiceUncertain === true;
   const autoRollback = policy?.rollbackOnRegression ?? true;
   const metricMonitoringPreferences: Record<string, { autoRollback: boolean }> = {};
   for (const m of metrics) metricMonitoringPreferences[m.key] = { autoRollback };
@@ -335,7 +341,13 @@ export async function triggerRelease(
       : {}),
   });
 
-  const notes = [policyNote, usedDefaults ? "used demo default stages (no overrides or policy stages)" : ""]
+  const rollbackNote =
+    method === "guarded" && metrics.length > 0 && rollbackUncertain
+      ? "the policy's rollback choice could not be read (shape drift) — released with AUTO-ROLLBACK ON; " +
+        "a configured pause-and-wait may have been overridden"
+      : "";
+  if (rollbackNote) console.warn(`auto-factory: ${rollbackNote}`);
+  const notes = [policyNote, rollbackNote, usedDefaults ? "used demo default stages (no overrides or policy stages)" : ""]
     .filter(Boolean)
     .join("; ");
   return {

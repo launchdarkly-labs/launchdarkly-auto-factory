@@ -41,11 +41,16 @@ function fakeGh(listDirRefs: string[]): GitHubClient {
 }
 
 /** Fake LD client covering what triggerRelease + findActiveRelease touch. */
-function fakeLd(activeReleases: Record<string, string>, patches: unknown[]): LdClient {
+function fakeLd(
+  activeReleases: Record<string, string>,
+  patches: unknown[],
+  opts2: { releasesListThrows?: boolean } = {},
+): LdClient {
   return {
     projectKey: "autofactory-demo",
     async request(opts: { path: string }): Promise<{ status: number; ok: boolean; data: unknown }> {
       if (opts.path.includes("/automated-releases")) {
+        if (opts2.releasesListThrows) throw new Error("connection reset");
         const flagKey = opts.path.split("/flags/")[1]?.split("/")[0] ?? "";
         const id = activeReleases[flagKey];
         return { status: 200, ok: true, data: { items: id ? [{ id, status: "in_progress" }] : [] } };
@@ -82,11 +87,14 @@ interface Harness {
   close(): void;
 }
 
-function startHarness(activeReleases: Record<string, string> = {}): Promise<Harness> {
+function startHarness(
+  activeReleases: Record<string, string> = {},
+  ldOpts: { releasesListThrows?: boolean } = {},
+): Promise<Harness> {
   const patches: unknown[] = [];
   const monitored: string[] = [];
   const listDirRefs: string[] = [];
-  const app = createApp(cfg, fakeLd(activeReleases, patches), {
+  const app = createApp(cfg, fakeLd(activeReleases, patches, ldOpts), {
     store: new MemoryDeployStateStore(),
     gh: fakeGh(listDirRefs),
     onReleaseStarted: (flagKey) => monitored.push(flagKey),
@@ -118,8 +126,11 @@ function startHarness(activeReleases: Record<string, string> = {}): Promise<Harn
 describe("Beacon server", async () => {
   const harnesses: Harness[] = [];
   after(() => harnesses.forEach((h) => h.close()));
-  async function harness(activeReleases: Record<string, string> = {}): Promise<Harness> {
-    const h = await startHarness(activeReleases);
+  async function harness(
+    activeReleases: Record<string, string> = {},
+    ldOpts: { releasesListThrows?: boolean } = {},
+  ): Promise<Harness> {
+    const h = await startHarness(activeReleases, ldOpts);
     harnesses.push(h);
     return h;
   }
@@ -210,5 +221,32 @@ describe("Beacon server", async () => {
     const h = await harness();
     assert.equal((await h.post("/flag-releases", { service: "nope", sha: "x" })).status, 400);
     assert.equal((await h.post(`/webhooks/railway?secret=${SECRET}`, { status: "SUCCESS" }, null)).status, 422);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The idempotency guard must FAIL CLOSED. It used to be `.catch(() => null)`, which
+// answered "does this flag already have an active release?" with "no" whenever the read
+// failed — and then performed a write. Read failures cluster during rate limiting and
+// outages, which is exactly when providers redeliver.
+// ---------------------------------------------------------------------------
+describe("beacon: idempotency guard failure", () => {
+  const harnesses: Harness[] = [];
+  after(() => harnesses.forEach((h) => h.close()));
+
+  it("starts NOTHING and answers retriably when the guard read fails", async () => {
+    const h = await startHarness({}, { releasesListThrows: true });
+    harnesses.push(h);
+    const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1", environment: "production" });
+    // 503, not 200: the work is unfinished, and redelivery is how it gets retried.
+    assert.equal(res.status, 503);
+    const outcome = res.json.outcomes[0];
+    assert.equal(outcome.action, "error");
+    assert.match(String(outcome.detail), /NOT started/);
+    assert.match(String(outcome.detail), /redeliver/);
+    // THE DISCRIMINATOR: no write happened. Under `.catch(() => null)` triggerRelease runs
+    // and records a startAutomatedRelease patch, and the status is 200.
+    assert.deepEqual(h.patches, []);
+    assert.deepEqual(h.monitored, []);
   });
 });

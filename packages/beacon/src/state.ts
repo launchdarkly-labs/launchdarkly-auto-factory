@@ -84,8 +84,27 @@ export class FileDeployStateStore extends MemoryDeployStateStore {
     try {
       const raw = JSON.parse(readFileSync(this.file, "utf8")) as Record<string, DeployState>;
       this.states = new Map(Object.entries(raw));
-    } catch {
-      /* no state yet (first run) or unreadable — start empty */
+    } catch (e) {
+      // ENOENT is a first run. ANYTHING ELSE must not read as one.
+      //
+      // Collapsing "no state yet" and "state unreadable" into "start empty" is destructive:
+      // with no state, `resolvePreviousSha` returns undefined, discovery treats EVERY
+      // manifest in .release-flags/ as new, and Beacon re-triggers all of them. For a flag
+      // whose guarded release was already REVERTED by a metric regression, the environment
+      // serves the original variation again — so it is not a no-op, and a guardrail's
+      // rollback gets silently undone.
+      //
+      // Throwing here fails at construction (createApp, before any webhook is served), so an
+      // operator sees it at boot rather than as a mass re-release. Deliberate reset is still
+      // available: delete the file.
+      if ((e as { code?: string }).code === "ENOENT") return;
+      throw new Error(
+        `deploy-state file '${this.file}' exists but could not be read — refusing to start with empty ` +
+          `state, because that would re-trigger every release manifest in the repo. Fix or delete the ` +
+          `file (deleting it deliberately resets to full re-discovery). Cause: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+      );
     }
   }
 

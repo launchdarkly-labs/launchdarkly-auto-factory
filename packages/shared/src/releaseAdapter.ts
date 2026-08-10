@@ -11,6 +11,7 @@
  * Concrete request/response shapes: reference-private/internal-apis/.
  */
 
+import { LdApiError } from "./ldClient.js";
 import type { LdClient, LdResponse } from "./ldClient.js";
 import type { MetricRef, ReleaseKind, Stage } from "./types.js";
 
@@ -154,7 +155,13 @@ const TERMINAL: ReadonlySet<string> = new Set(["completed", "reverted", "monitor
  *    `completed` that repoints child flags. An earlier revision stopped on unknown, which
  *    was a reporting fix that silently cost that observation.
  *  - the idempotency check treats anything not known-TERMINAL as active, so a re-delivered
- *    deploy webhook cannot start a SECOND release on a flag that already has one.
+ *    deploy webhook cannot start a SECOND release on a flag that already has one — PROVIDED
+ *    the listing read succeeds. The caller must fail closed when it throws (skip the flag
+ *    and answer retriably); answering "no active release" on a read error would perform the
+ *    very write the check exists to prevent. Not closed by this: the listing can also be
+ *    briefly, legitimately EMPTY just after a start (eventual consistency), so a redelivery
+ *    arriving seconds later can still double-start. That needs a start ledger or an LD-side
+ *    idempotency token.
  */
 const KNOWN_RUNNING: ReadonlySet<string> = new Set(["in_progress"]);
 
@@ -263,7 +270,20 @@ export function normalizeReleasePolicy(raw: RawReleaseSettings): ReleasePolicy {
  * reported as `unreadable`, not as "no policy".
  */
 export type PolicyRead =
-  | { status: "ok"; policy: ReleasePolicy; note?: string }
+  | {
+      status: "ok";
+      policy: ReleasePolicy;
+      note?: string;
+      /**
+       * The response drifted AND `rollbackOnRegression` is absent from what parsed — so a
+       * configured rollback choice may have been lost rather than never set. The caller
+       * still defaults to auto-rollback (reverting to a known-good variation is the safer
+       * direction for users, and Beacon has no pager to hand a paused release to), but it
+       * must SAY so: silently overriding a pause-and-wait policy is what this whole
+       * tri-state exists to prevent.
+       */
+      rollbackChoiceUncertain?: true;
+    }
   | { status: "absent" }
   | { status: "unreadable"; reason: string };
 
@@ -277,13 +297,25 @@ export async function readReleasePolicy(
   ld: LdClient,
   flagKey: string,
   environmentKey: string,
+  /** `sleep` is injectable so tests can assert the backoff without wall-clock waits. */
+  opts: { sleep?: (ms: number) => Promise<void> } = {},
 ): Promise<PolicyRead> {
-  // Retried for the same reason status polling is, only more so: a missed poll is picked
-  // up on the next tick, whereas a missed policy read DISCARDS the org's configured policy
-  // for this release and forces auto-rollback on.
+  // Retried because a missed policy read DISCARDS the org's configured policy for this
+  // release — but with a DIFFERENT shape from the monitor's poll loop, because this runs
+  // inside a webhook handler rather than a detached poller:
+  //
+  //  - short and SPACED. An earlier version reused the monitor's retry count with no sleep
+  //    at all, so six attempts completed in ~0ms and covered only sub-millisecond failures
+  //    while its comment claimed parity with polling (which does sleep).
+  //  - never on an exhausted rate limit. `LdClient.request` already retries 429s with
+  //    backoff, so an `LdApiError` with status 429 means that budget is spent; retrying here
+  //    multiplies a storm by this loop's attempt count for no new information, and the
+  //    handler is awaited per-flag — long stalls push the provider into timing out and
+  //    redelivering, which is the hazard the idempotency guard has to absorb.
+  const doSleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   let res: LdResponse<RawReleaseSettings> | undefined;
   let lastError = "";
-  for (let attempt = 0; attempt <= POLL_ERROR_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < POLICY_READ_MAX_ATTEMPTS; attempt++) {
     try {
       res = await ld.request<RawReleaseSettings>({
         path: releaseSettingsPath(ld.projectKey, flagKey, environmentKey),
@@ -293,7 +325,12 @@ export async function readReleasePolicy(
       break;
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
-      if (attempt === POLL_ERROR_RETRIES) return { status: "unreadable", reason: lastError };
+      // NOTE the coupling: this is only sound while LdClient retries 429s itself. If
+      // RATE_LIMIT_RETRIES ever drops to 0, a single transient 429 would surface here and
+      // this short-circuit would stop covering it.
+      if (e instanceof LdApiError && e.status === 429) return { status: "unreadable", reason: lastError };
+      if (attempt === POLICY_READ_MAX_ATTEMPTS - 1) return { status: "unreadable", reason: lastError };
+      await doSleep(POLICY_READ_BACKOFF_MS * 2 ** attempt);
     }
   }
   if (!res) return { status: "unreadable", reason: lastError || "no response" };
@@ -315,7 +352,16 @@ export async function readReleasePolicy(
   // downgrade an otherwise-EMPTY result; against a parsed one it is a note.
   const drift = describePolicyDrift(res.data, policy);
   if (Object.keys(policy).length > 0) {
-    return { status: "ok", policy, ...(drift ? { note: drift } : {}) };
+    // Keyed on ANY drift, not just drift inside the guarded block: a whole-block rename
+    // shows up as an unknown TOP-LEVEL key while `releaseMethod` still parses, and loses
+    // the rollback choice just as completely.
+    const rollbackChoiceUncertain = drift !== undefined && policy.rollbackOnRegression === undefined;
+    return {
+      status: "ok",
+      policy,
+      ...(drift ? { note: drift } : {}),
+      ...(rollbackChoiceUncertain ? { rollbackChoiceUncertain: true as const } : {}),
+    };
   }
   if (drift) return { status: "unreadable", reason: drift };
   return { status: "absent" };
@@ -325,6 +371,24 @@ export async function readReleasePolicy(
  * Fields the no-policy response is known to carry, so their presence never reads as drift.
  * Extend this as LaunchDarkly adds boilerplate — otherwise `absent` rots into noise.
  */
+/**
+ * Recognized keys INSIDE each config block, mirroring `RawReleaseSettings`. The top-level
+ * allowlist below contains the block names themselves, which means their contents were
+ * never inspected — so a single renamed inner field parsed as "fine" while the value it
+ * carried silently vanished. Same maintenance contract as the top-level set: extend it when
+ * LaunchDarkly adds a field, or reads start carrying a note.
+ */
+const KNOWN_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
+  guardedReleaseConfig: new Set([
+    "rolloutContextKindKey",
+    "metricKeys",
+    "metricGroupKeys",
+    "stages",
+    "rollbackOnRegression",
+  ]),
+  progressiveReleaseConfig: new Set(["rolloutContextKindKey", "stages"]),
+};
+
 const KNOWN_SETTINGS_KEYS = new Set([
   "releaseMethod",
   "releasePolicyKey",
@@ -369,6 +433,22 @@ function describePolicyDrift(raw: RawReleaseSettings, normalized: ReleasePolicy)
         normalized.metricGroupKeys !== undefined ||
         normalized.rollbackOnRegression !== undefined;
       if (!recovered) return `release-settings ${key} had content but nothing in it was recognized`;
+      // Rule 2b: PARTIAL drift inside the block — the case rule 2 cannot see once any one
+      // field parses, and the one that actually matters, because losing
+      // `rollbackOnRegression` silently changes what happens when a metric regresses.
+      const known = KNOWN_CONFIG_KEYS[key];
+      const unknownInner = Object.entries(cfg as Record<string, unknown>)
+        .filter(([k, v]) => !known?.has(k) && v !== "" && v !== null && v !== undefined)
+        .map(([k]) => k);
+      if (unknownInner.length > 0) {
+        return `release-settings ${key} carried unrecognized field(s): ${unknownInner.join(", ")}`;
+      }
+      // Type drift on the destructive axis: normalizeReleasePolicy drops a non-boolean
+      // `rollbackOnRegression` silently, which reads identically to the field being absent.
+      const rollback = (cfg as Record<string, unknown>).rollbackOnRegression;
+      if (rollback !== undefined && typeof rollback !== "boolean") {
+        return `release-settings ${key}.rollbackOnRegression was ${typeof rollback}, not a boolean`;
+      }
     }
   }
   // (3) Populated fields we have never seen. Only non-empty values count, so the
@@ -415,6 +495,14 @@ export async function findActiveRelease(
 
 /** Consecutive poll failures tolerated before monitoring gives up. */
 const POLL_ERROR_RETRIES = 5;
+
+/**
+ * Policy-read attempts and backoff. Deliberately NOT the monitor's numbers: this read runs
+ * inside a webhook handler, so its budget is bounded by how long a provider will wait
+ * before timing out and redelivering.
+ */
+const POLICY_READ_MAX_ATTEMPTS = 3;
+const POLICY_READ_BACKOFF_MS = 250;
 
 /**
  * Poll an automated release until it finishes or the deadline passes.

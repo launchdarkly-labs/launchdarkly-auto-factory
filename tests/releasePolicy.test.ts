@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import type { LdClient } from "@auto-factory/shared";
 import {
+  LdApiError,
   findActiveRelease,
   monitorRelease,
   readReleasePolicy,
@@ -319,5 +320,114 @@ describe("monitorRelease keeps watching an unrecognised (paused) state", () => {
     } as unknown as LdClient;
     const final = await monitorRelease(ld, "production", "r1", { pollMillis: 1, timeoutMillis: 5_000 });
     assert.equal(final.status, "completed", "two transient failures must not strand the completion");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Partial drift INSIDE a config block: the case rule 2 cannot see once any one field
+// parses, and the one that matters, because losing `rollbackOnRegression` changes what
+// happens when a metric regresses.
+// ---------------------------------------------------------------------------
+describe("readReleasePolicy: inner-field drift", () => {
+  const read = async (data: unknown) =>
+    readReleasePolicy(
+      { projectKey: "p", request: async () => ({ status: 200, ok: true, data }) } as unknown as LdClient,
+      "enable-x",
+      "production",
+    );
+
+  it("flags ONE renamed inner field and marks the rollback choice uncertain", async () => {
+    const r = await read({
+      releaseMethod: "guarded-release",
+      guardedReleaseConfig: { rolloutContextKindKey: "user", metricKeys: ["m1"], rollbackBehavior: "pause_and_wait" },
+    });
+    assert.equal(r.status, "ok", "what parsed is still usable");
+    assert.match((r as { note?: string }).note ?? "", /guardedReleaseConfig carried unrecognized field\(s\): rollbackBehavior/);
+    assert.equal((r as { rollbackChoiceUncertain?: true }).rollbackChoiceUncertain, true);
+  });
+
+  it("does NOT mark uncertainty when the rollback choice itself parsed", async () => {
+    // Narrowness matters: additive drift alongside a readable choice is a note, not a
+    // reason to doubt the choice.
+    const r = await read({
+      releaseMethod: "guarded-release",
+      guardedReleaseConfig: { metricKeys: ["m1"], rollbackOnRegression: false, minimumSampleSize: 100 },
+    });
+    assert.equal(r.status, "ok");
+    assert.match((r as { note?: string }).note ?? "", /minimumSampleSize/);
+    assert.equal((r as { rollbackChoiceUncertain?: true }).rollbackChoiceUncertain, undefined);
+    assert.equal(r.status === "ok" && r.policy.rollbackOnRegression, false);
+  });
+
+  it("catches type drift on the rollback field, which normalization drops silently", async () => {
+    const r = await read({
+      releaseMethod: "guarded-release",
+      guardedReleaseConfig: { metricKeys: ["m1"], rollbackOnRegression: "false" },
+    });
+    assert.match((r as { note?: string }).note ?? "", /rollbackOnRegression was string, not a boolean/);
+    assert.equal((r as { rollbackChoiceUncertain?: true }).rollbackChoiceUncertain, true);
+  });
+
+  it("a whole-BLOCK rename also marks uncertainty (top-level unknown key)", async () => {
+    const r = await read({ releaseMethod: "guarded-release", guardedReleaseConfigV2: { metricKeys: ["m1"] } });
+    assert.equal((r as { rollbackChoiceUncertain?: true }).rollbackChoiceUncertain, true);
+  });
+
+  it("known inner fields and empty values stay silent", async () => {
+    const r = await read({
+      releaseMethod: "guarded-release",
+      guardedReleaseConfig: { rolloutContextKindKey: "user", metricKeys: ["m1"], rollbackOnRegression: true, stages: [] },
+    });
+    assert.equal(r.status, "ok");
+    assert.equal((r as { note?: string }).note, undefined);
+  });
+});
+
+describe("readReleasePolicy: retry shape", () => {
+  it("SPACES its retries with doubling backoff", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const ld = {
+      projectKey: "p",
+      request: async () => {
+        if (++calls <= 2) throw new Error("connection reset");
+        return { status: 200, ok: true, data: { releaseMethod: "" } };
+      },
+    } as unknown as LdClient;
+    const r = await readReleasePolicy(ld, "f", "production", { sleep: async (ms) => { sleeps.push(ms); } });
+    assert.equal(r.status, "absent");
+    // The previous loop never slept at all: six attempts in ~0ms, covering only
+    // sub-millisecond failures while claiming parity with the monitor's spaced polling.
+    assert.deepEqual(sleeps, [250, 500]);
+  });
+
+  it("does NOT stack retries on an exhausted 429 budget", async () => {
+    // An LdApiError(429) can only surface after LdClient spent its own backoff, so retrying
+    // here multiplies a storm for no new information — and stalls a webhook handler.
+    let calls = 0;
+    const ld = {
+      projectKey: "p",
+      request: async () => {
+        calls++;
+        throw new LdApiError("GET", "/internal/x", 429, {});
+      },
+    } as unknown as LdClient;
+    const r = await readReleasePolicy(ld, "f", "production", { sleep: async () => {} });
+    assert.equal(r.status, "unreadable");
+    assert.equal(calls, 1, "one attempt, not the full budget");
+  });
+
+  it("gives up after the bounded attempt count on other errors", async () => {
+    let calls = 0;
+    const ld = {
+      projectKey: "p",
+      request: async () => {
+        calls++;
+        throw new Error("reset");
+      },
+    } as unknown as LdClient;
+    const r = await readReleasePolicy(ld, "f", "production", { sleep: async () => {} });
+    assert.equal(r.status, "unreadable");
+    assert.equal(calls, 3);
   });
 });
