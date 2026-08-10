@@ -99,7 +99,8 @@ that moment never gets another.
 | `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | manual re-POST |
 | `waiting` | the fullstack counterpart definitively hasn't deployed (the readiness check is tri-state now; an *incomplete* check no longer reads as "not deployed" — it answers **503 → redelivery**) | the other side's deploy notification re-evaluates; if lost, manual re-POST |
 | `error`, idempotency guard unverifiable | the read that would prove no release is running failed | **503 → provider redelivery** (automatic) |
-| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **none automatic — acked 200** (`server.ts:209-223`) |
+| `error`, readiness check incomplete | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | **503 → provider redelivery** (automatic) |
+| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **503 → provider redelivery** (automatic; a landed patch converges via `already_running`) |
 | paused release resumed late | monitoring stopped at the deadline | manual re-POST → `noop` → children repointed |
 | release completed after the window | same | same |
 
@@ -132,10 +133,10 @@ cleared on a final outcome. What it buys is not the retry mechanism — re-POST 
 but that **no human has to know to invoke it.** Both recoveries above exist and both require
 someone to notice; the ledger is what notices.
 
-Two defects found in round seven belong here rather than to the architecture, and are cheap to
-fix independently of the ledger: the fullstack readiness check fails open into `waiting`
-(a rate-limit blip reads as "the other side hasn't deployed"), and a `triggerRelease` throw is
-acked 200 despite the surrounding comment claiming redelivery covers it. Both should route
+Two defects found in round seven belonged here rather than to the architecture, and are now
+**fixed** independently of the ledger: the fullstack readiness check no longer fails open into
+`waiting` (it is tri-state — an *incomplete* check answers retriably instead of reading as "the
+other side hasn't deployed"), and a `triggerRelease` throw is no longer acked 200. Both route
 through the same retriable-status path the idempotency guard uses; retrying a failed trigger is
 safe by construction, since a write that did land comes back as `already_running`.
 

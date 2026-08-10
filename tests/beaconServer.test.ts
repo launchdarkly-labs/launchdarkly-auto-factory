@@ -44,7 +44,7 @@ function fakeGh(listDirRefs: string[]): GitHubClient {
 function fakeLd(
   activeReleases: Record<string, string>,
   patches: unknown[],
-  opts2: { releasesListThrows?: boolean } = {},
+  opts2: { releasesListThrows?: boolean; patchThrows?: boolean } = {},
 ): LdClient {
   return {
     projectKey: "autofactory-demo",
@@ -73,6 +73,7 @@ function fakeLd(
       };
     },
     async patchFlagSemantic(flagKey: string, env: string, instructions: unknown[]): Promise<unknown> {
+      if (opts2.patchThrows) throw new Error("LaunchDarkly PATCH failed: HTTP 502 — bad gateway");
       patches.push({ flagKey, env, instructions });
       return { status: 200, ok: true, data: {} };
     },
@@ -89,7 +90,7 @@ interface Harness {
 
 function startHarness(
   activeReleases: Record<string, string> = {},
-  ldOpts: { releasesListThrows?: boolean } = {},
+  ldOpts: { releasesListThrows?: boolean; patchThrows?: boolean } = {},
 ): Promise<Harness> {
   const patches: unknown[] = [];
   const monitored: string[] = [];
@@ -128,7 +129,7 @@ describe("Beacon server", async () => {
   after(() => harnesses.forEach((h) => h.close()));
   async function harness(
     activeReleases: Record<string, string> = {},
-    ldOpts: { releasesListThrows?: boolean } = {},
+    ldOpts: { releasesListThrows?: boolean; patchThrows?: boolean } = {},
   ): Promise<Harness> {
     const h = await startHarness(activeReleases, ldOpts);
     harnesses.push(h);
@@ -368,5 +369,42 @@ describe("beacon: idempotency guard failure", () => {
     // and records a startAutomatedRelease patch, and the status is 200.
     assert.deepEqual(h.patches, []);
     assert.deepEqual(h.monitored, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round seven, finding 2: a triggerRelease throw must be RETRIABLE, not acked.
+// The comment above the guard claims redelivery "is the retry mechanism for
+// everything else here too", but a throw from the trigger (LD 5xx, a dropped
+// connection mid-patch — LdClient retries only 429s) yielded action "error"
+// with HTTP 200: the provider marked the delivery handled and the release
+// stranded. Retrying is safe by construction: if the patch landed before the
+// failure surfaced, the redelivery's idempotency check answers already_running.
+// ---------------------------------------------------------------------------
+describe("beacon: release trigger failure", () => {
+  const harnesses: Harness[] = [];
+  after(() => harnesses.forEach((h) => h.close()));
+
+  it("answers RETRIABLY when the trigger throws mid-release", async () => {
+    const h = await startHarness({}, { patchThrows: true });
+    harnesses.push(h);
+    const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
+    // THE DISCRIMINATOR: 503 so the provider redelivers. This was 200.
+    assert.equal(res.status, 503);
+    const outcome = res.json.outcomes[0];
+    assert.equal(outcome.action, "error");
+    assert.match(String(outcome.detail), /redeliver/);
+    assert.match(String(outcome.detail), /HTTP 502/);
+    assert.deepEqual(h.monitored, [], "nothing handed to the monitor for a failed trigger");
+  });
+
+  it("a redelivery that finds the release already running acks 200 (retry converges)", async () => {
+    // The safety-by-construction half: if the failed patch actually landed,
+    // the retried notification must settle rather than loop on 503.
+    const h = await startHarness({ "enable-one": "rel-9" }, { patchThrows: true });
+    harnesses.push(h);
+    const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.outcomes[0].action, "already_running");
   });
 });

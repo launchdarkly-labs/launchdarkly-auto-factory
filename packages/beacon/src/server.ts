@@ -229,8 +229,22 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           detail: result,
         });
       } catch (e) {
-        console.warn(`[beacon] release trigger ERROR for '${flag.flagKey}': ${String(e)}`);
-        outcomes.push({ flag: flag.flagKey, scope, action: "error", detail: String(e) });
+        // RETRIABLE, like the guard above. This used to ack 200, which stranded the
+        // release: an LD 5xx or a dropped connection during the trigger got exactly one
+        // evaluation and no redelivery. Retrying is safe by construction — if the patch
+        // actually landed before the failure surfaced, the redelivery's idempotency
+        // check finds the running release and answers `already_running` instead of
+        // starting a second one.
+        retryNeeded = true;
+        console.warn(
+          `[beacon] release trigger ERROR for '${flag.flagKey}' (retriable — redelivery will retry): ${String(e)}`,
+        );
+        outcomes.push({
+          flag: flag.flagKey,
+          scope,
+          action: "error",
+          detail: `release trigger failed — redeliver this notification to retry: ${String(e)}`,
+        });
       }
     }
     if (outcomes.length) {
