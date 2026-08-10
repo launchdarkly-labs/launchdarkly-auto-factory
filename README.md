@@ -1,7 +1,8 @@
 # LaunchDarkly AutoFactory
 
-An opinionated framework for a software factory built on **LaunchDarkly Release
-Primitives**.
+Every software factory is different. This repository serves as an opinionated example and
+framework for developing a software factory using **LaunchDarkly primitives** alongside
+tools like **Claude Code, Cursor, and Sentry**.
 
 ## Why
 
@@ -60,7 +61,7 @@ flowchart LR
     D4 -->|"Deploy succeeded"| R1
 ```
 
-## The opinion
+## The flow
 
 | Stage | Job | Output |
 |---|---|---|
