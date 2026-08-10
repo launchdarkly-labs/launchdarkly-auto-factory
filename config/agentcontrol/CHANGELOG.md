@@ -49,6 +49,18 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **`tags.json`:** `review_approved` now declares the edge it gates, and its
   description records the exact-equality-vs-normalization gap.
 
+### ✅ Orphan guard extended to metrics
+- **Why:** the guard that stops a rework from reporting success over an abandoned
+  resource only knew about flags — and `metrics-author` is the node the new
+  judge-driven quality loop re-runs. `inventory.metric_keys` is last-write-wins, so if
+  iteration 2 created a different metric, iteration 1's was left in LaunchDarkly,
+  unreported, on a run that still exited 0.
+- `interpretWalk` now returns `orphanedMetricKeys` (a set comparison, since the tag is
+  a comma-separated list — adding a metric on a rework is clean, dropping one is not),
+  `decideApproval` reports INCOMPLETE for it, and `runRecord.orphanedResources` carries
+  flags and metrics. An orphaned flag still takes precedence in the reason, being the
+  more serious of the two.
+
 ### ✅ `loop_if_judge_below` — judge-driven quality retries
 - **Why:** judge scores were computed, recorded to LaunchDarkly, and then **discarded**
   by the walker. They are the only evaluation signal in the pipeline grounded in

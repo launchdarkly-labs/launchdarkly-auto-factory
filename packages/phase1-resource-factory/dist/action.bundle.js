@@ -34161,6 +34161,9 @@ function buildHandoffVerifier(opts) {
 }
 
 // ../shared/dist/approval.js
+function keyList(raw) {
+  return (raw ?? "").split(",").map((k) => k.trim()).filter(Boolean);
+}
 function decideApproval(verdict) {
   const base = { apply: false, noop: false, incomplete: false };
   if (verdict.inconsistentSkip) {
@@ -34175,6 +34178,13 @@ function decideApproval(verdict) {
       ...base,
       incomplete: true,
       reason: `INCOMPLETE \u2014 an earlier iteration created a different flag (${verdict.orphanedFlagKeys.join(", ")}) than the final one (orphaned \u2014 clean up in LaunchDarkly)`
+    };
+  }
+  if (verdict.orphanedMetricKeys.length > 0) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: `INCOMPLETE \u2014 an earlier iteration created metric(s) the final run abandoned (${verdict.orphanedMetricKeys.join(", ")}) (orphaned \u2014 clean up in LaunchDarkly)`
     };
   }
   if (verdict.skipFlagging) {
@@ -34207,7 +34217,11 @@ function interpretWalk(tags, inventory = {}, runs = []) {
   const orphanedFlagKeys = [
     ...new Set(runs.map((r) => r.tags.flag_key).filter((k) => Boolean(k) && k !== finalFlagKey))
   ];
-  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys };
+  const finalMetricKeys = new Set(keyList(inventory.metric_keys));
+  const orphanedMetricKeys = [
+    ...new Set(runs.flatMap((r) => keyList(r.tags.metric_keys)).filter((k) => !finalMetricKeys.has(k)))
+  ];
+  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys, orphanedMetricKeys };
 }
 
 // ../shared/dist/approvalGates.js

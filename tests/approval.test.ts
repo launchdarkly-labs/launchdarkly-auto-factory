@@ -11,6 +11,7 @@ const verdict = (o: Partial<WalkVerdict> = {}): WalkVerdict => ({
   skipFlagging: false,
   inconsistentSkip: false,
   orphanedFlagKeys: [],
+  orphanedMetricKeys: [],
   ...o,
 });
 
@@ -112,5 +113,79 @@ describe("interpretWalk", () => {
   it("no orphan when every iteration used the same flag_key", () => {
     const runs = [{ tags: { flag_key: "flag-x" } }, { tags: { flag_key: "flag-x" } }];
     assert.deepEqual(interpretWalk({}, { flag_key: "flag-x" }, runs).orphanedFlagKeys, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The metrics author is the node a judge-driven quality loop re-runs, and
+// `inventory.metric_keys` is last-write-wins — so an abandoned metric was
+// previously invisible on a run that still exited 0.
+// ---------------------------------------------------------------------------
+describe("orphaned metrics (judge-driven rework on the metrics author)", () => {
+  it("a rework that creates a DIFFERENT metric reports INCOMPLETE, not approved", () => {
+    const runs = [
+      { tags: { metric_keys: "checkout-conv-v1" } },
+      { tags: { metric_keys: "checkout-conv-v2" } }, // iteration 2 replaced it
+    ];
+    const v = interpretWalk(
+      { review_approved: "true" },
+      { flag_key: "enable-x", metric_keys: "checkout-conv-v2" },
+      runs,
+    );
+    assert.deepEqual(v.orphanedMetricKeys, ["checkout-conv-v1"]);
+    const d = decideApproval(v);
+    assert.equal(d.incomplete, true, "an orphaned metric must not report success");
+    assert.equal(d.apply, false);
+    assert.match(d.reason, /checkout-conv-v1/);
+  });
+
+  it("amending the SAME metric across iterations is clean", () => {
+    // What the rework instructions tell the agent to do.
+    const runs = [{ tags: { metric_keys: "checkout-conv" } }, { tags: { metric_keys: "checkout-conv" } }];
+    const v = interpretWalk({ review_approved: "true" }, { metric_keys: "checkout-conv" }, runs);
+    assert.deepEqual(v.orphanedMetricKeys, []);
+    assert.equal(decideApproval(v).apply, true);
+  });
+
+  it("ADDING a metric on the rework is clean; dropping one is not", () => {
+    // metric_keys is a comma-separated LIST, so this is a set comparison, not a
+    // string comparison — a superset must not read as an orphan.
+    const added = interpretWalk(
+      { review_approved: "true" },
+      { metric_keys: "a,b" },
+      [{ tags: { metric_keys: "a" } }, { tags: { metric_keys: "a,b" } }],
+    );
+    assert.deepEqual(added.orphanedMetricKeys, []);
+    assert.equal(decideApproval(added).apply, true);
+
+    const dropped = interpretWalk(
+      { review_approved: "true" },
+      { metric_keys: "b" },
+      [{ tags: { metric_keys: "a,b" } }, { tags: { metric_keys: "b" } }],
+    );
+    assert.deepEqual(dropped.orphanedMetricKeys, ["a"]);
+    assert.equal(decideApproval(dropped).incomplete, true);
+  });
+
+  it("tolerates spacing and duplicates in the tag value", () => {
+    const v = interpretWalk(
+      { review_approved: "true" },
+      { metric_keys: " b , b " },
+      [{ tags: { metric_keys: "a, b" } }, { tags: { metric_keys: " b , b " } }],
+    );
+    assert.deepEqual(v.orphanedMetricKeys, ["a"]);
+  });
+
+  it("an orphaned FLAG still takes precedence in the reported reason", () => {
+    const v = interpretWalk(
+      { review_approved: "true" },
+      { flag_key: "enable-y", metric_keys: "m2" },
+      [{ tags: { flag_key: "enable-x", metric_keys: "m1" } }, { tags: { flag_key: "enable-y", metric_keys: "m2" } }],
+    );
+    assert.deepEqual(v.orphanedFlagKeys, ["enable-x"]);
+    assert.deepEqual(v.orphanedMetricKeys, ["m1"]);
+    const d = decideApproval(v);
+    assert.equal(d.incomplete, true);
+    assert.match(d.reason, /different flag/, "the flag is the more serious orphan");
   });
 });

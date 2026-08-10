@@ -59,6 +59,24 @@ export interface WalkVerdict {
    * orphaned in LaunchDarkly by a re-plan that switched flags. Empty when none.
    */
   orphanedFlagKeys: string[];
+  /**
+   * Metric keys created in earlier iterations that the final set abandons —
+   * orphaned in LaunchDarkly the same way an abandoned flag is.
+   *
+   * This matters because the metrics author is the node a judge-driven quality loop
+   * re-runs (`loop_if_judge_below`), and `inventory.metric_keys` is last-write-wins:
+   * without this, iteration 2 creating a different metric would leave iteration 1's
+   * behind, unreported, on a run that still exits 0.
+   */
+  orphanedMetricKeys: string[];
+}
+
+/** Split a comma-separated tag value (metric_keys) into clean keys. */
+function keyList(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
 }
 
 /** Turn the reviewer's verdict into the run's reported outcome. */
@@ -80,6 +98,13 @@ export function decideApproval(verdict: WalkVerdict): ApprovalDecision {
       ...base,
       incomplete: true,
       reason: `INCOMPLETE — an earlier iteration created a different flag (${verdict.orphanedFlagKeys.join(", ")}) than the final one (orphaned — clean up in LaunchDarkly)`,
+    };
+  }
+  if (verdict.orphanedMetricKeys.length > 0) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: `INCOMPLETE — an earlier iteration created metric(s) the final run abandoned (${verdict.orphanedMetricKeys.join(", ")}) (orphaned — clean up in LaunchDarkly)`,
     };
   }
   if (verdict.skipFlagging) {
@@ -141,5 +166,12 @@ export function interpretWalk(
     ),
   ];
 
-  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys };
+  // Same shape for metrics, but the tag is a comma-separated LIST, so compare sets:
+  // a key any iteration created and the final set no longer names is orphaned.
+  const finalMetricKeys = new Set(keyList(inventory.metric_keys));
+  const orphanedMetricKeys = [
+    ...new Set(runs.flatMap((r) => keyList(r.tags.metric_keys)).filter((k) => !finalMetricKeys.has(k))),
+  ];
+
+  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys, orphanedMetricKeys };
 }

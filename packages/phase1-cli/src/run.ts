@@ -585,7 +585,9 @@ async function run(opts: CliOptions): Promise<number> {
       noop: decision.noop,
       incomplete: decision.incomplete,
     });
-    const orphanedResources = verdict.orphanedFlagKeys;
+    // Flags AND metrics: a judge-driven rework on the metrics author can abandon a
+    // metric exactly the way a re-plan abandons a flag.
+    const orphanedResources = [...verdict.orphanedFlagKeys, ...verdict.orphanedMetricKeys];
     writeRunRecord(root, {
       ...(state.branch ? { branch: state.branch } : {}),
       ...(state.head ? { head: state.head } : {}),
