@@ -65,6 +65,7 @@ import {
 } from "@auto-factory/shared";
 import { type CliOptions, EXIT } from "./args.js";
 import {
+  carryUnconsumedFeedback,
   clearWalkState,
   computeTreeHash,
   appendGrants,
@@ -356,6 +357,12 @@ async function run(opts: CliOptions): Promise<number> {
   let priorGrants: LoopGrant[] = [];
   // Length of the journal replayed this round — the point any NEW grant takes effect.
   let replayedRuns = 0;
+  // The feedback in force this round: newly passed, or re-loaded from the saved state
+  // because no live node has consumed it yet. Persisted again at a halt if it is STILL
+  // unconsumed (see carryUnconsumedFeedback) — without that, the default sequence
+  // (loop-exhausted → grant+feedback → gate halt → approve) silently destroyed the
+  // very guidance --grant-visits insists on.
+  let carriedFeedback: string | undefined;
   if (opts.resume) {
     const check = validateWalkState(readWalkState(root), stateKeys);
     if (!check.ok) {
@@ -391,15 +398,22 @@ async function run(opts: CliOptions): Promise<number> {
     // the frontier (after the replayed runs). Replay then re-derives the original budget
     // decisions exactly, with no assumption about the graph's shape.
     const allGrants = appendGrants(priorGrants, opts.grantVisits, replayedRuns);
+    // A newly passed --feedback wins; otherwise re-inject the saved one, which exists
+    // exactly when no live node has consumed it yet (a gate can halt a granted resume
+    // before the loop target runs — the guidance must survive that round trip).
+    carriedFeedback = opts.feedback ?? check.state.humanFeedback;
     resume = {
       journal: check.state.runs,
       ...(allGrants.length > 0 ? { grants: allGrants } : {}),
-      ...(opts.feedback ? { humanFeedback: opts.feedback } : {}),
+      ...(carriedFeedback ? { humanFeedback: carriedFeedback } : {}),
     };
     console.log(
       `Resuming the walk saved at ${check.state.at}: replaying ${check.state.runs.length} step(s) ` +
         `(no model calls, no duplicate LaunchDarkly writes), then continuing from '${check.state.haltedAt.node}'.` +
-        (grants.length > 0 ? `\n  Extra loop budget: ${grants.map(([k, n]) => `${k} +${n}`).join(", ")}` : ""),
+        (grants.length > 0 ? `\n  Extra loop budget: ${grants.map(([k, n]) => `${k} +${n}`).join(", ")}` : "") +
+        (!opts.feedback && carriedFeedback
+          ? `\n  Re-delivering the saved --feedback (no live step has consumed it yet).`
+          : ""),
     );
   }
 
@@ -500,6 +514,10 @@ async function run(opts: CliOptions): Promise<number> {
           const all = appendGrants(priorGrants, opts.grantVisits, replayedRuns);
           return all.length > 0 ? { grants: all } : {};
         })(),
+        // Feedback nobody consumed this round (no live node ran) rides along, so the
+        // next --resume re-delivers it instead of burning the granted iteration with
+        // a rework preamble and zero human guidance.
+        ...carryUnconsumedFeedback(carriedFeedback, walk.runs.length, replayedRuns),
         haltedAt: halt,
         runs: walk.runs,
       });
@@ -547,6 +565,16 @@ async function run(opts: CliOptions): Promise<number> {
         `Add --resume to replay the ${walk.runs.length} completed step(s) instead of re-running them:`,
         `  autofactory run --graph ${opts.graphKey} --resume ${approveFlags}`,
       );
+      // The hint must name EVERYTHING the next invocation needs. Grants and unconsumed
+      // feedback are saved with the walk state and re-applied automatically, so the
+      // command above is complete — but say so, or the human re-types the feedback
+      // (harmless) or assumes it was lost (it used to be).
+      if ("humanFeedback" in carryUnconsumedFeedback(carriedFeedback, walk.runs.length, replayedRuns)) {
+        lines.push(
+          `Your --feedback was not consumed yet; it is saved with the walk state and will be`,
+          `delivered to the first live step automatically (no need to pass it again).`,
+        );
+      }
     }
     console.log(lines.join("\n"));
     return EXIT.PENDING_APPROVAL;
@@ -602,9 +630,18 @@ async function run(opts: CliOptions): Promise<number> {
     if (!opts.dryRun) {
       const spent = walk.loopExhausted.exhausted[0];
       const grant = spent ? `${spent.source}:${spent.target}=1` : "<source>:<target>=1";
+      // The hint must name EVERYTHING the next invocation needs. The loop target may
+      // be an approval-gated step (the DEFAULT gated step is exactly the reviewer
+      // loop's target), and a resume always re-gates the frontier — without --approve
+      // the resume halts at the gate before any live node runs.
+      const approveHint = [
+        ...new Set([...approvedSteps, ...(spent && gate?.steps.includes(spent.target) ? [spent.target] : [])]),
+      ]
+        .map((s) => ` --approve ${s}`)
+        .join("");
       lines.push(
         `  To give it another pass WITH guidance (replays the completed steps, no duplicate writes):`,
-        `    autofactory run --graph ${opts.graphKey} --resume --grant-visits ${grant} --feedback "what to change"`,
+        `    autofactory run --graph ${opts.graphKey} --resume --grant-visits ${grant} --feedback "what to change"${approveHint}`,
       );
     }
   }

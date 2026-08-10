@@ -39,8 +39,13 @@ import type { LoopGrant, NodeRun } from "@auto-factory/shared";
  * v4 replaced the flat `grants` map with a positional list (`LoopGrant[]`). A v4 journal
  * read by a v3 build would apply every grant uniformly and diverge; a v3 journal read by
  * a v4 build has no positions to honour. Refuse both.
+ *
+ * v5 added `humanFeedback` (a resume's undelivered guidance, carried until a live node
+ * consumes it) and `baseSha` (the resolved base ref's commit, so a moved `origin/main`
+ * invalidates the journal even though the ref NAME still matches). A v5 journal read by
+ * a v4 build would silently drop the feedback and skip the base-commit check.
  */
-export const WALK_STATE_VERSION = 4;
+export const WALK_STATE_VERSION = 5;
 
 const FILE_NAME = "autofactory-walk-state.json";
 
@@ -70,6 +75,18 @@ export interface WalkState {
    * the LoopGrant docs for the shape that failed.
    */
   grants?: LoopGrant[];
+  /**
+   * Human guidance (`--feedback`) that has NOT yet been delivered to any live node.
+   *
+   * The walker hands `humanFeedback` to the first LIVE node only. A resume that
+   * replays the journal and then halts before the frontier runs — the default
+   * shape, since the reviewer loop's target is the default gated step — has
+   * delivered it to nobody. Persisting it here means the next `--resume` re-injects
+   * it automatically; dropping it silently defeated the invariant that a loop grant
+   * requires guidance (`--grant-visits` refuses to travel without `--feedback`).
+   * Cleared (not written) once any live node has consumed it.
+   */
+  humanFeedback?: string;
   /**
    * Why the walk stopped. `exhaustedEdges` (keys `${source}→${target}`) are the loop
    * edges whose budget ENDED this walk — the only edges a resume grant may target.
@@ -309,6 +326,22 @@ export function validateGrants(state: WalkState, grants: Record<string, number>)
       `An advisory loop that already fell through cannot be topped up — its downstream work is in the journal, ` +
       `so re-running it would invalidate the rest. Start a fresh run for that.`,
   };
+}
+
+/**
+ * The feedback a halt must carry into the saved state: whatever was in force this
+ * round (newly passed, or re-loaded from the previous state), IF no live node ran to
+ * consume it. The walker delivers `humanFeedback` to the first LIVE node only, so
+ * "consumed" is exactly "at least one run beyond the replayed journal" — a walk that
+ * replayed everything and halted at the frontier's gate delivered it to nobody.
+ * Spread the result into `writeWalkState`'s argument.
+ */
+export function carryUnconsumedFeedback(
+  feedback: string | undefined,
+  totalRuns: number,
+  replayedRuns: number,
+): { humanFeedback: string } | Record<string, never> {
+  return feedback !== undefined && totalRuns <= replayedRuns ? { humanFeedback: feedback } : {};
 }
 
 /**

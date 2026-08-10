@@ -8,6 +8,7 @@ export {
   type WalkState,
   type WalkStateCheck,
   type WalkStateKeys,
+  carryUnconsumedFeedback,
   clearWalkState,
   computeTreeHash,
   type GrantCheck,
