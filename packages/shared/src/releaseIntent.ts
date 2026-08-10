@@ -87,12 +87,11 @@ function normalizePrerequisites(v: unknown, issues: string[]): { value: IntentPr
 
 /**
  * A calendar date at the START of the string, cleanly terminated (end of string, or
- * followed by `T`/whitespace before a time). This prefix IS the answer — see below.
+ * followed by `T`/whitespace before a time). This prefix IS the answer — never compute a
+ * calendar date from an instant.
  */
 const ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?=$|[T\s])/;
-/** Starts ISO-shaped but may not terminate cleanly (`2026-08-011`). */
-const LOOKS_ISO_RE = /^\d{4}-\d{2}-\d{2}/;
-/** A year-month with no day. V8 parses this in UTC. */
+/** A year-month with no day. Strict, unambiguous, and V8 parses it in UTC. */
 const ISO_YEAR_MONTH_RE = /^\d{4}-\d{2}$/;
 
 /** Is `ymd` a real calendar day? `2026-02-30` is not, and V8 rolls it to March 2. */
@@ -104,80 +103,76 @@ function isRealCalendarDay(ymd: string): boolean {
 /**
  * Parse a notBefore value into ISO YYYY-MM-DD, or report it as an issue.
  *
- * `notBefore` is a CALENDAR DATE, and the calendar date is whatever the human
- * wrote. So when the string carries an ISO date prefix, that prefix is the answer
- * and no reference-frame arithmetic happens at all:
+ * ISO ONLY. `YYYY-MM-DD` (optionally followed by a time and any zone), or `YYYY-MM`.
+ * Anything else — `Aug 1 2026`, `1/12/2026`, RFC 1123 — is refused, which holds the
+ * release and says so on the PR.
  *
- *   2026-08-01                  → 2026-08-01
- *   2026-08-01T00:00:00Z        → 2026-08-01
- *   2026-08-01T00:00:00+02:00   → 2026-08-01   (the author meant Aug 1, in +02:00)
- *   2026-08-01 00:00 UTC        → 2026-08-01
- *   2026-08-01T12:00:00         → 2026-08-01
+ * That refusal replaces four successive attempts to HEAL free-form dates, each of which
+ * shipped a way to release EARLY:
  *
- * Three earlier attempts got this wrong by picking a frame to FORMAT in, and each
- * traded one off-by-one-day for another: `toISOString()` shifted "Aug 1 2026" to
- * 07-31 east of UTC; local getters then shifted "2026-08-01T00:00:00Z" to 07-31 west
- * of it; choosing UTC for zone-suffixed strings was wrong for every non-`Z` offset
- * (`+02:00` midnight is 07-31 in UTC); and a word zone (`… UTC`, `… GMT`) wasn't
- * detected as a zone at all, so non-ISO shapes carrying one stayed zone-dependent.
+ *  - formatting via `toISOString()` moved "Aug 1 2026" to 07-31 east of UTC;
+ *  - formatting via local getters then moved "2026-08-01T00:00:00Z" to 07-31 west of it;
+ *  - reading zone-suffixed strings in UTC was wrong for every non-`Z` offset, and word
+ *    zones (`UTC`, `GMT`) weren't detected as zones at all;
+ *  - reinterpreting in UTC and validating the result against digit runs in the input was
+ *    defeated by time tokens — V8 rolls an impossible day onto day 1-3, exactly what an
+ *    hour or minute supplies, so "Feb 30 2026 02:00" healed silently to March 2. That
+ *    heuristic also could not see month-position ambiguity: "1/12/2026" from a D/M/Y
+ *    author became January 12, eleven months early.
  *
- * The rule that ends it: never compute a calendar date from an instant. Read what was
- * written — the ISO prefix where there is one, and for non-ISO a UTC REINTERPRETATION
- * (see below), which recovers the written fields regardless of the frame the string
- * named. Every branch is then identical in every runtime timezone.
- *
- * Both non-prefix branches also validate the parse rather than trusting it, because
- * V8's leniency fails OPEN — it rolls "2026-02-30" to March 2 and reads "Aug 1" as the
- * year 2001, either of which would release EARLIER than intended, silently.
+ * The lesson is that healing a free-form date requires recovering the author's intent from
+ * an ambiguous string, and every shortcut for that fails open. The documented format is
+ * `YYYY-MM-DD` (see INTENT_INSTRUCTIONS); a steward agent's job is to promote free text
+ * into structured fields ON THE PR, where a human can see it — not at deploy time.
  */
 function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coerced: boolean } {
   if (v === undefined || v === null || v === "") return { value: "", coerced: false };
   const raw = String(v).trim();
   const prefix = ISO_DATE_PREFIX_RE.exec(raw)?.[1];
   if (prefix) {
-    // The prefix must be a real day (V8 rolls 2026-02-30 to March 2 rather than
-    // rejecting it) AND the whole string must parse, so trailing junk is refused.
+    // BOTH checks matter: the prefix must be a real day (V8 rolls 2026-02-30 to March 2
+    // rather than rejecting it), AND the whole string must parse, so trailing junk like
+    // "2026-08-10 garbage" or "…T25:00" is refused rather than silently truncated.
     if (isRealCalendarDay(prefix) && !Number.isNaN(new Date(raw).getTime())) {
       return { value: prefix, coerced: prefix !== raw };
     }
-  } else if (LOOKS_ISO_RE.test(raw)) {
-    // ISO-shaped but not cleanly terminated (`2026-08-011`). V8 parses it anyway,
-    // into a zone-dependent instant — so refuse rather than guess.
   } else if (ISO_YEAR_MONTH_RE.test(raw)) {
-    // No day component. Parsed in UTC by spec, so read it back in UTC: deterministic
-    // across zones, and normalises to the first of the month.
+    // Kept deliberately: strict, unambiguous, no rollover exposure, and normalises to the
+    // first of the month. Parsed in UTC by spec, so read back in UTC — deterministic.
     const parsed = new Date(raw);
     if (!Number.isNaN(parsed.getTime())) {
       return { value: parsed.toISOString().slice(0, 10), coerced: true };
     }
-  } else {
-    // Non-ISO ("Aug 1 2026", "Fri, 01 Aug 2026 00:00:00 GMT", "8/1/2026").
-    //
-    // Reinterpreting in UTC recovers the date the author WROTE, whatever frame the
-    // string named — appending " UTC" re-anchors the written fields and overrides any
-    // zone token, so the result is identical in every runtime timezone. That matters
-    // because local-field formatting was only right for ZONELESS input: a string
-    // carrying `GMT`/`UTC`/`EST`/an offset is an instant, and reading its local fields
-    // shifted the date by a day west of UTC. Deliberately vocabulary-free — V8's
-    // accepted zone tokens are implementation-defined (it takes `UT` but rejects
-    // `CEST`), so any regex over them would be a guess about the parser's table.
-    const asWritten = new Date(`${raw} UTC`);
-    if (!Number.isNaN(new Date(raw).getTime()) && !Number.isNaN(asWritten.getTime())) {
-      const iso = asWritten.toISOString().slice(0, 10);
-      // Validate against the numbers actually written, because this branch has no ISO
-      // prefix to check and V8's leniency fails OPEN: "Feb 30 2026" becomes March 2 and
-      // "Aug 1" becomes the year 2001 — both would release EARLIER than intended,
-      // silently. Require the written text to contain the resulting year and day.
-      const written: string[] = raw.match(/\d+/g) ?? [];
-      const year = iso.slice(0, 4);
-      const day = String(Number(iso.slice(8, 10)));
-      const hasYear = written.includes(year);
-      const hasDay = written.some((n) => n.length <= 2 && String(Number(n)) === day);
-      if (hasYear && hasDay) return { value: iso, coerced: iso !== raw };
-    }
   }
-  issues.push(`notBefore '${raw}' is not a parseable date (use YYYY-MM-DD) — treated as unintelligible`);
+  // The "notBefore" prefix is load-bearing: normalizeReleaseIntent flips action auto→hold
+  // on an issue starting with it. Reword this and the fail-closed hold disappears.
+  issues.push(
+    `notBefore '${raw}' is not an ISO date (use YYYY-MM-DD) — treated as unintelligible`,
+  );
   return { value: raw, coerced: false };
+}
+
+/**
+ * Does a `notBefore` still hold the release at `now`?
+ *
+ * ANYWHERE-ON-EARTH: the gate opens once the stated calendar date has begun in the LAST
+ * timezone on Earth (UTC−12), i.e. at `notBefore`T12:00Z. The author's timezone is
+ * unknown and unknowable from a bare date, and `notBefore` forbids EARLY while tolerating
+ * late — so the only safe reading is the latest interpretation.
+ *
+ * The previous comparison (`new Date(notBefore).getTime() > Date.now()`) opened at 00:00
+ * UTC, which is the *earliest* interpretation: an author in Los Angeles writing
+ * `2026-08-10` got a release at 17:00 on Aug 9 their time. That contradicts this module's
+ * contract — an intent must never CAUSE a release, only prevent one.
+ *
+ * Operational caveat worth knowing: Beacon has no scheduler. A held release is only
+ * re-evaluated on the next deploy notification, so `notBefore` means "held until someone
+ * deploys again on or after that date", not "released at midnight".
+ */
+export function notBeforeHolds(notBefore: string, now: number = Date.now()): boolean {
+  if (!notBefore) return false;
+  const AOE_OFFSET_MS = 12 * 60 * 60 * 1000;
+  return new Date(now - AOE_OFFSET_MS).toISOString().slice(0, 10) < notBefore;
 }
 
 /**

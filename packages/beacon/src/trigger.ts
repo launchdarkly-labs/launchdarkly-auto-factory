@@ -18,6 +18,7 @@ import {
   readReleasePolicy,
   latestVariationValue,
   normalizeReleaseIntent,
+  notBeforeHolds,
   startRelease,
   type DiscoveredFlag,
   type LdClient,
@@ -138,7 +139,10 @@ export async function triggerRelease(
       note: `releaseIntent action=${intent.action} — not auto-released${intentContext ? ` (${intentContext})` : ""}`,
     };
   }
-  if (intent.notBefore && new Date(intent.notBefore).getTime() > Date.now()) {
+  // Anywhere-on-Earth: opens at notBefore T12:00Z, once the stated date has begun in the
+  // last timezone. See notBeforeHolds — comparing instants opened at 00:00 UTC, which
+  // released a day early for every author west of UTC.
+  if (intent.notBefore && notBeforeHolds(intent.notBefore)) {
     return {
       flagKey: flag.flagKey,
       method: "held",

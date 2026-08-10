@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
-import { intentIsDefault, intentSkeleton, normalizeReleaseIntent } from "@auto-factory/shared";
+import { intentIsDefault, intentSkeleton, normalizeReleaseIntent, notBeforeHolds } from "@auto-factory/shared";
 
 describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
   it("absent intent → plain auto (legacy manifests unaffected)", () => {
@@ -35,14 +35,19 @@ describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
     assert.match(r.issues.join(" "), /not understood/);
   });
 
-  it("notBefore coerces to ISO; unparseable dates hold (fail-closed)", () => {
+  it("notBefore accepts ISO only; everything else holds (fail-closed)", () => {
     assert.equal(normalizeReleaseIntent({ notBefore: "2026-08-01" }).intent.notBefore, "2026-08-01");
-    const coerced = normalizeReleaseIntent({ notBefore: "Aug 1 2026" });
-    assert.equal(coerced.intent.notBefore, "2026-08-01");
-    assert.equal(coerced.healed, true);
-    const bad = normalizeReleaseIntent({ action: "auto", notBefore: "next month" });
-    assert.equal(bad.intent.action, "hold");
-    assert.match(bad.issues.join(" "), /not a parseable date/);
+    // A datetime keeps its written date; the time is dropped.
+    const withTime = normalizeReleaseIntent({ notBefore: "2026-08-01T09:30:00+02:00" });
+    assert.equal(withTime.intent.notBefore, "2026-08-01");
+    assert.equal(withTime.healed, true);
+    // Free-form dates are NO LONGER healed — four attempts at that all found ways to
+    // release early. They hold, visibly, and the steward promotes them on the PR.
+    for (const freeform of ["Aug 1 2026", "1/12/2026", "Fri, 01 Aug 2026 00:00:00 GMT", "next month"]) {
+      const r = normalizeReleaseIntent({ action: "auto", notBefore: freeform });
+      assert.equal(r.intent.action, "hold", freeform);
+      assert.match(r.issues.join(" "), /not an ISO date/, freeform);
+    }
   });
 
   it("prerequisites: strings coerce to {flagKey, variation:'on'}; variation synonyms map", () => {
@@ -91,32 +96,20 @@ describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
 // ---------------------------------------------------------------------------
 describe("normalizeNotBefore is timezone-independent", () => {
   const MODULE = fileURLToPath(new URL("../packages/shared/dist/releaseIntent.js", import.meta.url));
-  // Every shape the normalizer accepts. A `notBefore` is a CALENDAR DATE, so the
-  // answer is whatever the author wrote — including for offsets and word zones,
-  // which two earlier attempts got wrong in opposite directions.
+  // Every shape the normalizer still accepts: an ISO date, an ISO datetime with any zone
+  // (the written date is read from the prefix, never computed from the instant), and a
+  // year-month. Free-form dates are refused now, covered by the fail-closed matrix below.
   const CASES = [
     "2026-08-01",
-    "Aug 1 2026",
-    "2026-8-1",
     "2026-01-01",
-    "Dec 31 2026",
     "2026-08-01T00:00:00Z",
     "2026-08-01T00:00:00.000Z",
     "2026-08-01T00:00:00+02:00",
     "2026-08-01T09:00:00+10:00",
     "2026-07-31T23:00:00-10:00",
     "2026-08-01 00:00 UTC",
-    "2026-08-01 00:00:00 GMT",
     "2026-08-01T12:00:00",
     "2026-08",
-    // Non-ISO shapes CARRYING A ZONE — the gap the third attempt left open. These are
-    // instants, so local-field formatting shifted them a day west of UTC.
-    "Fri, 01 Aug 2026 00:00:00 GMT",
-    "Aug 1 2026 UTC",
-    "August 1, 2026 00:00 UTC",
-    "Aug 1 2026 EST",
-    "Aug 1 2026 00:00 +02:00",
-    "8/1/2026",
   ];
   // Sign, magnitude, a half-hour offset, and both extremes of the UTC range.
   const ZONES = [
@@ -147,10 +140,7 @@ describe("normalizeNotBefore is timezone-independent", () => {
   it("every accepted date shape yields the same calendar date in all zones", () => {
     const expected = {
       "2026-08-01": "2026-08-01",
-      "Aug 1 2026": "2026-08-01",
-      "2026-8-1": "2026-08-01",
       "2026-01-01": "2026-01-01",
-      "Dec 31 2026": "2026-12-31",
       "2026-08-01T00:00:00Z": "2026-08-01",
       "2026-08-01T00:00:00.000Z": "2026-08-01",
       // Offsets: the author wrote Aug 1. Formatting these in UTC gave 07-31 — the
@@ -159,18 +149,11 @@ describe("normalizeNotBefore is timezone-independent", () => {
       "2026-08-01T09:00:00+10:00": "2026-08-01",
       // …and the date is the one WRITTEN, not the UTC instant: this is Aug 1 09:00Z.
       "2026-07-31T23:00:00-10:00": "2026-07-31",
-      // Word zones were never detected as zones at all, leaving them zone-dependent.
+      // A word zone after an ISO date: the prefix still decides.
       "2026-08-01 00:00 UTC": "2026-08-01",
-      "2026-08-01 00:00:00 GMT": "2026-08-01",
       "2026-08-01T12:00:00": "2026-08-01",
       // No day component: normalised to the first, deterministically.
       "2026-08": "2026-08-01",
-      "Fri, 01 Aug 2026 00:00:00 GMT": "2026-08-01",
-      "Aug 1 2026 UTC": "2026-08-01",
-      "August 1, 2026 00:00 UTC": "2026-08-01",
-      "Aug 1 2026 EST": "2026-08-01",
-      "Aug 1 2026 00:00 +02:00": "2026-08-01",
-      "8/1/2026": "2026-08-01",
     };
     for (const tz of ZONES) {
       assert.deepEqual(notBeforeIn(tz), expected, `notBefore drifted under TZ=${tz}`);
@@ -182,14 +165,18 @@ describe("normalizeNotBefore is timezone-independent", () => {
     // rolls it to March 2 — so a run would have released two days early.
     // "Feb 30 2026" and "Aug 1" are the non-ISO fail-open cases: V8 rolls the former to
     // March 2 and reads the latter as the year 2001 — both release EARLIER than intended.
+    // The last four are the shapes that defeated the digit-run heuristic: V8 rolls an
+    // impossible day onto day 1-3, exactly what an hour or minute token supplies, and
+    // month-position ambiguity is invisible to any such check.
     for (const bad of [
       "2026-02-30",
       "2026-02-30T00:00:00Z",
       "2026-08-011",
       "not a date",
-      "Feb 30 2026",
-      "Aug 1",
-      "2026",
+      "Feb 30 2026 02:00",
+      "Feb 29 2026 01:00",
+      "Sep 31 2026 01:00",
+      "1/12/2026",
     ]) {
       for (const tz of ["UTC", "America/Los_Angeles", "Pacific/Kiritimati"]) {
         const script = `
@@ -226,5 +213,47 @@ describe("normalizeNotBefore is timezone-independent", () => {
       assert.equal(out.action, "hold", `TZ=${tz}`);
       assert.ok(out.issues > 0, `TZ=${tz}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The gate. Comparing instants (`new Date(notBefore) > Date.now()`) opened at 00:00 UTC —
+// the EARLIEST reading — so an author west of UTC got a release on their previous
+// calendar day. Anywhere-on-Earth is the only safe reading of a bare date whose author
+// timezone is unknown: notBefore forbids early and tolerates late.
+// ---------------------------------------------------------------------------
+describe("notBeforeHolds (anywhere-on-earth)", () => {
+  const at = (iso: string) => Date.parse(iso);
+
+  it("opens at notBefore T12:00Z — when the date has begun in the last timezone", () => {
+    assert.equal(notBeforeHolds("2026-08-10", at("2026-08-10T11:59:59Z")), true, "still held");
+    assert.equal(notBeforeHolds("2026-08-10", at("2026-08-10T12:00:00Z")), false, "open");
+  });
+
+  it("does NOT open at 00:00 UTC — the bug this replaces", () => {
+    // The old comparison released here, which is 17:00 on Aug 9 in Los Angeles.
+    assert.equal(notBeforeHolds("2026-08-10", at("2026-08-10T00:00:00Z")), true);
+  });
+
+  it("is never early for any real timezone offset", () => {
+    // For every offset from UTC-12 to UTC+14, the local calendar date at the moment the
+    // gate opens must be >= the stated date. That is the property "never early".
+    const open = at("2026-08-10T12:00:00Z");
+    for (let offsetHours = -12; offsetHours <= 14; offsetHours++) {
+      const localDate = new Date(open + offsetHours * 3600_000).toISOString().slice(0, 10);
+      assert.ok(localDate >= "2026-08-10", `UTC${offsetHours >= 0 ? "+" : ""}${offsetHours} saw ${localDate}`);
+    }
+  });
+
+  it("holds well before, opens well after, and treats an empty value as no gate", () => {
+    assert.equal(notBeforeHolds("2026-08-10", at("2026-01-01T00:00:00Z")), true);
+    assert.equal(notBeforeHolds("2026-08-10", at("2026-12-01T00:00:00Z")), false);
+    assert.equal(notBeforeHolds("", at("2020-01-01T00:00:00Z")), false);
+  });
+
+  it("is independent of the runtime timezone", () => {
+    // It must not matter where Beacon runs — only where the author might be.
+    const t = at("2026-08-10T11:00:00Z");
+    assert.equal(notBeforeHolds("2026-08-10", t), true);
   });
 });

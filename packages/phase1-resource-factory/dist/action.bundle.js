@@ -33496,7 +33496,6 @@ function normalizePrerequisites(v, issues) {
   return { value: out, coerced };
 }
 var ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?=$|[T\s])/;
-var LOOKS_ISO_RE = /^\d{4}-\d{2}-\d{2}/;
 var ISO_YEAR_MONTH_RE = /^\d{4}-\d{2}$/;
 function isRealCalendarDay(ymd) {
   const d = /* @__PURE__ */ new Date(`${ymd}T00:00:00Z`);
@@ -33511,26 +33510,13 @@ function normalizeNotBefore(v, issues) {
     if (isRealCalendarDay(prefix) && !Number.isNaN(new Date(raw).getTime())) {
       return { value: prefix, coerced: prefix !== raw };
     }
-  } else if (LOOKS_ISO_RE.test(raw)) {
   } else if (ISO_YEAR_MONTH_RE.test(raw)) {
     const parsed = new Date(raw);
     if (!Number.isNaN(parsed.getTime())) {
       return { value: parsed.toISOString().slice(0, 10), coerced: true };
     }
-  } else {
-    const asWritten = /* @__PURE__ */ new Date(`${raw} UTC`);
-    if (!Number.isNaN(new Date(raw).getTime()) && !Number.isNaN(asWritten.getTime())) {
-      const iso = asWritten.toISOString().slice(0, 10);
-      const written = raw.match(/\d+/g) ?? [];
-      const year = iso.slice(0, 4);
-      const day = String(Number(iso.slice(8, 10)));
-      const hasYear = written.includes(year);
-      const hasDay = written.some((n) => n.length <= 2 && String(Number(n)) === day);
-      if (hasYear && hasDay)
-        return { value: iso, coerced: iso !== raw };
-    }
   }
-  issues.push(`notBefore '${raw}' is not a parseable date (use YYYY-MM-DD) \u2014 treated as unintelligible`);
+  issues.push(`notBefore '${raw}' is not an ISO date (use YYYY-MM-DD) \u2014 treated as unintelligible`);
   return { value: raw, coerced: false };
 }
 function normalizeReleaseIntent(raw) {
