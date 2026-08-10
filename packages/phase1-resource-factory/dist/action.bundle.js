@@ -33664,6 +33664,14 @@ function withFreshRouting(accumulated, own) {
     out[k] = v;
   return out;
 }
+function warnIfOnlyStaleWouldMatch(isLoop, source, target, kind, cond, accumulated, fresh) {
+  if (!isLoop || !tagsMatch(accumulated, cond))
+    return;
+  const foreign = Object.keys(cond).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === void 0);
+  if (foreign.length === 0)
+    return;
+  console.warn(`[loop] edge ${source} \u2192 ${target} can never fire: its ${kind} names routing tag(s) ${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched against the source run's own tags, so this condition is unsatisfiable \u2014 check the SERVED graph.`);
+}
 function tagsMatch(tags, cond) {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
 }
@@ -33937,8 +33945,10 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const isLoop = handoffNumber(h, "max_visits") !== void 0;
       const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
       const require2 = handoffTags(h, "require_tags");
-      if (require2 && !tagsMatch(matchAgainst, require2))
+      if (require2 && !tagsMatch(matchAgainst, require2)) {
+        warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require2, accumulatedTags, matchAgainst);
         continue;
+      }
       const skip = handoffTags(h, "skip_if_tags");
       if (skip && tagsMatch(matchAgainst, skip))
         continue;

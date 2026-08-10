@@ -51,7 +51,10 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
   });
 
   /** A sandbox with the repo's config + the one source file check 6c reads. */
-  function sandbox(mutate: (graph: { edges: Array<Record<string, unknown>> }) => void): string {
+  function sandbox(
+    mutate: (graph: { edges: Array<Record<string, unknown>> }) => void,
+    mutateRegistry?: (tags: Record<string, { edges?: Array<Record<string, string>> }>) => void,
+  ): string {
     const dir = mkdtempSync(join(tmpdir(), "af-checkcfg-"));
     dirs.push(dir);
     cpSync(resolve(repoRoot, "config"), join(dir, "config"), { recursive: true });
@@ -62,6 +65,14 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
     const graph = JSON.parse(readFileSync(graphPath, "utf8")) as { edges: Array<Record<string, unknown>> };
     mutate(graph);
     writeFileSync(graphPath, JSON.stringify(graph, null, 2) + "\n");
+    if (mutateRegistry) {
+      const regPath = join(dir, "config/agentcontrol/tags.json");
+      const reg = JSON.parse(readFileSync(regPath, "utf8")) as {
+        tags: Record<string, { edges?: Array<Record<string, string>> }>;
+      };
+      mutateRegistry(reg.tags);
+      writeFileSync(regPath, JSON.stringify(reg, null, 2) + "\n");
+    }
     return dir;
   }
 
@@ -108,6 +119,47 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
     }));
     assert.equal(code, 1);
     assert.match(out, /unbudgeted quality loop/);
+  });
+
+  it("rejects a loop edge gating on a ROUTING tag its source cannot produce", () => {
+    // The freshness rule matches a loop edge's routing conditions against the source
+    // run's own tags, so gating on another node's llm tag is unsatisfiable — the loop
+    // silently never fires. This turns that into a build failure.
+    const { code, out } = runIn(sandbox((g) => {
+      const loop = g.edges.find(
+        (e) => e.sourceConfig === "autofactory-code-reviewer" && e.targetConfig === "autofactory-flag-implementer",
+      )!;
+      // `flag_worthy` is produced by the research planner, not the reviewer.
+      (loop.handoff as Record<string, unknown>).require_tags = { review_approved: "false", flag_worthy: "true" };
+    }));
+    assert.equal(code, 1);
+    assert.match(out, /flag_worthy/);
+    assert.match(out, /produced by 'autofactory-research-planner'/);
+    assert.match(out, /can never be satisfied/);
+  });
+
+  it("allows a loop edge gating on an upstream FACT tag", () => {
+    // Fact tags are never rewound and legitimately come from other nodes, so this
+    // must NOT be flagged — over-tightening here would break valid configs. The
+    // registry edge is declared too, since check 2 requires that independently.
+    const { code, out } = runIn(
+      sandbox(
+        (g) => {
+          const loop = g.edges.find(
+            (e) => e.sourceConfig === "autofactory-code-reviewer" && e.targetConfig === "autofactory-flag-implementer",
+          )!;
+          (loop.handoff as Record<string, unknown>).require_tags = { review_approved: "false", flag_ready: "true" };
+        },
+        (tags) => {
+          (tags.flag_ready!.edges ??= []).push({
+            from: "autofactory-code-reviewer",
+            to: "autofactory-flag-implementer",
+            kind: "require_tags",
+          });
+        },
+      ),
+    );
+    assert.equal(code, 0, out);
   });
 
   it("rejects a PLAIN (non-judge) loop edge declared after another edge from the same node", () => {

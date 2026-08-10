@@ -476,6 +476,39 @@ describe("walkGraph — loop-back edges", () => {
     });
   });
 
+  it("5c. warns when a loop edge gates on a routing tag its source cannot emit", async () => {
+    // check-configs catches this in the COMMITTED graph, but the walker executes the
+    // graph LaunchDarkly serves — a dashboard edit can introduce it with no build in
+    // between. Without the warning the loop is simply dead: no stall, no exhaustion,
+    // nothing in the report.
+    const g = graphFrom({
+      root: "research",
+      edges: {
+        research: [{ key: "flag" }],
+        flag: [{ key: "review" }],
+        // `flag_worthy` is the planner's routing tag; the reviewer never emits it.
+        review: [{ key: "flag", handoff: { max_visits: 2, require_tags: { flag_worthy: "true" } } }],
+      },
+    });
+    const runner = new ScriptedRunner({ research: { tags: { flag_worthy: "true" } } });
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+    let r;
+    try {
+      r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+    } finally {
+      console.warn = realWarn;
+    }
+    assert.equal(countOf(r, "flag"), 1, "the loop cannot fire — that is the point");
+    assert.equal(r.loopExhausted, undefined);
+    assert.equal(r.stalledAt, undefined);
+    assert.ok(
+      warnings.some((w) => w.includes("can never fire") && w.includes("flag_worthy")),
+      `expected a dead-loop-edge warning, got: ${warnings.join(" | ")}`,
+    );
+  });
+
   it("9. envelope inheritance: a re-run inherits the first-entry max_turns/capabilities", async () => {
     const g = graphFrom({
       root: "research",

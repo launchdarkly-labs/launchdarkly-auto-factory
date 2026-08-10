@@ -154,6 +154,28 @@ for (const file of listJson(GRAPH_DIR)) {
         fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has loop_if_judge_below but no max_visits — an unbudgeted quality loop runs to the node-run cap.`);
       }
     }
+    // 6f: a LOOP edge's conditions on ROUTING tags must name tags its SOURCE node can
+    // produce. The walker matches loop-edge routing conditions against the source
+    // run's own tags (so a stale verdict can't re-fire the loop), which means a
+    // condition on another node's llm tag can never be satisfied — the loop would be
+    // dead config with no runtime signal. Fact tags are exempt: they're never rewound
+    // and legitimately come from upstream.
+    if (mv !== undefined) {
+      for (const kind of ["require_tags", "skip_if_tags"]) {
+        for (const tag of Object.keys(edge.handoff?.[kind] ?? {})) {
+          const def = registry[tag];
+          if (!def || def.production !== "llm") continue;
+          if (def.producedBy !== edge.sourceConfig) {
+            fail(
+              `graph: loop edge ${edge.sourceConfig} → ${edge.targetConfig} gates on '${tag}' (${kind}), ` +
+                `which is produced by '${def.producedBy}', not by the edge's source. The walker matches a loop edge's ` +
+                `routing conditions against the source run's OWN tags, so this condition can never be satisfied and the ` +
+                `loop would never fire.`,
+            );
+          }
+        }
+      }
+    }
     if (mv !== undefined && seenSourceEdge.has(edge.sourceConfig)) {
       fail(
         `graph: the loop edge ${edge.sourceConfig} → ${edge.targetConfig} (max_visits: ${mv}) is declared AFTER another edge from '${edge.sourceConfig}'. ` +

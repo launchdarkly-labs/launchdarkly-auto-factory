@@ -325,6 +325,34 @@ function withFreshRouting(
   return out;
 }
 
+/**
+ * Warn when a loop edge was skipped ONLY because of the routing-freshness rule — the
+ * condition matches the accumulated tags but not the source run's own. That means the
+ * edge gates on a routing tag another node owns, so it can never fire: dead config.
+ *
+ * `check-configs` catches this in the committed graph, but the walker executes the
+ * graph LaunchDarkly SERVES, so a dashboard edit can introduce it with no build step
+ * in between. This is the runtime backstop for that gap.
+ */
+function warnIfOnlyStaleWouldMatch(
+  isLoop: boolean,
+  source: string,
+  target: string,
+  kind: string,
+  cond: Record<string, string>,
+  accumulated: Record<string, string>,
+  fresh: Record<string, string>,
+): void {
+  if (!isLoop || !tagsMatch(accumulated, cond)) return;
+  const foreign = Object.keys(cond).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === undefined);
+  if (foreign.length === 0) return;
+  console.warn(
+    `[loop] edge ${source} → ${target} can never fire: its ${kind} names routing tag(s) ` +
+      `${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched ` +
+      `against the source run's own tags, so this condition is unsatisfiable — check the SERVED graph.`,
+  );
+}
+
 /** All key/value pairs in `cond` are present and equal in `tags`. */
 function tagsMatch(tags: Record<string, string>, cond: Record<string, string>): boolean {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
@@ -923,7 +951,10 @@ export async function walkGraph(
       // nodes, so a loop edge may still gate on e.g. flag_ready.
       const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
       const require = handoffTags(h, "require_tags");
-      if (require && !tagsMatch(matchAgainst, require)) continue;
+      if (require && !tagsMatch(matchAgainst, require)) {
+        warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require, accumulatedTags, matchAgainst);
+        continue;
+      }
       const skip = handoffTags(h, "skip_if_tags");
       if (skip && tagsMatch(matchAgainst, skip)) continue;
       // Quality gate: take this edge only when the just-completed node scored BELOW
