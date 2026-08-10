@@ -183,14 +183,14 @@ the change to exactly the case where we are currently overriding something.
 
 ## Consequences elsewhere
 
-- **The orphaned-metric guard should stop gating.** It reports INCOMPLETE when an earlier
+- **The orphaned-metric guard has stopped gating (done).** It reports INCOMPLETE when an earlier
   iteration's `metric_keys` are absent from the final run's, but `metric_keys` is set only
   by `create_metric`, stripped from agent-supplied tags (`sandboxTools.ts:518`), and the
   tool executor is per node run — so a rework that correctly *adds* a metric while keeping
   the first is indistinguishable from one that replaced it, and the guard fires on the
   compliant path. Once the standard set comes from the policy rather than from tags, the
-  guard is measuring the wrong thing entirely. Union `inventory.metric_keys` so every
-  created metric stays visible, and drop the INCOMPLETE.
+  guard is measuring the wrong thing entirely. `inventory.metric_keys` now accumulates so
+  every created metric stays visible, and the INCOMPLETE is gone.
 - **Reporting** should read the union (policy + created), not just `metric_keys`.
 
 ## Ask for LaunchDarkly engineering

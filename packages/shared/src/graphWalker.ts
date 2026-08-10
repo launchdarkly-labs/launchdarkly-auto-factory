@@ -353,6 +353,16 @@ function warnIfOnlyStaleWouldMatch(
   );
 }
 
+/** Merge two comma-separated key lists, deduped, order-stable, whitespace-tolerant. */
+function unionCsv(existing: string | undefined, incoming: string): string {
+  const split = (s: string | undefined) =>
+    (s ?? "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  return [...new Set([...split(existing), ...split(incoming)])].join(",");
+}
+
 /** All key/value pairs in `cond` are present and equal in `tags`. */
 function tagsMatch(tags: Record<string, string>, cond: Record<string, string>): boolean {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
@@ -842,7 +852,19 @@ export async function walkGraph(
 
     Object.assign(accumulatedTags, result.tags);
     // Mirror tool-produced facts into the never-rewound inventory.
-    for (const [k, v] of Object.entries(result.tags)) if (FACT_TAGS.has(k)) inventory[k] = v;
+    for (const [k, v] of Object.entries(result.tags)) {
+      if (!FACT_TAGS.has(k)) continue;
+      // `metric_keys` ACCUMULATES across iterations; every other fact is last-write-wins.
+      //
+      // Why the exception: the tool executor is per node run, so a re-run's `metric_keys`
+      // lists only what THAT run created. Last-write-wins therefore hides iteration 1's
+      // metrics the moment a rework creates another one — the links go missing and the
+      // run looks like it created fewer resources than it did. Union keeps the record
+      // honest. NOT applied to `metric_event_keys`: the handoff verifier greps the
+      // checkout for an emitter of each, and resurrecting an earlier iteration's event
+      // key would assert an emitter that may no longer exist.
+      inventory[k] = k === "metric_keys" ? unionCsv(inventory[k], v) : v;
+    }
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
     const run: NodeRun = { configKey: key, status: result.status, output, tags: result.tags, iteration };

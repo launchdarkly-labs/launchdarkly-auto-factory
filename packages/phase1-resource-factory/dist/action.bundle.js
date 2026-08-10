@@ -33672,6 +33672,10 @@ function warnIfOnlyStaleWouldMatch(isLoop, source, target, kind, cond, accumulat
     return;
   console.warn(`[loop] edge ${source} \u2192 ${target} can never fire: its ${kind} names routing tag(s) ${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched against the source run's own tags, so this condition is unsatisfiable \u2014 check the SERVED graph.`);
 }
+function unionCsv(existing, incoming) {
+  const split = (s) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  return [.../* @__PURE__ */ new Set([...split(existing), ...split(incoming)])].join(",");
+}
 function tagsMatch(tags, cond) {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
 }
@@ -33883,9 +33887,11 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       ...cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}
     });
     Object.assign(accumulatedTags, result.tags);
-    for (const [k, v] of Object.entries(result.tags))
-      if (FACT_TAGS.has(k))
-        inventory[k] = v;
+    for (const [k, v] of Object.entries(result.tags)) {
+      if (!FACT_TAGS.has(k))
+        continue;
+      inventory[k] = k === "metric_keys" ? unionCsv(inventory[k], v) : v;
+    }
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
     const run = { configKey: key, status: result.status, output, tags: result.tags, iteration };
@@ -34189,9 +34195,6 @@ function buildHandoffVerifier(opts) {
 }
 
 // ../shared/dist/approval.js
-function keyList(raw) {
-  return (raw ?? "").split(",").map((k) => k.trim()).filter(Boolean);
-}
 function decideApproval(verdict) {
   const base = { apply: false, noop: false, incomplete: false };
   if (verdict.inconsistentSkip) {
@@ -34206,13 +34209,6 @@ function decideApproval(verdict) {
       ...base,
       incomplete: true,
       reason: `INCOMPLETE \u2014 an earlier iteration created a different flag (${verdict.orphanedFlagKeys.join(", ")}) than the final one (orphaned \u2014 clean up in LaunchDarkly)`
-    };
-  }
-  if (verdict.orphanedMetricKeys.length > 0) {
-    return {
-      ...base,
-      incomplete: true,
-      reason: `INCOMPLETE \u2014 an earlier iteration created metric(s) the final run abandoned (${verdict.orphanedMetricKeys.join(", ")}) (orphaned \u2014 clean up in LaunchDarkly)`
     };
   }
   if (verdict.skipFlagging) {
@@ -34245,11 +34241,7 @@ function interpretWalk(tags, inventory = {}, runs = []) {
   const orphanedFlagKeys = [
     ...new Set(runs.map((r) => r.tags.flag_key).filter((k) => Boolean(k) && k !== finalFlagKey))
   ];
-  const finalMetricKeys = new Set(keyList(inventory.metric_keys));
-  const orphanedMetricKeys = [
-    ...new Set(runs.flatMap((r) => keyList(r.tags.metric_keys)).filter((k) => !finalMetricKeys.has(k)))
-  ];
-  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys, orphanedMetricKeys };
+  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys };
 }
 
 // ../shared/dist/approvalGates.js

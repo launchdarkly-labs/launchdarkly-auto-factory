@@ -49,7 +49,21 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **`tags.json`:** `review_approved` now declares the edge it gates, and its
   description records the exact-equality-vs-normalization gap.
 
-### ✅ Orphan guard extended to metrics
+### ⚠️ REVERTED: the metrics orphan guard (added below) was unsound
+- The guard reported INCOMPLETE when an earlier iteration's `metric_keys` were absent from
+  the final run's. It cannot work: `metric_keys` is set only by `create_metric`, stripped
+  from agent-supplied tags, and the tool executor is per node run — so a re-run's tag lists
+  only what THAT run created, never what stays attached. A compliant rework that keeps `m1`
+  and adds `m2` emits exactly `m2`, byte-identical to one that replaced `m1`. The guard
+  therefore fired on the path the rework instructions ask for, turning good runs red.
+- **Now:** `inventory.metric_keys` accumulates across iterations (a union), so every
+  created metric stays visible in the reported links — report, don't gate. An orphaned
+  FLAG is still gated: it is a config the application may evaluate, where a stray metric
+  is an unused row.
+- The durable answer is that the authoritative metric set belongs to the **release
+  policy**, not to creation tags — see `docs/release-policy-metrics.md`.
+
+### ✅ Orphan guard extended to metrics (superseded by the entry above)
 - **Why:** the guard that stops a rework from reporting success over an abandoned
   resource only knew about flags — and `metrics-author` is the node the new
   judge-driven quality loop re-runs. `inventory.metric_keys` is last-write-wins, so if

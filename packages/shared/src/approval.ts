@@ -59,25 +59,31 @@ export interface WalkVerdict {
    * orphaned in LaunchDarkly by a re-plan that switched flags. Empty when none.
    */
   orphanedFlagKeys: string[];
-  /**
-   * Metric keys created in earlier iterations that the final set abandons —
-   * orphaned in LaunchDarkly the same way an abandoned flag is.
-   *
-   * This matters because the metrics author is the node a judge-driven quality loop
-   * re-runs (`loop_if_judge_below`), and `inventory.metric_keys` is last-write-wins:
-   * without this, iteration 2 creating a different metric would leave iteration 1's
-   * behind, unreported, on a run that still exits 0.
-   */
-  orphanedMetricKeys: string[];
 }
 
-/** Split a comma-separated tag value (metric_keys) into clean keys. */
-function keyList(raw: string | undefined): string[] {
-  return (raw ?? "")
-    .split(",")
-    .map((k) => k.trim())
-    .filter(Boolean);
-}
+/*
+ * NOT guarded: orphaned METRICS.
+ *
+ * A judge-driven rework can re-run the metrics author, and an earlier iteration's metric
+ * can end up superseded. We deliberately do NOT gate on that, because the pipeline cannot
+ * tell a supersede from a legitimate addition:
+ *
+ *  - `metric_keys` is set only by `create_metric` and stripped from agent-supplied tags
+ *    (sandboxTools.ts), and the tool executor is per node run — so a re-run's tag lists
+ *    only what THAT run created, never what remains attached.
+ *  - The rework instructions tell the agent to amend or reuse rather than recreate, so the
+ *    COMPLIANT path for "added m2, kept m1" emits exactly `m2` — byte-identical to
+ *    "replaced m1 with m2".
+ *
+ * A gate here therefore fires on the compliant path, and a guard that reddens good runs
+ * gets muted along with its true positives. Instead: `inventory.metric_keys` accumulates
+ * (graphWalker.ts), so every created metric stays visible in the reported links.
+ *
+ * The durable answer is that the authoritative metric set belongs to the release policy,
+ * not to creation tags — see docs/release-policy-metrics.md. An orphaned FLAG stays
+ * guarded: it is a config the application may evaluate, where a stray metric is an unused
+ * row.
+ */
 
 /** Turn the reviewer's verdict into the run's reported outcome. */
 export function decideApproval(verdict: WalkVerdict): ApprovalDecision {
@@ -98,13 +104,6 @@ export function decideApproval(verdict: WalkVerdict): ApprovalDecision {
       ...base,
       incomplete: true,
       reason: `INCOMPLETE — an earlier iteration created a different flag (${verdict.orphanedFlagKeys.join(", ")}) than the final one (orphaned — clean up in LaunchDarkly)`,
-    };
-  }
-  if (verdict.orphanedMetricKeys.length > 0) {
-    return {
-      ...base,
-      incomplete: true,
-      reason: `INCOMPLETE — an earlier iteration created metric(s) the final run abandoned (${verdict.orphanedMetricKeys.join(", ")}) (orphaned — clean up in LaunchDarkly)`,
     };
   }
   if (verdict.skipFlagging) {
@@ -166,12 +165,5 @@ export function interpretWalk(
     ),
   ];
 
-  // Same shape for metrics, but the tag is a comma-separated LIST, so compare sets:
-  // a key any iteration created and the final set no longer names is orphaned.
-  const finalMetricKeys = new Set(keyList(inventory.metric_keys));
-  const orphanedMetricKeys = [
-    ...new Set(runs.flatMap((r) => keyList(r.tags.metric_keys)).filter((k) => !finalMetricKeys.has(k))),
-  ];
-
-  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys, orphanedMetricKeys };
+  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys };
 }

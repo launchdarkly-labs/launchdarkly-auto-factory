@@ -509,6 +509,31 @@ describe("walkGraph — loop-back edges", () => {
     );
   });
 
+  it("5d. inventory ACCUMULATES metric_keys across iterations; other facts are last-write-wins", async () => {
+    // The tool executor is per node run, so a re-run's metric_keys lists only what THAT
+    // run created. Last-write-wins would hide iteration 1's metrics as soon as a rework
+    // created another — the links would go missing and the run would look like it created
+    // less than it did. flag_key must NOT accumulate: it is a single resource identity,
+    // and the orphan guard compares against the final one.
+    const g = graphFrom({
+      root: "research",
+      edges: {
+        research: [{ key: "metrics" }],
+        metrics: [{ key: "metrics", handoff: { max_visits: 1, require_tags: { retry: "yes" } } }],
+      },
+    });
+    const runner = new ScriptedRunner({
+      metrics: [
+        { tags: { metric_keys: "m1, m2", flag_key: "enable-x", retry: "yes" } },
+        { tags: { metric_keys: "m3,m1", flag_key: "enable-y" } }, // m1 repeated, flag changed
+      ],
+    });
+    const r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+    assert.equal(countOf(r, "metrics"), 2);
+    assert.equal(r.inventory.metric_keys, "m1,m2,m3", "union, deduped, whitespace-trimmed");
+    assert.equal(r.inventory.flag_key, "enable-y", "still last-write-wins");
+  });
+
   it("9. envelope inheritance: a re-run inherits the first-entry max_turns/capabilities", async () => {
     const g = graphFrom({
       root: "research",
