@@ -211,10 +211,11 @@ Three things to understand before adding one:
    report is `loopBudgetSpent`, surfaced as a warning on every front end ("quality loop
    used all 1 attempt(s) without converging"). Without that the run would look
    identical to one that passed on the first try.
-3. **Declaration order is load-bearing.** A judge self-loop must be declared **before**
-   any other edge from the same node, or the forward edge — whose conditions are also
-   satisfied — always wins and the loop never evaluates. `check:configs` enforces this,
-   along with the `[0, 1]` range and the requirement that a judge loop carry
+3. **Declaration order is load-bearing.** A loop edge must be declared **before** any
+   other edge from the same node, or a forward edge whose conditions are also satisfied
+   always wins and the loop never evaluates — dead config with no runtime signal.
+   `check:configs` enforces this for **every** `max_visits` edge (not just judge ones),
+   along with the `[0, 1]` threshold range and the requirement that a judge loop carry
    `max_visits`.
 
 The re-entered node's rework preamble names the score and the judge

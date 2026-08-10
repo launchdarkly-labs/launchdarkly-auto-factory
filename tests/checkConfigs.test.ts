@@ -110,6 +110,24 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
     assert.match(out, /unbudgeted quality loop/);
   });
 
+  it("rejects a PLAIN (non-judge) loop edge declared after another edge from the same node", () => {
+    // The lint originally only covered judge edges, but a verdict loop is equally
+    // killable: add a forward edge above the reviewer's loop and rework silently
+    // never happens, with no runtime signal at all.
+    const { code, out } = runIn(sandbox((g) => {
+      const i = g.edges.findIndex((e) => e.sourceConfig === "autofactory-code-reviewer");
+      g.edges.splice(i, 0, {
+        key: "edge-reviewer-straight-to-testing",
+        sourceConfig: "autofactory-code-reviewer",
+        targetConfig: "autofactory-flag-testing",
+        handoff: {},
+      });
+    }));
+    assert.equal(code, 1);
+    assert.match(out, /loop edge autofactory-code-reviewer → autofactory-flag-implementer/);
+    assert.match(out, /declared AFTER another edge/);
+  });
+
   it("rejects a judge loop declared AFTER another edge from the same node", () => {
     // The silent-failure hazard: the walker takes the first passing edge, so a
     // late-declared loop never fires. Caught at build time rather than in a run.

@@ -178,3 +178,48 @@ describe("walk state validation (fail-closed)", () => {
     assert.match((noCurrent as { reason: string }).reason, /could not verify/);
   });
 });
+
+describe("autofactory CLI args — --flag=value", () => {
+  const ok = (argv: string[]) => {
+    const r = parseArgs(argv, {});
+    assert.ok("options" in r, `expected success, got ${JSON.stringify(r)}`);
+    return (r as { options: import("@auto-factory/phase1-cli").CliOptions }).options;
+  };
+  const err = (argv: string[]) => {
+    const r = parseArgs(argv, {});
+    assert.ok("error" in r, `expected an error, got ${JSON.stringify(r)}`);
+    return (r as { error: string }).error;
+  };
+
+  it("carries feedback text that STARTS WITH A DASH", () => {
+    // The space form can't express this — the parser reads a leading `--` as the
+    // next option — and freeform human prose is exactly where that bites.
+    const o = ok(["run", "--resume", "--feedback=--use the existing flag, don't create one"]);
+    assert.equal(o.feedback, "--use the existing flag, don't create one");
+    assert.equal(o.resume, true);
+  });
+
+  it("works for every value-taking option", () => {
+    const o = ok(["run", "--graph=g1", "--base=develop", "--approve=node-a", "--root=/tmp/x"]);
+    assert.equal(o.graphKey, "g1");
+    assert.equal(o.base, "develop");
+    assert.deepEqual(o.approve, ["node-a"]);
+    assert.equal(o.root, "/tmp/x");
+  });
+
+  it("still validates the value", () => {
+    assert.match(err(["run", "--graph="]), /requires a graph key/);
+    assert.match(err(["run", "--resume", "--feedback=x", "--grant-visits=bogus"]), /--grant-visits/);
+  });
+
+  it("rejects a value on a boolean flag instead of ignoring it", () => {
+    assert.match(err(["run", "--dry-run=true"]), /takes no value/);
+    assert.match(err(["run", "--resume=yes"]), /takes no value/);
+  });
+
+  it("the space form still works", () => {
+    const o = ok(["run", "--graph", "g2", "--resume", "--feedback", "narrow the flag"]);
+    assert.equal(o.graphKey, "g2");
+    assert.equal(o.feedback, "narrow the flag");
+  });
+});

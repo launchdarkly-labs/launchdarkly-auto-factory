@@ -11,6 +11,8 @@
  * the front end driving the CLI (a human, or Claude Code) owns the question.
  */
 
+import { parseVisitGrant } from "./walkState.js";
+
 export const EXIT = {
   /** Reviewer approved, or a clean no-op (no flag needed). */
   OK: 0,
@@ -49,8 +51,6 @@ export interface CliOptions {
   feedback?: string;
 }
 
-import { parseVisitGrant } from "./walkState.js";
-
 export type ParseResult = { options: CliOptions } | { help: true } | { error: string };
 
 export function usage(): string {
@@ -72,6 +72,9 @@ export function usage(): string {
     "  --base <ref>        Base ref to diff against (default: $PR_BASE_REF or main)",
     "  --root <dir>        Repo to operate on (default: current directory)",
     "  -h, --help          Show this help",
+    "",
+    "  Any value-taking option also accepts --flag=value, which is the only way to pass",
+    "  text beginning with a dash (e.g. --feedback=\"--reuse the existing flag\").",
     "",
     "Environment (read from the invoking directory's .env, then the process env):",
     "  LD_SDK_KEY, LD_PROJECT_KEY            factory project (agent configs + flags)",
@@ -110,8 +113,16 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 
   const args = argv.slice(1);
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
+    const raw = args[i] as string;
+    // `--flag=value` is accepted for every value-taking option. It's the only way to
+    // pass text that starts with a dash — `--feedback "--use the existing flag"`
+    // would otherwise be read as a missing value, and freeform human prose is
+    // exactly where that happens.
+    const eq = raw.startsWith("--") ? raw.indexOf("=") : -1;
+    const arg = eq > 0 ? raw.slice(0, eq) : raw;
+    const inlineValue = eq > 0 ? raw.slice(eq + 1) : undefined;
     const next = (): string | undefined => {
+      if (inlineValue !== undefined) return inlineValue || undefined;
       const v = args[i + 1];
       if (v === undefined || v.startsWith("--")) return undefined;
       i++;
@@ -146,9 +157,11 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
         break;
       }
       case "--dry-run":
+        if (inlineValue !== undefined) return { error: "--dry-run takes no value" };
         options.dryRun = true;
         break;
       case "--resume":
+        if (inlineValue !== undefined) return { error: "--resume takes no value" };
         options.resume = true;
         break;
       case "--feedback": {

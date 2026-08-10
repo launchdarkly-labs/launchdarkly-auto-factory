@@ -136,9 +136,12 @@ for (const file of listJson(GRAPH_DIR)) {
   const graph = JSON.parse(readFileSync(file, "utf8"));
   const adjUntagged = new Map(); // source -> [target] for edges WITHOUT max_visits
   // 6d: `loop_if_judge_below` must be a number in [0, 1] and only on a budgeted edge
-  // (an unbudgeted judge loop would run to the node-run cap). 6e: a judge loop edge
-  // must be declared BEFORE any other edge from the same source — the walker takes
-  // the first passing edge, so a later declaration silently never fires.
+  // (an unbudgeted judge loop would run to the node-run cap). 6e: ANY loop edge must
+  // be declared BEFORE the other edges from the same source — the walker takes the
+  // first passing edge, so a loop declared after a forward edge that can pass is dead
+  // config with no runtime signal. This applies to every max_visits edge, not just
+  // judge-driven ones: a plain verdict loop is equally killable by a forward edge
+  // added above it.
   const seenSourceEdge = new Set();
   for (const edge of graph.edges ?? []) {
     const mv = edge.handoff?.max_visits;
@@ -150,12 +153,12 @@ for (const file of listJson(GRAPH_DIR)) {
       if (mv === undefined) {
         fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has loop_if_judge_below but no max_visits — an unbudgeted quality loop runs to the node-run cap.`);
       }
-      if (seenSourceEdge.has(edge.sourceConfig)) {
-        fail(
-          `graph: the judge loop edge ${edge.sourceConfig} → ${edge.targetConfig} is declared AFTER another edge from '${edge.sourceConfig}'. ` +
-            `The walker takes the first passing edge, so this loop would never fire — move it above the others.`,
-        );
-      }
+    }
+    if (mv !== undefined && seenSourceEdge.has(edge.sourceConfig)) {
+      fail(
+        `graph: the loop edge ${edge.sourceConfig} → ${edge.targetConfig} (max_visits: ${mv}) is declared AFTER another edge from '${edge.sourceConfig}'. ` +
+          `The walker takes the first passing edge, so this loop may never fire — move it above the others.`,
+      );
     }
     seenSourceEdge.add(edge.sourceConfig);
     if (mv !== undefined) {
