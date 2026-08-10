@@ -218,7 +218,10 @@ common case.
   previous variation) only runs on an observed completion. Repointing on a `noop` result
   helps a re-POST of the same SHA range and nothing more, because **discovery is a manifest
   diff**: a flag whose `.release-flags/` file exists at both SHAs is never rediscovered, so
-  `triggerRelease` never runs for it again. Closing this needs a persisted list of releases
+  `triggerRelease` never runs for it again. (More precisely: no *organic* notification
+  rediscovers it. An explicit `previousSha` on the request wins over the store — `state.ts:49`
+  — so a human who knows to do it can reopen any range indefinitely.) Closing this needs a
+  persisted list of releases
   we stopped watching, re-checked on any webhook independently of discovery — and even then
   only when *some* deploy arrives, since there is no scheduler. Children stay stranded until
   then; the monitor now says so rather than promising otherwise.

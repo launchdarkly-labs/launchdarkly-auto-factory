@@ -96,15 +96,30 @@ that moment never gets another.
 
 | Outcome | Why it isn't final | Recovery today |
 |---|---|---|
-| `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | manual re-POST, while the window lasts |
-| `waiting` | the fullstack counterpart hasn't deployed | same |
-| `error` | includes an unverifiable idempotency guard | 503 → provider redelivery (the one retriable path) |
-| paused release resumed late | monitoring stopped at the deadline | none — children stay pinned to the old variation |
-| release completed after the window | same | none |
+| `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | manual re-POST |
+| `waiting` | the fullstack counterpart hasn't deployed — **or the readiness check failed and was read as "not deployed"** (`server.ts:132` `.catch(() => false)`) | manual re-POST; the log misdiagnoses the second case as the first |
+| `error`, idempotency guard unverifiable | the read that would prove no release is running failed | **503 → provider redelivery** (automatic) |
+| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **none automatic — acked 200** (`server.ts:209-223`) |
+| paused release resumed late | monitoring stopped at the deadline | manual re-POST → `noop` → children repointed |
+| release completed after the window | same | same |
 
-Two mechanisms make it permanent rather than delayed. **Filename diffing** means editing the
-manifest to fix the problem is a no-op — the file exists at both SHAs. **Two-deep history**
-(`{ last, prior }`) means the re-POST window closes as soon as one more deploy lands.
+**Recovery is manual, not impossible** — an earlier revision of this doc said "none" for the
+last two rows and was wrong. `repointDependentPrerequisites` runs on a `noop` result
+(`server.ts:200-202`), and `noop` — the environment already serves the target variation — is
+exactly what an externally-completed release looks like. So a re-POST that rediscovers the
+manifest does repoint the children. It also re-reads the manifest **at the current SHA**, so a
+human's edit to fix a `held` release does take effect on re-POST.
+
+What makes recovery manual-only is that nothing *organic* re-surfaces the manifest: discovery
+is a filename diff, so a file present at both SHAs is never rediscovered, and two-deep history
+(`{ last, prior }`) closes the state-resolved range once another deploy lands. But an explicit
+`previousSha` on the request wins over the store (`state.ts:49`) and reopens any range
+indefinitely. The gap is that this requires a human who knows to do it, and the two 200-acked
+paths above mean nobody is told that they should.
+
+Two retriable paths already exist, both deliberate: the 503 above, and a **502 on discovery
+failure** which does not record the SHA so the next notification re-diffs the same range
+(`server.ts:103-107`). The ledger generalises what those two do case-by-case.
 
 **This is the gap that is already causing harm**, and it is the only silent one. It is also
 the one this branch made worse, correctly: refusing free-form dates puts more manifests into
@@ -113,10 +128,16 @@ needs redelivery. Every fail-closed improvement adds to a pile that recovers bad
 
 The fix is a **persisted re-evaluation ledger**: an entry per non-final outcome keyed by
 `(service, environment, flagKey)`, re-evaluated on any webhook *independently of discovery*,
-cleared on a final outcome. Two properties matter more than the retry itself — re-reading the
-manifest at the current SHA makes a human's fix take effect, and re-checking a release we
-stopped watching lets a late completion trigger the child-flag repointing that currently never
-happens.
+cleared on a final outcome. What it buys is not the retry mechanism — re-POST already is one —
+but that **no human has to know to invoke it.** Both recoveries above exist and both require
+someone to notice; the ledger is what notices.
+
+Two defects found in round seven belong here rather than to the architecture, and are cheap to
+fix independently of the ledger: the fullstack readiness check fails open into `waiting`
+(a rate-limit blip reads as "the other side hasn't deployed"), and a `triggerRelease` throw is
+acked 200 despite the surrounding comment claiming redelivery covers it. Both should route
+through the same retriable-status path the idempotency guard uses; retrying a failed trigger is
+safe by construction, since a write that did land comes back as `already_running`.
 
 What it still would not fix: it is webhook-gated. A `notBefore` date passing causes nothing
 until *some* deploy arrives. Closing that needs a timer, which makes Beacon a scheduler —
