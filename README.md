@@ -1,8 +1,8 @@
 # LaunchDarkly AutoFactory
 
-Every software factory is different. This repository serves as an opinionated example and
-framework for developing a software factory using **LaunchDarkly primitives** alongside
-tools like **Claude Code, Cursor, and Sentry**.
+Every software factory is different. This repository is an opinionated reference
+implementation for developing a software factory using **LaunchDarkly primitives**
+alongside tools like **Claude Code, Cursor, and Sentry**.
 
 ## Why
 
@@ -72,7 +72,24 @@ flowchart LR
 The goal is not code throughput or deployment frequency in isolation. It is reliable flow
 from idea to customer value, with control where uncertainty is highest.
 
-## How the framework works
+## LaunchDarkly Primitives
+
+The reference implementation composes LaunchDarkly primitives through a small set of
+AutoFactory components.
+
+| LaunchDarkly primitive | What it contributes | AutoFactory component |
+|---|---|---|
+| **AgentControl** | Runtime-configured instructions, models, tools, Agent Graphs, judges, and monitoring | Config Bridge provisions the control plane; the Phase 1 graph walker runs the agents |
+| **Feature flags** | Multivariate variations, targeting, prerequisites, and operational controls | Flag Implementer wires the change; approval and provider flags configure the factory |
+| **Observability and code references** | LLM traces, service dependencies, and flag wrap points | Research builds the knowledge graph; Metrics Author closes telemetry gaps |
+| **Metrics** | Custom, trace-based, and Sentry-backed measures tied to flag exposure | Metrics Author instruments signals and records them in the release manifest |
+| **Guarded and progressive releases** | Release policies, staged exposure, production guardrails, and automatic rollback | Beacon turns a successful deploy into a controlled release |
+
+Claude Code and Cursor provide execution surfaces. Sentry provides external error telemetry
+and Seer Autofix. AutoFactory connects them to LaunchDarkly; they are integrations, not
+LaunchDarkly primitives.
+
+## How the reference implementation works
 
 - A configurable AI-agent graph prepares each change for release.
 - Any CD system deploys the code while new behavior remains off.
