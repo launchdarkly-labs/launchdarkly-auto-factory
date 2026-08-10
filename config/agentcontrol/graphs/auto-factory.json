@@ -118,7 +118,7 @@
         "require_tags": {
           "review_approved": "false"
         },
-        "max_visits": 2
+        "max_visits": 1
       }
     }
   ]

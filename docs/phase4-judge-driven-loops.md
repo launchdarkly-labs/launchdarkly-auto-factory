@@ -77,7 +77,9 @@ The first real loop, at near-zero cost. Two commits: config, then feedback.
 ```
 
 No walker changes. `check-configs` 6b (every cycle carries a budget) is satisfied.
-`max_visits: 2` means at most one rework pass — start conservative and measure.
+`max_visits: N` allows N traversals, i.e. **N reworks** — so the shipped edge is
+`max_visits: 1`, one rework pass. An earlier revision shipped 2 while describing it
+as one; the config is now 1, matching the stated intent.
 
 **Reachability.** The target is `[G]` by default, so this loop completes inside one
 walk only where the gate resolves true: `yolo` mode, `risk-threshold` mode with

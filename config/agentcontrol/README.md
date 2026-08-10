@@ -140,17 +140,29 @@ loops tag each loop edge. This is config, not code: the graph owns *which edges
 loop and their budget*; the code owns the guarantees (the per-edge hard cap and a
 run-level backstop) that a graph edit can't disable.
 
-The committed graph ships **one** loop edge: `code-reviewer → flag-implementer`
-with `max_visits: 2` and `require_tags: { review_approved: "false" }` — a rejected
-review sends the work back to the implementer for at most one rework pass. Note the
-polarity: it fires only on the literal `"false"`. The approval gate *normalizes* the
-verdict (`reject`/`rejected` also count as a rejection), so a reviewer that drifts
-off the instructed `true`/`false` still reports REJECTED but skips the rework. That
-is the deliberate trade — `skip_if_tags: { review_approved: "approve" }` would loop
-on anything that isn't the exact approval string, and reworking work the reviewer
-*accepted* is the more expensive mistake. Also note the implementer is
-`DEFAULT_GATED_STEPS`, so in non-`yolo` modes this loop halts at the approval gate on
-re-entry rather than completing inside one walk.
+The committed graph ships a verdict loop: `code-reviewer → flag-implementer` with
+`max_visits: 1` and `require_tags: { review_approved: "false" }` — a rejected review
+sends the work back to the implementer for one rework pass. `max_visits: N` allows
+**N traversals, i.e. N reworks**, so this is one; an earlier revision shipped 2 while
+describing it as one.
+
+Note the polarity: it fires only on the literal `"false"`. The approval gate
+*normalizes* the verdict (`reject`/`rejected` also count as a rejection), so a
+reviewer that drifts off the instructed `true`/`false` still reports REJECTED but
+skips the rework. That is the deliberate trade — `skip_if_tags: { review_approved:
+"approve" }` would loop on anything that isn't the exact approval string, and
+reworking work the reviewer *accepted* is the more expensive mistake.
+
+**Approval semantics you need to know.** `flag-implementer` is in
+`DEFAULT_GATED_STEPS`, and the walker does re-ask the gate on every loop re-entry.
+But every front end answers from a **per-run decision that doesn't change**: the CLI
+checks a `--approve` set, the Action checks a PR label, the extension caches the
+human's answer for the run. So in practice the re-entry is silently covered by the
+approval already given, and **one human "yes" authorises up to `max_visits`
+additional side-effecting reworks** — each of which can create LaunchDarkly
+resources and commit code. It does *not* pause again. Genuinely requiring per-iteration
+approval would need approval tokens scoped to an iteration, which the label/flag
+surface can't express today.
 
 When a loop re-enters a node, the walker **rewinds routing/verdict tags** (the
 `production: "llm"` tags — `review_approved`, `risk_score`, …) to the state before

@@ -24,8 +24,9 @@ Status legend: ✅ done · 🔜 planned/in progress
   human, and the reviewer's findings were discarded. This edge makes the verdict
   actionable, and it needs no new signal — the reviewer is an independent node
   evaluating the implementer's work with the full diff in hand.
-- **The edge:** `max_visits: 2`, `require_tags: { review_approved: "false" }` — at
-  most one rework pass. Capabilities mirror the steward → implementer envelope minus
+- **The edge:** `max_visits: 1`, `require_tags: { review_approved: "false" }` — one
+  rework pass. (`max_visits: N` allows N traversals, i.e. N reworks. This first
+  shipped as 2 while being described as one; corrected to 1.) Capabilities mirror the steward → implementer envelope minus
   `query_repos` (cross-repo research is a first-pass concern).
 - **Polarity is deliberate:** it fires only on the literal `"false"`. The approval
   gate normalizes verdicts (`reject`/`rejected` also read as rejections), so a
@@ -33,11 +34,13 @@ Status legend: ✅ done · 🔜 planned/in progress
   (`skip_if_tags: { review_approved: "approve" }`) loops on anything that isn't the
   exact approval string, which would rework work the reviewer *accepted* — the more
   expensive mistake, since iteration 2 can attach new LD resources.
-- **Gate interaction:** the implementer is in `DEFAULT_GATED_STEPS`, and the walker
-  re-asks the gate on every loop re-entry (a re-run can create new side effects). So
-  in non-`yolo` modes this loop halts at the gate rather than completing inside one
-  walk. Resolving that needs resumable walk state — see
-  `docs/phase4-judge-driven-loops.md` Step 2.
+- **Gate interaction — corrected.** The implementer is in `DEFAULT_GATED_STEPS` and the
+  walker does re-ask the gate on every re-entry, but every front end answers from a
+  per-run decision that does not change (a `--approve` set, a PR label, a cached
+  modal answer). So the loop does NOT pause again: **one human approval authorises up
+  to `max_visits` additional side-effecting reworks.** An earlier entry claimed it
+  halted at the gate on re-entry, which was wrong. Per-iteration approval would need
+  tokens scoped to an iteration, which the label/flag surface cannot express.
 - **Walker fix this surfaced (`graphWalker.ts`):** an unmet loop edge is now treated
   as **convergence, not a stall**. Previously, giving a terminal node a loop-back
   edge made every *approved* run report `stalledAt` → INCOMPLETE, because an unmet
