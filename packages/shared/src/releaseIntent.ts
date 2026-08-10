@@ -87,19 +87,28 @@ function normalizePrerequisites(v: unknown, issues: string[]): { value: IntentPr
 
 /** A bare calendar date — no time, no zone. */
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** An explicit zone designator: trailing `Z`, or a `±HH:MM` / `±HHMM` offset. */
+const HAS_ZONE_RE = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 
 /**
  * Parse a notBefore value into ISO YYYY-MM-DD, or report it as an issue.
  *
- * Timezone-safe deliberately, because `Date` parses the two shapes we accept in
- * DIFFERENT reference frames: a bare `YYYY-MM-DD` is UTC midnight per spec, while a
- * non-ISO string like "Aug 1 2026" is LOCAL midnight. Formatting either with
- * `toISOString()` therefore shifts the calendar date by a day depending on the
- * offset's sign — "Aug 1 2026" became 2026-07-31 anywhere east of UTC, and
- * formatting the ISO form with local getters would break the same way west of it.
- * A `notBefore` is a calendar date, not an instant, so: an already-ISO date is
- * validated and passed through untouched, and anything else is formatted from the
- * LOCAL fields it was parsed into. No path round-trips through a different frame.
+ * Timezone-safe deliberately, because `Date` parses the shapes we accept in
+ * DIFFERENT reference frames, and formatting one frame's parse through another
+ * shifts the calendar date by a day. THREE classes, each formatted in the frame it
+ * was parsed in:
+ *
+ *  1. A bare `YYYY-MM-DD` — a calendar date. Validated and passed through
+ *     untouched, never round-tripped through a `Date` at all.
+ *  2. A string carrying an explicit zone (`2026-08-01T00:00:00Z`, `…+02:00`) — an
+ *     absolute INSTANT. Formatted in UTC, because that is the frame it names.
+ *  3. Anything else (`Aug 1 2026`, `2026-08-01T00:00:00`) — parsed as LOCAL by
+ *     spec, so formatted from local fields.
+ *
+ * Both directions have bitten this function: formatting (3) via `toISOString()`
+ * turned "Aug 1 2026" into 2026-07-31 east of UTC, and then formatting (2) via
+ * local getters turned "2026-08-01T00:00:00Z" into 2026-07-31 west of it. A
+ * `notBefore` a day early weakens Beacon's release hold, so both are real.
  */
 function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coerced: boolean } {
   if (v === undefined || v === null || v === "") return { value: "", coerced: false };
@@ -114,11 +123,15 @@ function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coer
   } else {
     const parsed = new Date(raw);
     if (!Number.isNaN(parsed.getTime())) {
-      const iso = [
-        parsed.getFullYear(),
-        String(parsed.getMonth() + 1).padStart(2, "0"),
-        String(parsed.getDate()).padStart(2, "0"),
-      ].join("-");
+      const iso = HAS_ZONE_RE.test(raw)
+        ? // (2) An instant: the string named its own frame, so read it back in UTC.
+          parsed.toISOString().slice(0, 10)
+        : // (3) Parsed as local, so format from local fields.
+          [
+            parsed.getFullYear(),
+            String(parsed.getMonth() + 1).padStart(2, "0"),
+            String(parsed.getDate()).padStart(2, "0"),
+          ].join("-");
       return { value: iso, coerced: iso !== raw };
     }
   }

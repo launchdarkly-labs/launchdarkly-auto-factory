@@ -91,7 +91,19 @@ describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
 // ---------------------------------------------------------------------------
 describe("normalizeNotBefore is timezone-independent", () => {
   const MODULE = fileURLToPath(new URL("../packages/shared/dist/releaseIntent.js", import.meta.url));
-  const CASES = ["2026-08-01", "Aug 1 2026", "2026-01-01", "Dec 31 2026"];
+  // Every shape the normalizer accepts, not just the two the first version covered.
+  // A zone-suffixed timestamp is an INSTANT and a bare/zoneless one is a LOCAL
+  // calendar date; formatting either in the other's frame shifts the day.
+  const CASES = [
+    "2026-08-01",
+    "Aug 1 2026",
+    "2026-01-01",
+    "Dec 31 2026",
+    "2026-08-01T00:00:00Z",
+    "2026-08-01T00:00:00.000Z",
+    "2026-08-01T22:00:00+02:00",
+    "2026-08-01T12:00:00",
+  ];
   // Sign, magnitude, a half-hour offset, and both extremes of the UTC range.
   const ZONES = [
     "UTC",
@@ -119,7 +131,18 @@ describe("normalizeNotBefore is timezone-independent", () => {
   }
 
   it("every accepted date shape yields the same calendar date in all zones", () => {
-    const expected = { "2026-08-01": "2026-08-01", "Aug 1 2026": "2026-08-01", "2026-01-01": "2026-01-01", "Dec 31 2026": "2026-12-31" };
+    const expected = {
+      "2026-08-01": "2026-08-01",
+      "Aug 1 2026": "2026-08-01",
+      "2026-01-01": "2026-01-01",
+      "Dec 31 2026": "2026-12-31",
+      // Instants: UTC is the frame the string named. 22:00+02:00 IS 20:00Z on the 1st.
+      "2026-08-01T00:00:00Z": "2026-08-01",
+      "2026-08-01T00:00:00.000Z": "2026-08-01",
+      "2026-08-01T22:00:00+02:00": "2026-08-01",
+      // No zone → local midday, which lands on the 1st in every real zone.
+      "2026-08-01T12:00:00": "2026-08-01",
+    };
     for (const tz of ZONES) {
       assert.deepEqual(notBeforeIn(tz), expected, `notBefore drifted under TZ=${tz}`);
     }

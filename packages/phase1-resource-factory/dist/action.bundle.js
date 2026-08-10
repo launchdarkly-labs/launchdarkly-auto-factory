@@ -33490,6 +33490,7 @@ function normalizePrerequisites(v, issues) {
   return { value: out, coerced };
 }
 var ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+var HAS_ZONE_RE = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 function normalizeNotBefore(v, issues) {
   if (v === void 0 || v === null || v === "")
     return { value: "", coerced: false };
@@ -33502,11 +33503,17 @@ function normalizeNotBefore(v, issues) {
   } else {
     const parsed = new Date(raw);
     if (!Number.isNaN(parsed.getTime())) {
-      const iso = [
-        parsed.getFullYear(),
-        String(parsed.getMonth() + 1).padStart(2, "0"),
-        String(parsed.getDate()).padStart(2, "0")
-      ].join("-");
+      const iso = HAS_ZONE_RE.test(raw) ? (
+        // (2) An instant: the string named its own frame, so read it back in UTC.
+        parsed.toISOString().slice(0, 10)
+      ) : (
+        // (3) Parsed as local, so format from local fields.
+        [
+          parsed.getFullYear(),
+          String(parsed.getMonth() + 1).padStart(2, "0"),
+          String(parsed.getDate()).padStart(2, "0")
+        ].join("-")
+      );
       return { value: iso, coerced: iso !== raw };
     }
   }
