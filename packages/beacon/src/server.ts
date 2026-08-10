@@ -114,12 +114,14 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     store.record(n.service, n.environment, n.sha);
 
     const outcomes: FlagOutcome[] = [];
-    // Set when an idempotency check could not be completed. The response then carries a
-    // RETRIABLE status so the provider redelivers — which is the retry mechanism for
-    // everything else here too, and which the state store's two-deep history exists to
-    // make safe (a re-POST of the same SHA re-diffs the same range and rediscovers the
-    // flags we skipped; anything that did release comes back as `already_running`).
-    let guardUnverifiable = false;
+    // Set when a flag's work could not be COMPLETED — an idempotency check that
+    // couldn't be verified, a fullstack readiness check that couldn't be finished, or
+    // a release trigger that threw mid-flight. The response then carries a RETRIABLE
+    // status so the provider redelivers, which the state store's two-deep history
+    // exists to make safe (a re-POST of the same SHA re-diffs the same range and
+    // rediscovers the flags we skipped; anything that did release comes back as
+    // `already_running`).
+    let retryNeeded = false;
     for (const flag of discovered) {
       const scope = flag.scope ?? "frontend";
       const decision = decideScope(scope, service.side);
@@ -129,8 +131,28 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         continue;
       }
       if (decision === "check_fullstack") {
-        const ready = await otherSideHasFile(cfg, gh, service.side, flag.sourceFile).catch(() => false);
-        if (!ready) {
+        // TRI-STATE (see fullstack.ts): `absent` is a real verdict — the other side's
+        // own deploy notification is the retry. `unknown` has NO later event that
+        // retries it, so it must answer retriably rather than ack into "waiting":
+        // that used to misdiagnose a GitHub rate-limit blip as "the other side
+        // hasn't deployed" and strand the release until a manual re-POST.
+        const readiness = await otherSideHasFile(cfg, gh, service.side, flag.sourceFile);
+        if (readiness.state === "unknown") {
+          retryNeeded = true;
+          console.warn(
+            `[beacon] fullstack readiness check for '${flag.flagKey}' (file=${flag.sourceFile}) could not be ` +
+              `completed — NOT a verdict on whether the other side deployed. Answering retriably so the ` +
+              `provider redelivers. Cause: ${readiness.reason}`,
+          );
+          outcomes.push({
+            flag: flag.flagKey,
+            scope,
+            action: "error",
+            detail: `fullstack readiness check could not be completed — release NOT started; redeliver this notification to retry: ${readiness.reason}`,
+          });
+          continue;
+        }
+        if (readiness.state === "absent") {
           outcomes.push({ flag: flag.flagKey, scope, action: "waiting", detail: "other service not deployed yet" });
           // No retry queue in the prototype: a "waiting" flag is released when
           // the OTHER service's deploy notification arrives and re-evaluates.
@@ -159,7 +181,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         try {
           active = await findActiveRelease(ld, flag.flagKey, n.environment);
         } catch (e) {
-          guardUnverifiable = true;
+          retryNeeded = true;
           console.warn(
             `[beacon] idempotency check failed for '${flag.flagKey}' — release NOT started (retriable): ${String(e)}`,
           );
@@ -216,10 +238,10 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     }
 
     return {
-      // 503 when any idempotency check could not be completed: the work is unfinished and
+      // 503 when any flag's work could not be completed: the work is unfinished and
       // redelivery is how it gets retried. Answering 200 would tell the provider the
       // notification was handled, stranding those flags until a manual re-POST.
-      status: guardUnverifiable ? 503 : 200,
+      status: retryNeeded ? 503 : 200,
       body: {
         service: n.service,
         environment: n.environment,

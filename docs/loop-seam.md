@@ -97,7 +97,7 @@ that moment never gets another.
 | Outcome | Why it isn't final | Recovery today |
 |---|---|---|
 | `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | manual re-POST |
-| `waiting` | the fullstack counterpart hasn't deployed — **or the readiness check failed and was read as "not deployed"** (`server.ts:132` `.catch(() => false)`) | manual re-POST; the log misdiagnoses the second case as the first |
+| `waiting` | the fullstack counterpart definitively hasn't deployed (the readiness check is tri-state now; an *incomplete* check no longer reads as "not deployed" — it answers **503 → redelivery**) | the other side's deploy notification re-evaluates; if lost, manual re-POST |
 | `error`, idempotency guard unverifiable | the read that would prove no release is running failed | **503 → provider redelivery** (automatic) |
 | `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **none automatic — acked 200** (`server.ts:209-223`) |
 | paused release resumed late | monitoring stopped at the deadline | manual re-POST → `noop` → children repointed |

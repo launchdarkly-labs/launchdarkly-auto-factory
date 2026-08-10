@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import type { Server } from "node:http";
+import { createServer, type Server } from "node:http";
 import { after, describe, it } from "node:test";
 
 import { MemoryDeployStateStore, createApp, type BeaconConfig, type GitHubClient } from "@auto-factory/beacon";
@@ -221,6 +221,126 @@ describe("Beacon server", async () => {
     const h = await harness();
     assert.equal((await h.post("/flag-releases", { service: "nope", sha: "x" })).status, 400);
     assert.equal((await h.post(`/webhooks/railway?secret=${SECRET}`, { status: "SUCCESS" }, null)).status, 422);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round seven, finding 1: the fullstack readiness check must not fail OPEN into
+// "waiting". `otherSideHasFile(...).catch(() => false)` read "we could not check"
+// as "the other side has not deployed" and acked 200 — the provider marked the
+// delivery handled, nothing organic rediscovers the manifest, and the release
+// stranded until a human re-POSTed. An incomplete check must answer retriably.
+// ---------------------------------------------------------------------------
+describe("beacon: fullstack readiness check failure", () => {
+  const harnesses: Array<{ close(): void }> = [];
+  const servers: Server[] = [];
+  after(() => {
+    harnesses.forEach((h) => h.close());
+    servers.forEach((s) => s.close());
+  });
+
+  /** A local status endpoint for the "other side", answering a deployed SHA. */
+  function statusEndpoint(): Promise<string> {
+    return new Promise((resolve) => {
+      const server = createServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ version: "fe-sha" }));
+      });
+      servers.push(server);
+      server.listen(0, "127.0.0.1", () => {
+        const { port } = server.address() as { port: number };
+        resolve(`http://127.0.0.1:${port}/api/status`);
+      });
+    });
+  }
+
+  async function fullstackHarness(fileExists: () => Promise<boolean>): Promise<Harness> {
+    const fullCfg: BeaconConfig = {
+      ...cfg,
+      services: {
+        ...cfg.services,
+        "demo-frontend": {
+          side: "frontend",
+          repo: { owner: "o", name: "fe" },
+          statusUrl: await statusEndpoint(),
+          statusShaField: "version",
+        },
+      },
+    };
+    const patches: unknown[] = [];
+    const monitored: string[] = [];
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return ["pr-9.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return { flagKey: "enable-both", scope: "fullstack" };
+      },
+      fileExists,
+    } as unknown as GitHubClient;
+    const app = createApp(fullCfg, fakeLd({}, patches), {
+      store: new MemoryDeployStateStore(),
+      gh,
+      onReleaseStarted: (flagKey) => monitored.push(flagKey),
+    });
+    return new Promise((resolveStart) => {
+      const server: Server = app.listen(0, () => {
+        const { port } = server.address() as { port: number };
+        resolveStart({
+          async post(path, body, secretHeader = SECRET) {
+            const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                ...(secretHeader ? { "x-beacon-secret": secretHeader } : {}),
+              },
+              body: JSON.stringify(body),
+            });
+            return { status: res.status, json: await res.json() };
+          },
+          patches,
+          monitored,
+          listDirRefs: [],
+          close: () => server.close(),
+        });
+      });
+    });
+  }
+
+  it("answers RETRIABLY when the readiness check cannot be completed (GitHub error)", async () => {
+    // gh.fileExists throws on any non-404 (github.ts) — a 403 rate limit is the
+    // review's exact failure scenario, with both sides actually deployed.
+    const h = await fullstackHarness(async () => {
+      throw new Error("GitHub /repos/o/fe/contents failed: HTTP 403 — rate limited");
+    });
+    harnesses.push(h);
+    const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
+    // THE DISCRIMINATOR: 503 so the provider redelivers. Under `.catch(() => false)`
+    // this was 200 + action "waiting", misdiagnosed as "the other side hasn't yet".
+    assert.equal(res.status, 503);
+    const outcome = res.json.outcomes[0];
+    assert.equal(outcome.action, "error");
+    assert.match(String(outcome.detail), /could not be completed/);
+    assert.match(String(outcome.detail), /redeliver/);
+    assert.doesNotMatch(String(outcome.detail), /not deployed/, "must not assert the other side is behind");
+    assert.deepEqual(h.patches, [], "no release started on an unverified readiness");
+  });
+
+  it("still acks 200 'waiting' on a DEFINITIVE not-deployed (GitHub 404)", async () => {
+    const h = await fullstackHarness(async () => false); // fileExists=false is a real 404
+    harnesses.push(h);
+    const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.outcomes[0].action, "waiting");
+    assert.deepEqual(h.patches, []);
+  });
+
+  it("releases when the other side definitively has the file", async () => {
+    const h = await fullstackHarness(async () => true);
+    harnesses.push(h);
+    const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.outcomes[0].action, "released");
   });
 });
 
