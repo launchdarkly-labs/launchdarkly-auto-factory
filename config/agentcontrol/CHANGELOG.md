@@ -15,6 +15,23 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-10
+
+### ✅ Guard: a `loop_if_judge_below` edge's source must have a judge attached
+- **Why:** judge scores fail **open** — no usable score means the edge is never
+  taken. Nothing checked that the source node of a judge-driven loop edge actually
+  attaches a judge in its committed AI config, so removing (or forgetting) the
+  judge turned the loop into dead config whose only signal was a per-run log line.
+- **Now:** `check:configs` (rule 6g) fails when a `loop_if_judge_below` edge's
+  source config has no variation with `judgeConfiguration.judges`, and the message
+  says what to do (attach a judge, or drop the condition). The committed graph's
+  `metrics-author` self-loop passes — its config carries
+  `autofactory-judge-metrics-quality` at `samplingRate: 1`. Still uncheckable here:
+  `samplingRate` lives in LaunchDarkly, so the runtime warning remains the backstop
+  for an unsampled judge.
+
+---
+
 ## 2026-08-09 (the graph actually loops)
 
 ### ✅ First loop edge: `code-reviewer → flag-implementer` on a rejected review

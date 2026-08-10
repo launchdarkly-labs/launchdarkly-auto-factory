@@ -207,6 +207,25 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
     assert.match(out, /declared AFTER a non-loop edge/);
   });
 
+  it("rejects a loop_if_judge_below edge whose source has NO judge attached (6g)", () => {
+    // Judge scores fail OPEN: no usable score → the edge is never taken. So a
+    // source with no judge in its committed AI config makes the edge dead config
+    // whose only signal is a runtime log line. The committed graph's real case is
+    // the metrics-author self-loop; strip its judge and the lint must say so.
+    const dir = sandbox(() => {});
+    const cfgPath = join(dir, "config/agentcontrol/ai-configs/autofactory-metrics-author.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as {
+      variations: Array<{ judgeConfiguration?: unknown }>;
+    };
+    for (const v of cfg.variations) delete v.judgeConfiguration;
+    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+    const { code, out } = runIn(dir);
+    assert.equal(code, 1);
+    assert.match(out, /routes on loop_if_judge_below/);
+    assert.match(out, /'autofactory-metrics-author' has no judge attached/);
+    assert.match(out, /Attach a judge/, "the message says what to do");
+  });
+
   it("rejects a judge loop declared AFTER another edge from the same node", () => {
     // The silent-failure hazard: the walker takes the first passing edge, so a
     // late-declared loop never fires. Caught at build time rather than in a run.

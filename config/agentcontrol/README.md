@@ -217,8 +217,11 @@ Three things to understand before adding one:
    signal. Ordering a loop first is always safe, since its own conditions decide
    whether it fires. `check:configs` enforces this for **every** `max_visits` edge (not
    just judge ones), permits several loop edges from one node, and additionally checks
-   the `[0, 1]` threshold range, that a judge loop carries `max_visits`, and that a loop
-   edge's routing conditions name tags its own source can produce.
+   the `[0, 1]` threshold range, that a judge loop carries `max_visits`, that a loop
+   edge's routing conditions name tags its own source can produce, and that a
+   `loop_if_judge_below` edge's **source has a judge attached** in its committed AI
+   config — the score fails open, so a judge-less source is a loop that can never fire,
+   and the walker's runtime warning is the only other signal.
 
 The re-entered node's rework preamble names the score and the judge
 (*"Sent back by 'metrics-author' because metrics-quality scored 0.55, below 0.7"*) and

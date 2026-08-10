@@ -51,6 +51,16 @@ function listJson(dir) {
 const instructionsOf = (p) => JSON.parse(readFileSync(p, "utf8")).variations?.[0]?.instructions ?? "";
 const edgeId = (from, to, kind) => `${from} -${kind}-> ${to}`;
 
+/** Whether the committed AI config for `configKey` attaches at least one judge. */
+function nodeHasJudge(configKey) {
+  try {
+    const cfg = JSON.parse(readFileSync(join(AI_CONFIG_DIR, `${configKey}.json`), "utf8"));
+    return (cfg.variations ?? []).some((v) => (v.judgeConfiguration?.judges ?? []).length > 0);
+  } catch {
+    return false; // no config file / unreadable → certainly no judge to route on
+  }
+}
+
 const violations = [];
 const fail = (m) => violations.push(m);
 
@@ -153,6 +163,21 @@ for (const file of listJson(GRAPH_DIR)) {
       }
       if (mv === undefined) {
         fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has loop_if_judge_below but no max_visits — an unbudgeted quality loop runs to the node-run cap.`);
+      }
+      // 6g: the source node must actually have a judge attached in its committed AI
+      // config. The score fails OPEN (no usable score → the edge is never taken), so
+      // a judge-less source makes the edge dead config that fails silently — the
+      // walker's runtime warning only fires per run, and only for whoever reads logs.
+      // (samplingRate lives in LaunchDarkly and cannot be checked here; this covers
+      // the committed half.)
+      if (!nodeHasJudge(edge.sourceConfig)) {
+        fail(
+          `graph: edge ${edge.sourceConfig} → ${edge.targetConfig} routes on loop_if_judge_below, but ` +
+            `'${edge.sourceConfig}' has no judge attached in its committed AI config ` +
+            `(${AI_CONFIG_DIR}/${edge.sourceConfig}.json has no variation with judgeConfiguration.judges). ` +
+            `Judge scores fail open, so this loop can never fire. Attach a judge to '${edge.sourceConfig}' ` +
+            `(see autofactory-metrics-author.json for the shape) or remove loop_if_judge_below from the edge.`,
+        );
       }
     }
     // 6f: a LOOP edge's conditions on ROUTING tags must name tags its SOURCE node can
