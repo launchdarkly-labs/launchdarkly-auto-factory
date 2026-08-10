@@ -12,7 +12,7 @@ interface Patch {
 /** Multivariate LdClient stub: AutoFactory lineage flags with per-env targeting. */
 function fakeLd(
   flags: Record<string, Record<string, unknown>>,
-  opts: { dependents?: string[]; policy?: Record<string, unknown> } = {},
+  opts: { dependents?: string[]; policy?: Record<string, unknown>; policyStatus?: number; policyThrows?: boolean } = {},
 ) {
   const patches: Patch[] = [];
   const ld = {
@@ -27,10 +27,14 @@ function fakeLd(
       patches.push({ flagKey, instructions });
       return { status: 200, data: {} };
     },
-    request: async () => {
-      // getReleasePolicy is best-effort; unstubbed reads throw and fall back to defaults.
-      if (!opts.policy) throw new Error("policy read not stubbed");
-      return { status: 200, data: opts.policy };
+    request: async (o: { path: string }) => {
+      // Release-settings reads: 404 / throw / 200-with-body, per the stub options. Any
+      // other request (the automated-releases list) returns an empty page.
+      if (!o.path.includes("release-settings")) return { status: 200, ok: true, data: { items: [] } };
+      if (opts.policyThrows) throw new Error("connection reset");
+      if (opts.policyStatus === 404) return { status: 404, ok: false, data: {} };
+      if (!opts.policy) return { status: 200, ok: true, data: { releaseMethod: "", releasePolicyKey: "" } };
+      return { status: 200, ok: true, data: opts.policy };
     },
   } as unknown as LdClient;
   return { ld, patches };
@@ -246,5 +250,43 @@ describe("triggerRelease — release policy is inherited, not overridden", () =>
     await triggerRelease(ld, discovered({ releasePlan: { metricKeys: ["only-mine"] } }), "production");
     const prefs = releaseInstr(patches).metricMonitoringPreferences as Record<string, { autoRollback: boolean }>;
     assert.deepEqual(prefs, { "only-mine": { autoRollback: true } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A policy read FAILURE is not "no policy". Conflating them drops the org's metric
+// baseline and flips auto-rollback on — silently overriding a pause-and-wait policy.
+// ---------------------------------------------------------------------------
+describe("triggerRelease — an unreadable policy is reported, not mistaken for absent", () => {
+  const flags = () => ({ "enable-x": mvFlag(["control", "v1"], { on: false }) });
+
+  it("a 404 from release-settings is reported as unreadable", async () => {
+    // Observed on a live project: an environment with NO policy returns 200 with empty
+    // fields. So 404 means the path or flag is wrong — including the rename the beta
+    // endpoint is warned about — and must not read as "no policy configured".
+    const { ld } = fakeLd(flags(), { policyStatus: 404 });
+    const r = await triggerRelease(ld, discovered({ releasePlan: { metricKeys: ["m1"] } }), "production");
+    assert.match(r.note ?? "", /policy UNREADABLE/);
+    assert.match(r.note ?? "", /404/);
+  });
+
+  it("a thrown read is reported as unreadable, with the cause", async () => {
+    const { ld } = fakeLd(flags(), { policyThrows: true });
+    const r = await triggerRelease(ld, discovered({ releasePlan: { metricKeys: ["m1"] } }), "production");
+    assert.match(r.note ?? "", /policy UNREADABLE/);
+    assert.match(r.note ?? "", /connection reset/);
+  });
+
+  it("a genuinely absent policy (200, empty fields) is SILENT — nothing went wrong", async () => {
+    const { ld } = fakeLd(flags()); // default stub: 200 with empty releaseMethod
+    const r = await triggerRelease(ld, discovered({ releasePlan: { metricKeys: ["m1"] } }), "production");
+    assert.doesNotMatch(r.note ?? "", /UNREADABLE/);
+  });
+
+  it("an unreadable read still releases — a renamed beta path must not stop every release", async () => {
+    const { ld, patches } = fakeLd(flags(), { policyThrows: true });
+    const r = await triggerRelease(ld, discovered({ releasePlan: { metricKeys: ["m1"] } }), "production");
+    assert.equal(r.method, "guarded", "manifest metrics still produce a guarded release");
+    assert.ok(patches.length > 0, "the release was started");
   });
 });

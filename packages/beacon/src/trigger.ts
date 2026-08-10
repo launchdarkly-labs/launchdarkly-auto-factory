@@ -15,7 +15,7 @@
  */
 
 import {
-  getReleasePolicy,
+  readReleasePolicy,
   latestVariationValue,
   normalizeReleaseIntent,
   startRelease,
@@ -246,11 +246,20 @@ export async function triggerRelease(
   }
 
   // Defaults precedence: manifest releasePlan > the flag's release policy > demo defaults.
-  let policy: ReleasePolicy | null = null;
-  try {
-    policy = await getReleasePolicy(ld, flag.flagKey, environmentKey);
-  } catch {
-    policy = null; // policy read is best-effort; fall back to demo defaults
+  //
+  // A read FAILURE is not the same as "no policy configured", and conflating them is
+  // dangerous: with no policy we drop the org's metric baseline and default auto-rollback
+  // to on, which silently overrides a policy that says pause-and-wait. We still proceed
+  // (a renamed beta path must not hard-stop every release, and Beacon's idempotency means
+  // a hold might never be retried) — but the run says so.
+  const policyRead = await readReleasePolicy(ld, flag.flagKey, environmentKey);
+  const policy: ReleasePolicy | null = policyRead.status === "ok" ? policyRead.policy : null;
+  let policyNote: string | undefined;
+  if (policyRead.status === "unreadable") {
+    policyNote =
+      `release policy UNREADABLE (${policyRead.reason}) — released with manifest metrics only and ` +
+      `auto-rollback on; a configured policy may have been ignored`;
+    console.warn(`auto-factory: ${policyNote}`);
   }
 
   const ov = flag.releasePlan ?? flag.releaseOverrides ?? {};
@@ -275,7 +284,7 @@ export async function triggerRelease(
       ],
       "auto-factory: immediate release",
     );
-    return { flagKey: flag.flagKey, method };
+    return { flagKey: flag.flagKey, method, ...(policyNote ? { note: policyNote } : {}) };
   }
 
   const metrics: MetricRef[] = [
@@ -316,9 +325,12 @@ export async function triggerRelease(
       : {}),
   });
 
+  const notes = [policyNote, usedDefaults ? "used demo default stages (no overrides or policy stages)" : ""]
+    .filter(Boolean)
+    .join("; ");
   return {
     flagKey: flag.flagKey,
     method,
-    ...(usedDefaults ? { note: "used demo default stages (no overrides or policy stages)" } : {}),
+    ...(notes ? { note: notes } : {}),
   };
 }

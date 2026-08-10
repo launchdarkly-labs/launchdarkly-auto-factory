@@ -11,7 +11,7 @@
  * Concrete request/response shapes: reference-private/internal-apis/.
  */
 
-import type { LdClient } from "./ldClient.js";
+import type { LdClient, LdResponse } from "./ldClient.js";
 import type { MetricRef, ReleaseKind, Stage } from "./types.js";
 
 /** Beta header required by the automated-release endpoints (subject to change). */
@@ -141,7 +141,32 @@ export interface AutomatedRelease {
   }>;
 }
 
-const TERMINAL: ReadonlySet<ReleaseStatus> = new Set(["completed", "reverted", "monitoring_stopped"]);
+const TERMINAL: ReadonlySet<string> = new Set(["completed", "reverted", "monitoring_stopped"]);
+
+/**
+ * Statuses we positively recognise as "still running". Deliberately an allowlist, and
+ * deliberately asymmetric with TERMINAL — an UNKNOWN status must be handled differently
+ * by the two callers, and both directions fail safe:
+ *
+ *  - monitoring stops on anything not known-running, so an unrecognised state (a release
+ *    PAUSED awaiting human intervention, which `rollbackOnRegression: false` now makes
+ *    reachable, or any state LaunchDarkly adds later) is reported instead of polled until
+ *    the timeout fires and reads like an error. Monitoring is observe-only, so stopping
+ *    early costs nothing.
+ *  - the idempotency check treats anything not known-TERMINAL as active, so a re-delivered
+ *    deploy webhook cannot start a SECOND release on a flag that already has one.
+ */
+const KNOWN_RUNNING: ReadonlySet<string> = new Set(["in_progress"]);
+
+/** Is this release still running, as far as we can positively tell? */
+export function isReleaseRunning(status: string): boolean {
+  return KNOWN_RUNNING.has(status);
+}
+
+/** Is this release definitely finished? Unknown statuses are NOT finished. */
+export function isReleaseFinished(status: string): boolean {
+  return TERMINAL.has(status);
+}
 
 /** Read the current state of an automated release. */
 export async function getReleaseStatus(
@@ -225,19 +250,56 @@ export function normalizeReleasePolicy(raw: RawReleaseSettings): ReleasePolicy {
   return out;
 }
 
-/** Read a flag's configured release policy. Returns null if none is set (404). */
-export async function getReleasePolicy(
+/**
+ * The outcome of reading a flag's release policy. THREE states, not two, because
+ * "no policy is configured" and "we could not find out" must not be confused:
+ * both previously collapsed to `null`, and the caller then silently dropped the org's
+ * metric baseline AND flipped auto-rollback on — overriding a policy configured to pause
+ * and wait for a human, invisibly.
+ *
+ * Note which HTTP shape means what, from observing a live project: an environment with no
+ * policy returns **200 with empty strings**, not 404. So a 404 much more likely means the
+ * path or flag is wrong — including the rename this file's header predicts — and is
+ * reported as `unreadable`, not as "no policy".
+ */
+export type PolicyRead =
+  | { status: "ok"; policy: ReleasePolicy }
+  | { status: "absent" }
+  | { status: "unreadable"; reason: string };
+
+/**
+ * Read a flag's configured release policy, distinguishing absent from unreadable.
+ *
+ * Never throws: a caller deciding how to release should get a state it can report, not
+ * an exception to swallow.
+ */
+export async function readReleasePolicy(
   ld: LdClient,
   flagKey: string,
   environmentKey: string,
-): Promise<ReleasePolicy | null> {
-  const res = await ld.request<RawReleaseSettings>({
-    path: releaseSettingsPath(ld.projectKey, flagKey, environmentKey),
-    headers: BETA_HEADER,
-    okStatuses: [404],
-  });
-  if (res.status === 404) return null;
-  return normalizeReleasePolicy(res.data);
+): Promise<PolicyRead> {
+  let res: LdResponse<RawReleaseSettings>;
+  try {
+    res = await ld.request<RawReleaseSettings>({
+      path: releaseSettingsPath(ld.projectKey, flagKey, environmentKey),
+      headers: BETA_HEADER,
+      okStatuses: [404],
+    });
+  } catch (e) {
+    return { status: "unreadable", reason: e instanceof Error ? e.message : String(e) };
+  }
+  if (res.status === 404) {
+    return {
+      status: "unreadable",
+      reason:
+        `release-settings returned 404 for '${flagKey}' in '${environmentKey}'. An environment with no ` +
+        `policy returns 200 with empty fields, so this is more likely a wrong path (the beta ` +
+        `/internal endpoint is mid-rename) or an unknown flag.`,
+    };
+  }
+  const policy = normalizeReleasePolicy(res.data);
+  // A policy-free environment normalizes to {} (empty releaseMethod, no guardedReleaseConfig).
+  return Object.keys(policy).length === 0 ? { status: "absent" } : { status: "ok", policy };
 }
 
 /** Path for listing a flag's automated releases across environments (beta/internal). */
@@ -246,21 +308,31 @@ function flagAutomatedReleasesPath(projectKey: string, flagKey: string): string 
 }
 
 /**
- * Find the in-progress automated release for a flag in an environment, or null.
+ * Find the active automated release for a flag in an environment, or null.
  * `startRelease` doesn't return the release id (the semantic patch responds with
  * the flag), so this is how a caller obtains the id to monitor.
+ *
+ * "Active" is everything NOT known-terminal, not `status:in_progress`. The old
+ * server-side filter was an allowlist of one, so a release in any other non-terminal
+ * state — notably one PAUSED on a regression, which `rollbackOnRegression: false` makes
+ * reachable — read as "no active release". For the caller that uses this as a
+ * re-delivery guard, that means a retried deploy webhook would start a SECOND release on
+ * a flag that already has one. Filtering client-side against the terminal set fails safe
+ * for any status LaunchDarkly adds.
  */
 export async function findActiveRelease(
   ld: LdClient,
   flagKey: string,
   environmentKey: string,
 ): Promise<AutomatedRelease | null> {
-  const filter = encodeURIComponent(`environmentKey:${environmentKey},status:in_progress`);
+  const filter = encodeURIComponent(`environmentKey:${environmentKey}`);
   const res = await ld.request<{ items?: AutomatedRelease[] }>({
-    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=1`,
+    // No limit=1: the newest release may be terminal while an older one is still active,
+    // and a server-side limit would hide it.
+    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=20`,
     headers: BETA_HEADER,
   });
-  return res.data.items?.[0] ?? null;
+  return res.data.items?.find((r) => !isReleaseFinished(r.status)) ?? null;
 }
 
 /** Poll an automated release until it reaches a terminal state or times out. */
@@ -274,7 +346,10 @@ export async function monitorRelease(
   const deadline = Date.now() + (opts.timeoutMillis ?? 60 * 60 * 1000);
   for (;;) {
     const release = await getReleaseStatus(ld, environmentKey, releaseId);
-    if (TERMINAL.has(release.status)) return release;
+    // Stop on anything not positively running — terminal OR unrecognised. See
+    // KNOWN_RUNNING: a paused release polled until the deadline would surface as a
+    // monitoring timeout, which reads like a failure and says nothing about the pause.
+    if (!isReleaseRunning(release.status)) return release;
     if (Date.now() > deadline) {
       throw new Error(`Timed out monitoring release ${releaseId} (last status: ${release.status})`);
     }

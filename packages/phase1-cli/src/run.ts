@@ -336,11 +336,14 @@ async function run(opts: CliOptions): Promise<number> {
   // reused when persisting: `writeWalkState` re-hashes the tree itself, because by
   // then the agents have edited it. See the comment on writeWalkState.
   const configStamp = localConfigHash();
+  // Hoisted: computing it twice ran git twice AND could store a hash that was never the
+  // one compared, if a file changed between the two calls.
+  const treeHash = computeTreeHash(root);
   const stateKeys: WalkStateKeys = {
     graphKey: opts.graphKey,
     ...(configStamp ? { configStamp } : {}),
     ...(state.head ? { head: state.head } : {}),
-    ...(computeTreeHash(root) ? { treeHash: computeTreeHash(root) } : {}),
+    ...(treeHash ? { treeHash } : {}),
     policyMode: policy.mode,
     base: opts.base,
   };

@@ -121,6 +121,19 @@ describe("autofactory CLI args — resume", () => {
     assert.match(err(["run", "--feedback", "x"]), /only applies with --resume/);
   });
 
+  it("rejects the SAME edge granted twice rather than picking a semantic", () => {
+    // Overwrite (what this did) and sum (what mergeGrants does across rounds) disagree, so
+    // a repeat is refused instead of silently resolved one way.
+    const e = err(["run", "--resume", "--feedback", "x", "--grant-visits", "a:b=1", "--grant-visits", "a:b=2"]);
+    assert.match(e, /more than once/);
+    assert.match(e, /a:b/);
+  });
+
+  it("still allows grants on DIFFERENT edges in one invocation", () => {
+    const o = ok(["run", "--resume", "--feedback", "x", "--grant-visits", "a:b=1", "--grant-visits", "c:d=2"]);
+    assert.deepEqual(o.grantVisits, { "a→b": 1, "c→d": 2 });
+  });
+
   it("rejects malformed grants rather than silently ignoring them", () => {
     for (const bad of ["ab=1", "a:b", "a:b=0", "a:b=x", "a:b=c=1"]) {
       assert.match(err(["run", "--resume", "--feedback", "x", "--grant-visits", bad]), /--grant-visits/, bad);

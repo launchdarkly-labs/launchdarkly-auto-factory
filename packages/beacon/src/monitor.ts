@@ -12,6 +12,7 @@
  */
 
 import {
+  isReleaseFinished,
   findActiveRelease,
   monitorRelease,
   type AutomatedRelease,
@@ -69,10 +70,24 @@ export async function monitorTriggeredRelease(
       // the PREVIOUS variation — re-point auto-factory children to what the
       // environment serves now. Never throws (logs its own outcomes).
       await repointDependentPrerequisites(ld, flagKey, environmentKey);
-    } else {
+    } else if (isReleaseFinished(final.status)) {
       // reverted = a guardrail metric regressed and LD rolled the flag back;
       // monitoring_stopped = a human intervened. Both are end states for us.
       console.warn(`${tag}: ended ${final.status.toUpperCase()} (stage ${final.latestStageIndex})`);
+    } else {
+      // Not running and not finished: a state we do not model — most plausibly a release
+      // PAUSED on a regression, which is what `rollbackOnRegression: false` asks for.
+      // Say so loudly with the per-metric detail, because the whole point of choosing
+      // pause-over-rollback is that a human steps in, and nothing else here would tell
+      // them. Statuses are printed verbatim rather than interpreted: we do not know
+      // LaunchDarkly's vocabulary for this, and guessing it would be worse than quoting.
+      console.warn(
+        `${tag}: release ${final.id} is neither running nor finished (status '${final.status}', stage ` +
+          `${final.latestStageIndex}) — most likely PAUSED awaiting a human. Monitoring stopped.`,
+      );
+      for (const m of final.metricConfigurations ?? []) {
+        console.warn(`${tag}:   metric ${m.metricKey} status='${m.status}' autoRollback=${m.autoRollback}`);
+      }
     }
     return final;
   } catch (e) {

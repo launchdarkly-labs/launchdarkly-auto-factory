@@ -167,11 +167,18 @@ for (const file of listJson(GRAPH_DIR)) {
           const def = registry[tag];
           if (!def || def.production !== "llm") continue;
           if (def.producedBy !== edge.sourceConfig) {
+            // The consequence is opposite per kind, so say the right one: an unsatisfiable
+            // require_tags means the loop never fires; an unreachable skip_if exit means it
+            // fires every pass until budget. Printing "never fires" for both would send a
+            // reader looking for the wrong symptom.
+            const consequence =
+              kind === "require_tags"
+                ? "this condition can never be satisfied, so the loop would never fire"
+                : "this exit can never match, so the loop would run to its full budget every time";
             fail(
               `graph: loop edge ${edge.sourceConfig} → ${edge.targetConfig} gates on '${tag}' (${kind}), ` +
                 `which is produced by '${def.producedBy}', not by the edge's source. The walker matches a loop edge's ` +
-                `routing conditions against the source run's OWN tags, so this condition can never be satisfied and the ` +
-                `loop would never fire.`,
+                `routing conditions against the source run's OWN tags, so ${consequence}.`,
             );
           }
         }

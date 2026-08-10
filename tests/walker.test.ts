@@ -534,6 +534,39 @@ describe("walkGraph — loop-back edges", () => {
     assert.equal(r.inventory.flag_key, "enable-y", "still last-write-wins");
   });
 
+  it("5e. warns when a loop edge's skip_if EXIT can never match (fires every pass, not never)", async () => {
+    // The twin of 5c, and the costlier one: an unsatisfiable require_tags makes the loop
+    // never fire, while an unreachable skip_if exit makes it fire until budget — burning a
+    // full live iteration each pass. Only the require case was warned about.
+    const g = graphFrom({
+      root: "research",
+      edges: {
+        research: [{ key: "flag" }],
+        flag: [{ key: "review" }],
+        // `needs_tests` is the metrics author's routing tag; the reviewer never emits it,
+        // so this exit can never match.
+        review: [{ key: "flag", handoff: { max_visits: 2, skip_if_tags: { needs_tests: "true" } } }],
+      },
+    });
+    const runner = new ScriptedRunner({ research: { tags: { needs_tests: "true" } } });
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+    let r;
+    try {
+      r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+    } finally {
+      console.warn = realWarn;
+    }
+    // It really does burn the whole budget: flag runs 1 + max_visits(2) times.
+    assert.equal(countOf(r, "flag"), 3);
+    assert.equal(r.loopExhausted?.reason, "budget");
+    const warn = warnings.find((w) => w.includes("can never EXIT"));
+    assert.ok(warn, `expected an unreachable-exit warning, got: ${warnings.join(" | ")}`);
+    assert.match(warn!, /needs_tests/);
+    assert.match(warn!, /full budget every time/, "the diagnosis must be 'fires every pass', not 'never fires'");
+  });
+
   it("9. envelope inheritance: a re-run inherits the first-entry max_turns/capabilities", async () => {
     const g = graphFrom({
       root: "research",

@@ -33410,16 +33410,22 @@ var LdApiError = class extends Error {
 
 // ../shared/dist/releaseAdapter.js
 var BETA_HEADER = { "LD-API-Version": "beta" };
+var TERMINAL = /* @__PURE__ */ new Set(["completed", "reverted", "monitoring_stopped"]);
+function isReleaseFinished(status) {
+  return TERMINAL.has(status);
+}
 function flagAutomatedReleasesPath(projectKey, flagKey) {
   return `/internal/projects/${projectKey}/flags/${flagKey}/automated-releases`;
 }
 async function findActiveRelease(ld, flagKey, environmentKey) {
-  const filter = encodeURIComponent(`environmentKey:${environmentKey},status:in_progress`);
+  const filter = encodeURIComponent(`environmentKey:${environmentKey}`);
   const res = await ld.request({
-    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=1`,
+    // No limit=1: the newest release may be terminal while an older one is still active,
+    // and a server-side limit would hide it.
+    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=20`,
     headers: BETA_HEADER
   });
-  return res.data.items?.[0] ?? null;
+  return res.data.items?.find((r) => !isReleaseFinished(r.status)) ?? null;
 }
 
 // ../shared/dist/releaseIntent.js
@@ -33677,6 +33683,16 @@ function warnIfOnlyStaleWouldMatch(isLoop, source, target, kind, cond, accumulat
 function unionCsv(existing, incoming) {
   const split = (s) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   return [.../* @__PURE__ */ new Set([...split(existing), ...split(incoming)])].join(",");
+}
+function warnIfExitUnreachable(isLoop, source, target, skip, accumulated, fresh) {
+  if (!isLoop || !skip)
+    return;
+  if (!tagsMatch(accumulated, skip))
+    return;
+  const foreign = Object.keys(skip).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === void 0);
+  if (foreign.length === 0)
+    return;
+  console.warn(`[loop] edge ${source} \u2192 ${target} can never EXIT: its skip_if_tags names routing tag(s) ${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched against the source run's own tags, so this loop will run to its full budget every time \u2014 check the SERVED graph.`);
 }
 function tagsMatch(tags, cond) {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
@@ -33958,6 +33974,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         continue;
       }
       const skip = handoffTags(h, "skip_if_tags");
+      warnIfExitUnreachable(isLoop, key, edge.key, skip, accumulatedTags, matchAgainst);
       if (skip && tagsMatch(matchAgainst, skip))
         continue;
       const below = handoffNumber(h, "loop_if_judge_below");
@@ -34345,7 +34362,7 @@ function createPolicyGate(policy, approve) {
 }
 
 // ../shared/dist/vegaClient.js
-var TERMINAL = /* @__PURE__ */ new Set(["completed", "failed", "stopped", "cancelled"]);
+var TERMINAL2 = /* @__PURE__ */ new Set(["completed", "failed", "stopped", "cancelled"]);
 var StubVegaTransport = class {
   async dispatch(_req) {
     throw new Error("Vega transport not configured \u2014 set VEGA_ENDPOINT + VEGA_TOKEN, or use the default 'anthropic' provider.");
@@ -34369,7 +34386,7 @@ var VegaClient = class {
     const deadline = Date.now() + this.timeoutMillis;
     for (; ; ) {
       const result = await this.transport.getStatus(conversationId);
-      if (TERMINAL.has(result.status))
+      if (TERMINAL2.has(result.status))
         return result;
       if (Date.now() > deadline) {
         throw new Error(`Vega node ${req.configKey} timed out (status: ${result.status})`);

@@ -363,6 +363,34 @@ function unionCsv(existing: string | undefined, incoming: string): string {
   return [...new Set([...split(existing), ...split(incoming)])].join(",");
 }
 
+/**
+ * Warn when a loop edge's `skip_if_tags` exit can never match, because it names routing
+ * tags the source run didn't emit. The loop then fires on every pass until its budget is
+ * spent — burning a full live iteration each time — so this is the more expensive twin of
+ * `warnIfOnlyStaleWouldMatch`, and it needs the opposite diagnosis.
+ */
+function warnIfExitUnreachable(
+  isLoop: boolean,
+  source: string,
+  target: string,
+  skip: Record<string, string> | undefined,
+  accumulated: Record<string, string>,
+  fresh: Record<string, string>,
+): void {
+  if (!isLoop || !skip) return;
+  // Only interesting when the stale view WOULD have exited — otherwise the condition is
+  // simply unmet this pass, which is ordinary.
+  if (!tagsMatch(accumulated, skip)) return;
+  const foreign = Object.keys(skip).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === undefined);
+  if (foreign.length === 0) return;
+  console.warn(
+    `[loop] edge ${source} → ${target} can never EXIT: its skip_if_tags names routing tag(s) ` +
+      `${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched ` +
+      `against the source run's own tags, so this loop will run to its full budget every time — check the ` +
+      `SERVED graph.`,
+  );
+}
+
 /** All key/value pairs in `cond` are present and equal in `tags`. */
 function tagsMatch(tags: Record<string, string>, cond: Record<string, string>): boolean {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
@@ -978,6 +1006,10 @@ export async function walkGraph(
         continue;
       }
       const skip = handoffTags(h, "skip_if_tags");
+      // A loop edge's skip_if is its EXIT. If it names a routing tag the source can't
+      // emit, the exit can never match and the loop runs to budget every single time —
+      // the opposite failure from an unsatisfiable require_tags, and the costlier one.
+      warnIfExitUnreachable(isLoop, key, edge.key, skip, accumulatedTags, matchAgainst);
       if (skip && tagsMatch(matchAgainst, skip)) continue;
       // Quality gate: take this edge only when the just-completed node scored BELOW
       // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
