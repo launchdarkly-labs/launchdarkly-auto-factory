@@ -33512,14 +33512,16 @@ function normalizeNotBefore(v, issues) {
       return { value: parsed.toISOString().slice(0, 10), coerced: true };
     }
   } else {
-    const parsed = new Date(raw);
-    if (!Number.isNaN(parsed.getTime())) {
-      const iso = [
-        parsed.getFullYear(),
-        String(parsed.getMonth() + 1).padStart(2, "0"),
-        String(parsed.getDate()).padStart(2, "0")
-      ].join("-");
-      return { value: iso, coerced: iso !== raw };
+    const asWritten = /* @__PURE__ */ new Date(`${raw} UTC`);
+    if (!Number.isNaN(new Date(raw).getTime()) && !Number.isNaN(asWritten.getTime())) {
+      const iso = asWritten.toISOString().slice(0, 10);
+      const written = raw.match(/\d+/g) ?? [];
+      const year = iso.slice(0, 4);
+      const day = String(Number(iso.slice(8, 10)));
+      const hasYear = written.includes(year);
+      const hasDay = written.some((n) => n.length <= 2 && String(Number(n)) === day);
+      if (hasYear && hasDay)
+        return { value: iso, coerced: iso !== raw };
     }
   }
   issues.push(`notBefore '${raw}' is not a parseable date (use YYYY-MM-DD) \u2014 treated as unintelligible`);

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import {
+  WALK_STATE_VERSION,
   clearWalkState,
   computeTreeHash,
   readWalkState,
@@ -60,7 +61,7 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
     assert.equal(read?.haltedAt.node, "autofactory-flag-implementer");
     assert.deepEqual(read?.runs, sampleRuns);
     assert.ok(read?.at, "stamped with a write time");
-    assert.equal(read?.version, 1);
+    assert.equal(read?.version, WALK_STATE_VERSION, "stamped with the current schema version");
   });
 
   it("reads as absent before a write and after a clear", () => {
@@ -71,6 +72,38 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
     clearWalkState(dir);
     assert.equal(readWalkState(dir), undefined);
     assert.equal(existsSync(walkStatePath(dir)), false);
+  });
+
+  it("a journal from an older schema version is REFUSED, not misread", () => {
+    // v2 added `grants` and `base`. A v1 journal read as if it were v2 would silently
+    // carry no grants and then diverge mid-replay — a confusing failure instead of a
+    // clean refusal. (Written as a raw file: writeWalkState always stamps the current
+    // version, so only an older build could have produced this.)
+    const dir = repo();
+    writeFileSync(
+      walkStatePath(dir),
+      JSON.stringify({
+        version: 1,
+        graphKey: "g",
+        configStamp: "cfg123",
+        head: "sha1",
+        treeHash: "tree1",
+        policyMode: "always",
+        haltedAt: { kind: "pending-approval", node: "n" },
+        runs: sampleRuns,
+        at: "2026-08-09T00:00:00.000Z",
+      }),
+    );
+    const r = validateWalkState(readWalkState(dir), {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: "sha1",
+      treeHash: "tree1",
+      policyMode: "always",
+      base: "main",
+    });
+    assert.equal(r.ok, false);
+    assert.match((r as { reason: string }).reason, /version 1, this build expects 2/);
   });
 
   it("a corrupt file reads as absent rather than throwing", () => {

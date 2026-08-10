@@ -109,6 +109,14 @@ describe("normalizeNotBefore is timezone-independent", () => {
     "2026-08-01 00:00:00 GMT",
     "2026-08-01T12:00:00",
     "2026-08",
+    // Non-ISO shapes CARRYING A ZONE — the gap the third attempt left open. These are
+    // instants, so local-field formatting shifted them a day west of UTC.
+    "Fri, 01 Aug 2026 00:00:00 GMT",
+    "Aug 1 2026 UTC",
+    "August 1, 2026 00:00 UTC",
+    "Aug 1 2026 EST",
+    "Aug 1 2026 00:00 +02:00",
+    "8/1/2026",
   ];
   // Sign, magnitude, a half-hour offset, and both extremes of the UTC range.
   const ZONES = [
@@ -157,6 +165,12 @@ describe("normalizeNotBefore is timezone-independent", () => {
       "2026-08-01T12:00:00": "2026-08-01",
       // No day component: normalised to the first, deterministically.
       "2026-08": "2026-08-01",
+      "Fri, 01 Aug 2026 00:00:00 GMT": "2026-08-01",
+      "Aug 1 2026 UTC": "2026-08-01",
+      "August 1, 2026 00:00 UTC": "2026-08-01",
+      "Aug 1 2026 EST": "2026-08-01",
+      "Aug 1 2026 00:00 +02:00": "2026-08-01",
+      "8/1/2026": "2026-08-01",
     };
     for (const tz of ZONES) {
       assert.deepEqual(notBeforeIn(tz), expected, `notBefore drifted under TZ=${tz}`);
@@ -166,7 +180,17 @@ describe("normalizeNotBefore is timezone-independent", () => {
   it("malformed and impossible dates fail CLOSED, in every zone", () => {
     // 2026-02-30 with a time suffix is the nastier one: V8 does not reject it, it
     // rolls it to March 2 — so a run would have released two days early.
-    for (const bad of ["2026-02-30", "2026-02-30T00:00:00Z", "2026-08-011", "not a date"]) {
+    // "Feb 30 2026" and "Aug 1" are the non-ISO fail-open cases: V8 rolls the former to
+    // March 2 and reads the latter as the year 2001 — both release EARLIER than intended.
+    for (const bad of [
+      "2026-02-30",
+      "2026-02-30T00:00:00Z",
+      "2026-08-011",
+      "not a date",
+      "Feb 30 2026",
+      "Aug 1",
+      "2026",
+    ]) {
       for (const tz of ["UTC", "America/Los_Angeles", "Pacific/Kiritimati"]) {
         const script = `
           const { normalizeReleaseIntent } = await import(${JSON.stringify(MODULE)});

@@ -25,8 +25,14 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import type { NodeRun } from "@auto-factory/shared";
 
-/** Bumped when the shape changes; a mismatch invalidates instead of mis-reading. */
-export const WALK_STATE_VERSION = 1;
+/**
+ * Bumped when the shape changes; a mismatch invalidates instead of mis-reading.
+ *
+ * v2 added `grants` (cumulative loop-budget grants) and `base`. Both are load-bearing:
+ * a v2 journal read by a v1 build would silently drop the grants and then diverge
+ * mid-replay, which is a confusing failure rather than a clean refusal.
+ */
+export const WALK_STATE_VERSION = 2;
 
 const FILE_NAME = "autofactory-walk-state.json";
 

@@ -114,16 +114,21 @@ function isRealCalendarDay(ymd: string): boolean {
  *   2026-08-01 00:00 UTC        → 2026-08-01
  *   2026-08-01T12:00:00         → 2026-08-01
  *
- * Two earlier attempts got this wrong by picking a frame to format in, which is
- * where the bugs lived: formatting via `toISOString()` shifted "Aug 1 2026" to
- * 07-31 east of UTC; formatting via local getters then shifted
- * "2026-08-01T00:00:00Z" to 07-31 west of it; and choosing UTC for any
- * zone-suffixed string was wrong for every non-`Z` offset (`+02:00` midnight is
- * 07-31 in UTC) while a word zone (`… UTC`, `… GMT`) wasn't detected as a zone at
- * all, leaving it zone-dependent. Reading the prefix sidesteps all of it.
+ * Three earlier attempts got this wrong by picking a frame to FORMAT in, and each
+ * traded one off-by-one-day for another: `toISOString()` shifted "Aug 1 2026" to
+ * 07-31 east of UTC; local getters then shifted "2026-08-01T00:00:00Z" to 07-31 west
+ * of it; choosing UTC for zone-suffixed strings was wrong for every non-`Z` offset
+ * (`+02:00` midnight is 07-31 in UTC); and a word zone (`… UTC`, `… GMT`) wasn't
+ * detected as a zone at all, so non-ISO shapes carrying one stayed zone-dependent.
  *
- * Only genuinely non-ISO shapes (`Aug 1 2026`, `2026-8-1`) still need a `Date`;
- * those parse as LOCAL per spec, so they are formatted from local fields.
+ * The rule that ends it: never compute a calendar date from an instant. Read what was
+ * written — the ISO prefix where there is one, and for non-ISO a UTC REINTERPRETATION
+ * (see below), which recovers the written fields regardless of the frame the string
+ * named. Every branch is then identical in every runtime timezone.
+ *
+ * Both non-prefix branches also validate the parse rather than trusting it, because
+ * V8's leniency fails OPEN — it rolls "2026-02-30" to March 2 and reads "Aug 1" as the
+ * year 2001, either of which would release EARLIER than intended, silently.
  */
 function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coerced: boolean } {
   if (v === undefined || v === null || v === "") return { value: "", coerced: false };
@@ -146,14 +151,29 @@ function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coer
       return { value: parsed.toISOString().slice(0, 10), coerced: true };
     }
   } else {
-    const parsed = new Date(raw);
-    if (!Number.isNaN(parsed.getTime())) {
-      const iso = [
-        parsed.getFullYear(),
-        String(parsed.getMonth() + 1).padStart(2, "0"),
-        String(parsed.getDate()).padStart(2, "0"),
-      ].join("-");
-      return { value: iso, coerced: iso !== raw };
+    // Non-ISO ("Aug 1 2026", "Fri, 01 Aug 2026 00:00:00 GMT", "8/1/2026").
+    //
+    // Reinterpreting in UTC recovers the date the author WROTE, whatever frame the
+    // string named — appending " UTC" re-anchors the written fields and overrides any
+    // zone token, so the result is identical in every runtime timezone. That matters
+    // because local-field formatting was only right for ZONELESS input: a string
+    // carrying `GMT`/`UTC`/`EST`/an offset is an instant, and reading its local fields
+    // shifted the date by a day west of UTC. Deliberately vocabulary-free — V8's
+    // accepted zone tokens are implementation-defined (it takes `UT` but rejects
+    // `CEST`), so any regex over them would be a guess about the parser's table.
+    const asWritten = new Date(`${raw} UTC`);
+    if (!Number.isNaN(new Date(raw).getTime()) && !Number.isNaN(asWritten.getTime())) {
+      const iso = asWritten.toISOString().slice(0, 10);
+      // Validate against the numbers actually written, because this branch has no ISO
+      // prefix to check and V8's leniency fails OPEN: "Feb 30 2026" becomes March 2 and
+      // "Aug 1" becomes the year 2001 — both would release EARLIER than intended,
+      // silently. Require the written text to contain the resulting year and day.
+      const written: string[] = raw.match(/\d+/g) ?? [];
+      const year = iso.slice(0, 4);
+      const day = String(Number(iso.slice(8, 10)));
+      const hasYear = written.includes(year);
+      const hasDay = written.some((n) => n.length <= 2 && String(Number(n)) === day);
+      if (hasYear && hasDay) return { value: iso, coerced: iso !== raw };
     }
   }
   issues.push(`notBefore '${raw}' is not a parseable date (use YYYY-MM-DD) — treated as unintelligible`);
