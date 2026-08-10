@@ -259,6 +259,12 @@ export async function triggerRelease(
   const policyRead = await readReleasePolicy(ld, flag.flagKey, environmentKey);
   const policy: ReleasePolicy | null = policyRead.status === "ok" ? policyRead.policy : null;
   let policyNote: string | undefined;
+  if (policyRead.status === "ok" && policyRead.note) {
+    // The policy WAS read and is being used; an unfamiliar field is worth surfacing but
+    // must not discard it.
+    policyNote = `release policy read with an unfamiliar shape (${policyRead.note}) — used as parsed`;
+    console.warn(`auto-factory: ${policyNote}`);
+  }
   if (policyRead.status === "unreadable") {
     policyNote =
       `release policy UNREADABLE (${policyRead.reason}) — released with manifest metrics only and ` +

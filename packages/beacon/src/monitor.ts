@@ -13,6 +13,7 @@
 
 import {
   isReleaseFinished,
+  isReleaseRunning,
   findActiveRelease,
   monitorRelease,
   type AutomatedRelease,
@@ -74,20 +75,36 @@ export async function monitorTriggeredRelease(
       // reverted = a guardrail metric regressed and LD rolled the flag back;
       // monitoring_stopped = a human intervened. Both are end states for us.
       console.warn(`${tag}: ended ${final.status.toUpperCase()} (stage ${final.latestStageIndex})`);
+    } else if (isReleaseRunning(final.status)) {
+      // Still legitimately running when the window closed. A guarded rollout's stages can
+      // outlast the monitoring timeout, so this is a slow release, NOT a paused one —
+      // diagnosing it as paused sent the operator looking for a human decision that nobody
+      // was asked to make.
+      console.warn(
+        `${tag}: stopped watching release ${final.id} — still ${final.status} (stage ` +
+          `${final.latestStageIndex}) after the monitoring window. The release continues in ` +
+          `LaunchDarkly; nothing here is waiting on a human.`,
+      );
     } else {
-      // Neither running nor finished when the watch window ran out — most plausibly still
-      // PAUSED on a regression, which `rollbackOnRegression: false` asks for. The poll loop
-      // keeps watching such a release (a human may resume it), so reaching here means it
-      // was still unresolved at the deadline. Per-metric detail is printed VERBATIM: we do
-      // not know LaunchDarkly's vocabulary for this state, and quoting beats guessing.
+      // Neither running nor finished: most plausibly PAUSED on a regression, which
+      // `rollbackOnRegression: false` asks for. The poll loop keeps watching such a release
+      // (a human may resume it), so reaching here means it was still unresolved at the
+      // deadline. Per-metric detail is printed VERBATIM — we do not know LaunchDarkly's
+      // vocabulary for this state, and quoting beats guessing.
       console.warn(
         `${tag}: stopped watching release ${final.id} — still '${final.status}' (stage ` +
-          `${final.latestStageIndex}) after the monitoring window. Most likely PAUSED awaiting a human; ` +
-          `child-flag repointing will happen on the next deploy once it completes.`,
+          `${final.latestStageIndex}) after the monitoring window. Most likely PAUSED awaiting a human.`,
       );
       for (const m of final.metricConfigurations ?? []) {
         console.warn(`${tag}:   metric ${m.metricKey} status='${m.status}' autoRollback=${m.autoRollback}`);
       }
+      // Deliberately NOT promising that a later deploy repoints child flags: discovery is a
+      // manifest DIFF, so a flag whose manifest exists at both SHAs is never rediscovered
+      // and `triggerRelease` never runs for it again. See docs/release-policy-metrics.md.
+      console.warn(
+        `${tag}:   note: if this release later completes outside this window, child flags pinned to the ` +
+          `previous variation are NOT repointed automatically — see the deferred watch-ledger item.`,
+      );
     }
     return final;
   } catch (e) {

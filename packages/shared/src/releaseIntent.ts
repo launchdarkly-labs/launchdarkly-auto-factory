@@ -86,68 +86,65 @@ function normalizePrerequisites(v: unknown, issues: string[]): { value: IntentPr
 }
 
 /**
- * A calendar date at the START of the string, cleanly terminated (end of string, or
- * followed by `T`/whitespace before a time). This prefix IS the answer — never compute a
- * calendar date from an instant.
+ * RFC 3339 `full-date`: `YYYY-MM-DD`, with month and day range-checked by the grammar
+ * itself (01-12, 01-31). Calendar validity — Feb 30, Apr 31 — is checked separately.
  */
-const ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?=$|[T\s])/;
-/** A year-month with no day. Strict, unambiguous, and V8 parses it in UTC. */
-const ISO_YEAR_MONTH_RE = /^\d{4}-\d{2}$/;
+const RFC3339_FULL_DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
 
-/** Is `ymd` a real calendar day? `2026-02-30` is not, and V8 rolls it to March 2. */
-function isRealCalendarDay(ymd: string): boolean {
-  const d = new Date(`${ymd}T00:00:00Z`);
-  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === ymd;
+/** Days in a month, with the full Gregorian leap rule. */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] ?? 0;
 }
 
 /**
- * Parse a notBefore value into ISO YYYY-MM-DD, or report it as an issue.
+ * Parse a notBefore value. Accepts an RFC 3339 `full-date` (`YYYY-MM-DD`) and nothing
+ * else; anything unparseable holds the release with an issue.
  *
- * ISO ONLY. `YYYY-MM-DD` (optionally followed by a time and any zone), or `YYYY-MM`.
- * Anything else — `Aug 1 2026`, `1/12/2026`, RFC 1123 — is refused, which holds the
- * release and says so on the PR.
+ * NOTE THE ABSENCE OF `new Date()`. That is the point, and it is enforceable by
+ * inspection. Five previous revisions all used `Date` — an INSTANT — to carry a CALENDAR
+ * DATE, and every bug was a symptom of converting between the two in a frame nobody chose:
  *
- * That refusal replaces four successive attempts to HEAL free-form dates, each of which
- * shipped a way to release EARLY:
+ *  - `toISOString()` on a locally-parsed value shifted the date east of UTC;
+ *  - local getters on a zone-anchored value shifted it west;
+ *  - reading zone-suffixed strings in UTC was wrong for every non-`Z` offset;
+ *  - validating a lenient parse against digit runs in the input was defeated by time
+ *    tokens, because V8 rolls an impossible day onto day 1-3;
+ *  - and `2026-08-01T24:00:00Z` — whose instant is Aug 2 — read as Aug 1 from its prefix.
  *
- *  - formatting via `toISOString()` moved "Aug 1 2026" to 07-31 east of UTC;
- *  - formatting via local getters then moved "2026-08-01T00:00:00Z" to 07-31 west of it;
- *  - reading zone-suffixed strings in UTC was wrong for every non-`Z` offset, and word
- *    zones (`UTC`, `GMT`) weren't detected as zones at all;
- *  - reinterpreting in UTC and validating the result against digit runs in the input was
- *    defeated by time tokens — V8 rolls an impossible day onto day 1-3, exactly what an
- *    hour or minute supplies, so "Feb 30 2026 02:00" healed silently to March 2. That
- *    heuristic also could not see month-position ambiguity: "1/12/2026" from a D/M/Y
- *    author became January 12, eleven months early.
+ * That last one is not an exotic input: hour 24 is the single best-known difference
+ * between ISO 8601 (which permits it) and RFC 3339 (which forbids it, restricting hours to
+ * 00-23 "in order to reduce confusion"). Validating against the specification instead of
+ * against `new Date()`'s tolerance rules it out by construction, along with the rest of
+ * V8's leniency: it accepts `T24:00` and rolls `2026-02-30` to March 2, while rejecting
+ * `2026-13-01`. Grammar plus an explicit day-in-month check needs no parser at all.
  *
- * The lesson is that healing a free-form date requires recovering the author's intent from
- * an ambiguous string, and every shortcut for that fails open. The documented format is
- * `YYYY-MM-DD` (see INTENT_INSTRUCTIONS); a steward agent's job is to promote free text
- * into structured fields ON THE PR, where a human can see it — not at deploy time.
+ * The accepted set is deliberately ONE format — the one INTENT_INSTRUCTIONS documents.
+ * Datetimes are refused rather than truncated: a value carrying `T23:59:59Z` means an
+ * instant, and honouring only its date would open the gate ~12 hours early, which this
+ * module's contract forbids. `YYYY-MM` is refused too (a previous revision accepted it),
+ * because "which day" is a guess and one grammar with no exceptions is the whole idea.
  */
 function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coerced: boolean } {
   if (v === undefined || v === null || v === "") return { value: "", coerced: false };
   const raw = String(v).trim();
-  const prefix = ISO_DATE_PREFIX_RE.exec(raw)?.[1];
-  if (prefix) {
-    // BOTH checks matter: the prefix must be a real day (V8 rolls 2026-02-30 to March 2
-    // rather than rejecting it), AND the whole string must parse, so trailing junk like
-    // "2026-08-10 garbage" or "…T25:00" is refused rather than silently truncated.
-    if (isRealCalendarDay(prefix) && !Number.isNaN(new Date(raw).getTime())) {
-      return { value: prefix, coerced: prefix !== raw };
-    }
-  } else if (ISO_YEAR_MONTH_RE.test(raw)) {
-    // Kept deliberately: strict, unambiguous, no rollover exposure, and normalises to the
-    // first of the month. Parsed in UTC by spec, so read back in UTC — deterministic.
-    const parsed = new Date(raw);
-    if (!Number.isNaN(parsed.getTime())) {
-      return { value: parsed.toISOString().slice(0, 10), coerced: true };
+  const m = RFC3339_FULL_DATE_RE.exec(raw);
+  if (m) {
+    const year = Number(m[1]);
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    if (day <= daysInMonth(year, month)) {
+      // Already canonical: nothing is transformed, so nothing is "healed".
+      return { value: raw, coerced: false };
     }
   }
   // The "notBefore" prefix is load-bearing: normalizeReleaseIntent flips action auto→hold
   // on an issue starting with it. Reword this and the fail-closed hold disappears.
   issues.push(
-    `notBefore '${raw}' is not an ISO date (use YYYY-MM-DD) — treated as unintelligible`,
+    `notBefore '${raw}' is not a date in YYYY-MM-DD form (RFC 3339 full-date) — treated as unintelligible`,
   );
   return { value: raw, coerced: false };
 }

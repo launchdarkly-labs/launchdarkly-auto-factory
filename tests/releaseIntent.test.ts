@@ -35,18 +35,26 @@ describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
     assert.match(r.issues.join(" "), /not understood/);
   });
 
-  it("notBefore accepts ISO only; everything else holds (fail-closed)", () => {
-    assert.equal(normalizeReleaseIntent({ notBefore: "2026-08-01" }).intent.notBefore, "2026-08-01");
-    // A datetime keeps its written date; the time is dropped.
-    const withTime = normalizeReleaseIntent({ notBefore: "2026-08-01T09:30:00+02:00" });
-    assert.equal(withTime.intent.notBefore, "2026-08-01");
-    assert.equal(withTime.healed, true);
-    // Free-form dates are NO LONGER healed — four attempts at that all found ways to
-    // release early. They hold, visibly, and the steward promotes them on the PR.
-    for (const freeform of ["Aug 1 2026", "1/12/2026", "Fri, 01 Aug 2026 00:00:00 GMT", "next month"]) {
-      const r = normalizeReleaseIntent({ action: "auto", notBefore: freeform });
-      assert.equal(r.intent.action, "hold", freeform);
-      assert.match(r.issues.join(" "), /not an ISO date/, freeform);
+  it("notBefore accepts RFC 3339 full-date ONLY; everything else holds (fail-closed)", () => {
+    // Accepted verbatim, never transformed.
+    const ok = normalizeReleaseIntent({ notBefore: "2026-08-01" });
+    assert.equal(ok.intent.notBefore, "2026-08-01");
+    assert.equal(ok.healed, false, "nothing is healed — there is no transformation left");
+
+    // Everything else holds. A datetime is refused rather than truncated: honouring only
+    // its date would open the gate ~12h before an instant like T23:59:59Z.
+    for (const rejected of [
+      "2026-08-01T09:30:00+02:00",
+      "2026-08-01T24:00:00Z",
+      "Aug 1 2026",
+      "1/12/2026",
+      "Fri, 01 Aug 2026 00:00:00 GMT",
+      "2026-08",
+      "next month",
+    ]) {
+      const r = normalizeReleaseIntent({ action: "auto", notBefore: rejected });
+      assert.equal(r.intent.action, "hold", rejected);
+      assert.match(r.issues.join(" "), /YYYY-MM-DD/, rejected);
     }
   });
 
@@ -96,21 +104,10 @@ describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
 // ---------------------------------------------------------------------------
 describe("normalizeNotBefore is timezone-independent", () => {
   const MODULE = fileURLToPath(new URL("../packages/shared/dist/releaseIntent.js", import.meta.url));
-  // Every shape the normalizer still accepts: an ISO date, an ISO datetime with any zone
-  // (the written date is read from the prefix, never computed from the instant), and a
-  // year-month. Free-form dates are refused now, covered by the fail-closed matrix below.
-  const CASES = [
-    "2026-08-01",
-    "2026-01-01",
-    "2026-08-01T00:00:00Z",
-    "2026-08-01T00:00:00.000Z",
-    "2026-08-01T00:00:00+02:00",
-    "2026-08-01T09:00:00+10:00",
-    "2026-07-31T23:00:00-10:00",
-    "2026-08-01 00:00 UTC",
-    "2026-08-01T12:00:00",
-    "2026-08",
-  ];
+  // The accepted set is now exactly RFC 3339 full-date. The matrix stays as a regression
+  // guard: any reintroduction of `new Date()` into the parse path would make one of these
+  // zone-dependent again, which is how the previous five revisions each broke.
+  const CASES = ["2026-08-01", "2026-01-01", "2026-12-31", "2028-02-29", "2026-03-01"];
   // Sign, magnitude, a half-hour offset, and both extremes of the UTC range.
   const ZONES = [
     "UTC",
@@ -138,23 +135,8 @@ describe("normalizeNotBefore is timezone-independent", () => {
   }
 
   it("every accepted date shape yields the same calendar date in all zones", () => {
-    const expected = {
-      "2026-08-01": "2026-08-01",
-      "2026-01-01": "2026-01-01",
-      "2026-08-01T00:00:00Z": "2026-08-01",
-      "2026-08-01T00:00:00.000Z": "2026-08-01",
-      // Offsets: the author wrote Aug 1. Formatting these in UTC gave 07-31 — the
-      // regression that made this the third attempt.
-      "2026-08-01T00:00:00+02:00": "2026-08-01",
-      "2026-08-01T09:00:00+10:00": "2026-08-01",
-      // …and the date is the one WRITTEN, not the UTC instant: this is Aug 1 09:00Z.
-      "2026-07-31T23:00:00-10:00": "2026-07-31",
-      // A word zone after an ISO date: the prefix still decides.
-      "2026-08-01 00:00 UTC": "2026-08-01",
-      "2026-08-01T12:00:00": "2026-08-01",
-      // No day component: normalised to the first, deterministically.
-      "2026-08": "2026-08-01",
-    };
+    // Identity: an accepted value is returned verbatim, never transformed.
+    const expected = Object.fromEntries(CASES.map((c) => [c, c]));
     for (const tz of ZONES) {
       assert.deepEqual(notBeforeIn(tz), expected, `notBefore drifted under TZ=${tz}`);
     }
@@ -165,18 +147,33 @@ describe("normalizeNotBefore is timezone-independent", () => {
     // rolls it to March 2 — so a run would have released two days early.
     // "Feb 30 2026" and "Aug 1" are the non-ISO fail-open cases: V8 rolls the former to
     // March 2 and reads the latter as the year 2001 — both release EARLIER than intended.
-    // The last four are the shapes that defeated the digit-run heuristic: V8 rolls an
-    // impossible day onto day 1-3, exactly what an hour or minute token supplies, and
-    // month-position ambiguity is invisible to any such check.
+    // One entry per way a previous revision failed open, plus the grammar's own limits.
     for (const bad of [
+      // Calendar-invalid days that V8 ROLLS rather than rejecting.
       "2026-02-30",
+      "2026-02-29", // 2026 is not a leap year
+      "2026-04-31",
       "2026-02-30T00:00:00Z",
-      "2026-08-011",
-      "not a date",
+      // Hour 24: valid ISO 8601, forbidden by RFC 3339, and its instant is the NEXT day.
+      "2026-08-01T24:00:00Z",
+      // Datetimes are refused rather than truncated — honouring only the date would open
+      // the gate ~12h before an instant like T23:59:59Z.
+      "2026-08-01T00:00:00Z",
+      "2026-08-01T23:59:59Z",
+      "2026-08-01T00:00:00+02:00",
+      // Free-form: healing these is what shipped four early-release bugs.
       "Feb 30 2026 02:00",
-      "Feb 29 2026 01:00",
       "Sep 31 2026 01:00",
       "1/12/2026",
+      "Aug 1 2026",
+      // Shape errors the grammar rejects outright.
+      "2026-8-1",
+      "2026-08-011",
+      "2026-13-01",
+      "2026-00-01",
+      "2026-08-00",
+      "2026-08",
+      "not a date",
     ]) {
       for (const tz of ["UTC", "America/Los_Angeles", "Pacific/Kiritimati"]) {
         const script = `

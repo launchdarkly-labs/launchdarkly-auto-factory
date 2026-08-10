@@ -33495,28 +33495,28 @@ function normalizePrerequisites(v, issues) {
   }
   return { value: out, coerced };
 }
-var ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?=$|[T\s])/;
-var ISO_YEAR_MONTH_RE = /^\d{4}-\d{2}$/;
-function isRealCalendarDay(ymd) {
-  const d = /* @__PURE__ */ new Date(`${ymd}T00:00:00Z`);
-  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === ymd;
+var RFC3339_FULL_DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+function daysInMonth(year, month) {
+  if (month === 2) {
+    const leap = year % 4 === 0 && year % 100 !== 0 || year % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] ?? 0;
 }
 function normalizeNotBefore(v, issues) {
   if (v === void 0 || v === null || v === "")
     return { value: "", coerced: false };
   const raw = String(v).trim();
-  const prefix = ISO_DATE_PREFIX_RE.exec(raw)?.[1];
-  if (prefix) {
-    if (isRealCalendarDay(prefix) && !Number.isNaN(new Date(raw).getTime())) {
-      return { value: prefix, coerced: prefix !== raw };
-    }
-  } else if (ISO_YEAR_MONTH_RE.test(raw)) {
-    const parsed = new Date(raw);
-    if (!Number.isNaN(parsed.getTime())) {
-      return { value: parsed.toISOString().slice(0, 10), coerced: true };
+  const m = RFC3339_FULL_DATE_RE.exec(raw);
+  if (m) {
+    const year = Number(m[1]);
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    if (day <= daysInMonth(year, month)) {
+      return { value: raw, coerced: false };
     }
   }
-  issues.push(`notBefore '${raw}' is not an ISO date (use YYYY-MM-DD) \u2014 treated as unintelligible`);
+  issues.push(`notBefore '${raw}' is not a date in YYYY-MM-DD form (RFC 3339 full-date) \u2014 treated as unintelligible`);
   return { value: raw, coerced: false };
 }
 function normalizeReleaseIntent(raw) {

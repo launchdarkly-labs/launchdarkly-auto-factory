@@ -148,11 +148,11 @@ const TERMINAL: ReadonlySet<string> = new Set(["completed", "reverted", "monitor
  * deliberately asymmetric with TERMINAL — an UNKNOWN status must be handled differently
  * by the two callers, and both directions fail safe:
  *
- *  - monitoring stops on anything not known-running, so an unrecognised state (a release
- *    PAUSED awaiting human intervention, which `rollbackOnRegression: false` now makes
- *    reachable, or any state LaunchDarkly adds later) is reported instead of polled until
- *    the timeout fires and reads like an error. Monitoring is observe-only, so stopping
- *    early costs nothing.
+ *  - monitoring KEEPS POLLING an unrecognised state rather than stopping on it. A release
+ *    PAUSED awaiting human intervention — reachable now that `rollbackOnRegression: false`
+ *    is honoured — must still be watched, because a human resuming it produces the
+ *    `completed` that repoints child flags. An earlier revision stopped on unknown, which
+ *    was a reporting fix that silently cost that observation.
  *  - the idempotency check treats anything not known-TERMINAL as active, so a re-delivered
  *    deploy webhook cannot start a SECOND release on a flag that already has one.
  */
@@ -263,7 +263,7 @@ export function normalizeReleasePolicy(raw: RawReleaseSettings): ReleasePolicy {
  * reported as `unreadable`, not as "no policy".
  */
 export type PolicyRead =
-  | { status: "ok"; policy: ReleasePolicy }
+  | { status: "ok"; policy: ReleasePolicy; note?: string }
   | { status: "absent" }
   | { status: "unreadable"; reason: string };
 
@@ -278,16 +278,25 @@ export async function readReleasePolicy(
   flagKey: string,
   environmentKey: string,
 ): Promise<PolicyRead> {
-  let res: LdResponse<RawReleaseSettings>;
-  try {
-    res = await ld.request<RawReleaseSettings>({
-      path: releaseSettingsPath(ld.projectKey, flagKey, environmentKey),
-      headers: BETA_HEADER,
-      okStatuses: [404],
-    });
-  } catch (e) {
-    return { status: "unreadable", reason: e instanceof Error ? e.message : String(e) };
+  // Retried for the same reason status polling is, only more so: a missed poll is picked
+  // up on the next tick, whereas a missed policy read DISCARDS the org's configured policy
+  // for this release and forces auto-rollback on.
+  let res: LdResponse<RawReleaseSettings> | undefined;
+  let lastError = "";
+  for (let attempt = 0; attempt <= POLL_ERROR_RETRIES; attempt++) {
+    try {
+      res = await ld.request<RawReleaseSettings>({
+        path: releaseSettingsPath(ld.projectKey, flagKey, environmentKey),
+        headers: BETA_HEADER,
+        okStatuses: [404],
+      });
+      break;
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+      if (attempt === POLL_ERROR_RETRIES) return { status: "unreadable", reason: lastError };
+    }
   }
+  if (!res) return { status: "unreadable", reason: lastError || "no response" };
   if (res.status === 404) {
     return {
       status: "unreadable",
@@ -298,14 +307,18 @@ export async function readReleasePolicy(
     };
   }
   const policy = normalizeReleasePolicy(res.data);
-  // Classify by RECOGNIZED FIELDS, not by whether the body "looks empty". A policy-free
-  // environment does not send an empty body — it sends
-  // {"releaseMethod":"","releasePolicyKey":"","releasePolicyName":""} (observed live) — so
-  // "has keys but normalized to nothing" would flag every policy-free flag on every
-  // release. Each rule below names what drifted instead of guessing at emptiness.
+  // A POLICY WE PARSED IS NEVER DISCARDED. `unreadable` makes the caller fall back to
+  // manifest metrics with auto-rollback forced on, so treating an unfamiliar field as a
+  // reason to throw away a policy we successfully read would cause the exact failure this
+  // tri-state exists to prevent — and would do it org-wide the moment LaunchDarkly ships
+  // any additive field on an endpoint documented as mid-rename. Drift can only ever
+  // downgrade an otherwise-EMPTY result; against a parsed one it is a note.
   const drift = describePolicyDrift(res.data, policy);
+  if (Object.keys(policy).length > 0) {
+    return { status: "ok", policy, ...(drift ? { note: drift } : {}) };
+  }
   if (drift) return { status: "unreadable", reason: drift };
-  return Object.keys(policy).length === 0 ? { status: "absent" } : { status: "ok", policy };
+  return { status: "absent" };
 }
 
 /**
@@ -339,7 +352,16 @@ function describePolicyDrift(raw: RawReleaseSettings, normalized: ReleasePolicy)
   // (2) A config block with content from which nothing was recovered — an inner rename.
   for (const key of ["guardedReleaseConfig", "progressiveReleaseConfig"] as const) {
     const cfg = asRecord[key];
-    if (cfg && typeof cfg === "object" && Object.keys(cfg as object).length > 0) {
+    // Non-empty VALUES, not merely present keys: the no-policy body carries empty strings,
+    // and rule 3 below already exempts them. Requiring the same here keeps a policy-free
+    // environment silent even if LaunchDarkly starts sending an empty config block.
+    const hasContent =
+      cfg !== null &&
+      typeof cfg === "object" &&
+      Object.values(cfg as Record<string, unknown>).some(
+        (x) => x !== "" && x !== null && x !== undefined && !(Array.isArray(x) && x.length === 0),
+      );
+    if (hasContent) {
       const recovered =
         normalized.randomizationUnit !== undefined ||
         normalized.stages !== undefined ||

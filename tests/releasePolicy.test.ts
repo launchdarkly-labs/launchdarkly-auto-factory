@@ -208,15 +208,46 @@ describe("readReleasePolicy: drift detection without emptiness guessing", () => 
     assert.match((r as { reason: string }).reason, /unrecognized releaseMethod 'canary-release'/);
   });
 
-  it("PARTIAL drift is caught — the case an emptiness check cannot see", async () => {
-    // A recognised method beside a renamed inner config yields a NON-empty policy with the
-    // metrics silently gone, so `Object.keys(policy).length === 0` never fires.
+  it("PARTIAL drift is surfaced as a note WITHOUT discarding what parsed", async () => {
+    // A recognised method beside a renamed inner config. Reporting this as `unreadable`
+    // would throw away the method too and force auto-rollback on — worse than using the
+    // half we recovered. So: usable, with the missing half named.
     const r = await read(200, {
       releaseMethod: "guarded-release",
       guardedReleaseConfig: { metricKeysV2: ["m1"], rollbackOnRegressionV2: false },
     });
-    assert.equal(r.status, "unreadable");
-    assert.match((r as { reason: string }).reason, /guardedReleaseConfig had content but nothing in it was recognized/);
+    assert.equal(r.status, "ok");
+    assert.equal(r.status === "ok" && r.policy.releaseMethod, "guarded", "keep what parsed");
+    assert.match(
+      (r as { note?: string }).note ?? "",
+      /guardedReleaseConfig had content but nothing in it was recognized/,
+    );
+  });
+
+  it("an additive field on a VALID policy does not discard it", async () => {
+    // The failure this ordering prevents: one benign API addition previously made every
+    // read `unreadable`, which drops the metric baseline and flips auto-rollback on
+    // org-wide — the exact failure the tri-state was built to prevent.
+    const r = await read(200, {
+      releaseMethod: "guarded-release",
+      releasePolicyName: "Prod policy",
+      releasePolicyDescription: "org standard",
+      guardedReleaseConfig: { rolloutContextKindKey: "user", metricKeys: ["m1"], rollbackOnRegression: false },
+    });
+    assert.equal(r.status, "ok");
+    assert.equal(r.status === "ok" && r.policy.rollbackOnRegression, false, "pause-and-wait survives");
+    assert.deepEqual(r.status === "ok" ? r.policy.metricKeys : [], ["m1"], "the baseline survives");
+    assert.match((r as { note?: string }).note ?? "", /releasePolicyDescription/, "still reported");
+  });
+
+  it("an empty config block on a no-policy body is NOT drift", async () => {
+    // Rule 2 counts non-empty VALUES, matching rule 3's treatment of empty strings — so a
+    // policy-free environment stays silent even if LD starts sending an empty block.
+    const r = await read(200, {
+      releaseMethod: "",
+      guardedReleaseConfig: { rolloutContextKindKey: "", metricKeys: [], stages: [] },
+    });
+    assert.equal(r.status, "absent");
   });
 
   it("an unrecognized POPULATED top-level field is drift; empty ones are not", async () => {

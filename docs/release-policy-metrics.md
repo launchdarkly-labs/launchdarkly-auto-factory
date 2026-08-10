@@ -211,6 +211,18 @@ common case.
 
 ## Deferred
 
+- **A watch ledger for releases we stopped monitoring.** Beacon observes a release only
+  while `monitorRelease` is polling and only via webhooks. If a release pauses on a
+  regression and a human resumes it after the monitoring window, the completion is never
+  seen — and `repointDependentPrerequisites` (which re-points child flags pinned to the
+  previous variation) only runs on an observed completion. Repointing on a `noop` result
+  helps a re-POST of the same SHA range and nothing more, because **discovery is a manifest
+  diff**: a flag whose `.release-flags/` file exists at both SHAs is never rediscovered, so
+  `triggerRelease` never runs for it again. Closing this needs a persisted list of releases
+  we stopped watching, re-checked on any webhook independently of discovery — and even then
+  only when *some* deploy arrives, since there is no scheduler. Children stay stranded until
+  then; the monitor now says so rather than promising otherwise.
+
 - **Per-metric rollback preference from a human.** The motivating case is a dev who knows
   their feature adds latency and wants a p95 breach to pause rather than roll back. The
   API supports it per metric, so this is expressible — but the setting belongs in

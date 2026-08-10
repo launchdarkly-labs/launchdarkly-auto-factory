@@ -1059,6 +1059,28 @@ describe("walkGraph — resume (event-log replay)", () => {
       first.runs.map((r) => `${r.configKey}#${r.iteration}`),
     );
     assert.ok(resumed.runs.length > first.runs.length, "the grant did unlock further work");
+
+    // THE DISCRIMINATING STEP. The flat-total model didn't break on the first granted
+    // resume — it broke on the NEXT one, replaying a journal that already contains a
+    // granted traversal. Round 1 alone passes under the old frontier-gated shape too, so
+    // without this a regression to uniform application would go unnoticed.
+    const third = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
+      resume: {
+        journal: resumed.runs,
+        // Round 2's grant keeps the position it was issued at; nothing new is added.
+        grants: [{ edge: "x→a", visits: 1, effectiveAfterRuns: first.runs.length }],
+      },
+    });
+    assert.equal(
+      third.replayDiverged,
+      undefined,
+      `replaying an already-granted journal must not diverge; got ${JSON.stringify(third.replayDiverged)}`,
+    );
+    assert.deepEqual(
+      third.runs.slice(0, resumed.runs.length).map((r) => `${r.configKey}#${r.iteration}`),
+      resumed.runs.map((r) => `${r.configKey}#${r.iteration}`),
+      "the granted traversal replays at the position it happened",
+    );
   });
 
   it("8. an extraVisits grant cannot exceed the hard cap", async () => {
