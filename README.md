@@ -1,127 +1,115 @@
 # LaunchDarkly AutoFactory
 
-## Software factories should not stop at deployment
+A prototype software factory spanning **build, deploy, and release**.
 
-Software factories are getting very good at producing code. AI can help plan, implement,
-test, and review a change; CI can package it; CD can move it into production. Most of the
-industry's attention is concentrated on making those build and deploy stages faster.
+## Why
 
-But deployed software is not the same thing as released software.
+Software factories optimize:
 
-A deployment tells us that new code is running. It does not tell us whether customers
-should receive the new behavior, whether that behavior improves their experience, or
-whether it should keep rolling out when production signals begin to regress. Those are
-release decisions, and they are often left to manual checklists, one-off scripts, or an
-implicit final step in the deployment pipeline.
+- **Build**
+  - plan, code, test, review
+  - faster with AI
+- **Deploy**
+  - package, ship, verify
+  - faster with CI/CD
+- **Release**
+  - often implicit or manual
+  - where customers—and risk—actually enter the system
 
-That gap matters more as the rest of the factory accelerates. Producing and deploying more
-changes simply creates more release decisions, more exposure risk, and more operational
-load unless the factory also has a way to deliver those changes safely.
-
-AutoFactory explores a simple point of view:
+Deployment proves code is running. It does not prove the change is safe or valuable.
+Faster build and deploy only create more release decisions unless the factory closes that
+loop.
 
 > **A software factory is incomplete until it can release what it builds, measure the
 > outcome, and respond safely.**
 
-Release is not cleanup after deployment. It is the stage where software becomes customer
-experience—and where intent, risk, and production evidence must come together.
-
-## Build, deploy, and release are different jobs
+## The complete factory
 
 ```mermaid
 flowchart LR
-    A["Build<br/>Make a change ready"]
-    B["Deploy<br/>Make the change available"]
-    C["Release<br/>Make the change real for customers"]
-    D["Learn<br/>Use the outcome"]
+    subgraph BUILD["BUILD — make it ready"]
+        direction TB
+        B1["Understand<br/>change • scope • risk"]
+        B2["Prepare<br/>flag • control path"]
+        B3["Prove<br/>metrics • tests • review"]
+        B4[["Release manifest<br/>intent • guardrails"]]
+        B1 --> B2 --> B3 --> B4
+    end
 
-    A --> B --> C --> D
-    D -.-> A
+    subgraph DEPLOY["DEPLOY — make it available"]
+        direction TB
+        D1["Build artifact"]
+        D2["Existing CD deploys"]
+        D3["New behavior stays off"]
+        D4[["Notify<br/>service • SHA"]]
+        D1 --> D2 --> D3 --> D4
+    end
+
+    subgraph RELEASE["RELEASE — make it real"]
+        direction TB
+        R1["Discover manifest"]
+        R2["Resolve<br/>intent • policy • dependencies"]
+        R3["Roll out<br/>audience • stages"]
+        R4["Measure<br/>production guardrails"]
+        R5{"Outcome"}
+        R6["Complete"]
+        R7["Hold / stop"]
+        R8["Roll back"]
+        R1 --> R2 --> R3 --> R4 --> R5
+        R5 --> R6
+        R5 --> R7
+        R5 --> R8
+    end
+
+    B4 -->|"code + contract"| D1
+    D4 -->|"deploy succeeded"| R1
+    R6 -.->|"learn"| B1
+    R7 -.->|"adjust"| B1
+    R8 -.->|"repair"| B1
 ```
 
-### Build: make a change ready
+## Three different jobs
 
-The build stage turns an idea into a change that is safe to place in production. That means
-more than generating code and passing tests. The factory must preserve the existing
-experience, understand the change's risk, define how success and failure will be measured,
-and carry forward the intent needed to release it.
+- **Build — release-ready change**
+  - prior experience preserved
+  - new behavior behind a flag
+  - success and failure defined
+  - tests, review, release intent
+- **Deploy — available, not exposed**
+  - existing delivery pipeline
+  - code running in production
+  - customer behavior unchanged
+  - successful deploy notification
+- **Release — controlled customer exposure**
+  - human intent and dependencies honored
+  - gradual rollout
+  - production evidence vs. control
+  - complete, hold, stop, or roll back
 
-The output of build is not just an artifact. It is a **release-ready change**: code plus the
-controls, evidence, and context required to operate it safely.
+## What this repo demonstrates
 
-### Deploy: make the change available
+- **Build** — configurable AI-agent graph
+  - research, flagging, instrumentation, testing, review
+  - GitHub, editor, Cursor, and CLI entry points
+- **Deploy** — intentionally independent
+  - any CD system
+  - provider-neutral `{ service, sha }` handoff
+- **Release** — Beacon + LaunchDarkly
+  - manifest discovery
+  - guarded or progressive rollout
+  - metric-driven rollback
+- **Contract** — `.release-flags/`
+  - versioned with the code
+  - prepared while context is fresh
+  - executed only after deploy
 
-The deploy stage moves that change into a production environment and proves that it can run
-there. It should remain boring, repeatable, and owned by the team's existing delivery
-system.
+Status: working design-partner prototype; not a product.
 
-Crucially, deployment does not have to change the customer experience. When new behavior is
-separated from the deployed code, teams can move software frequently without making every
-deployment an all-or-nothing release event.
+## Go deeper
 
-### Release: make the change real for customers
-
-The release stage decides who receives the new behavior, when they receive it, and whether
-the rollout should continue. This is where the factory tests its assumptions against live
-production evidence.
-
-A first-class release stage can:
-
-- honor human intent, timing, and dependencies;
-- expose a change gradually instead of all at once;
-- compare the new experience with the previous one using meaningful guardrails;
-- stop or roll back without rebuilding or redeploying; and
-- turn the result into feedback for the next change.
-
-This changes the goal of the software factory. The goal is not maximum code throughput or
-deployment frequency in isolation. The goal is a reliable flow from idea to customer value,
-with control at the point where uncertainty is highest.
-
-## What this repository explores
-
-LaunchDarkly AutoFactory is a working prototype of that complete loop.
-
-At build time, a configurable graph of AI agents prepares a pull request as a release-ready
-change. It places new behavior behind a feature flag, preserves the prior behavior, creates
-the measurements and tests needed to evaluate the change, and records release intent beside
-the code.
-
-The team's existing CD system then deploys normally while the new behavior remains off.
-Deployment makes the change available but does not expose it.
-
-After a successful deploy, a small release orchestrator uses the intent prepared during
-build to begin a guarded release in LaunchDarkly. LaunchDarkly controls exposure, evaluates
-production metrics, and can return customers to the prior behavior automatically when a
-guardrail regresses. The outcome is observable whether the release completes, waits, stops,
-or rolls back.
-
-The versioned release manifest in `.release-flags/` connects these stages. It lets build
-prepare the release while context is fresh, lets deploy remain independent, and gives the
-release stage an explicit contract to execute.
-
-Status: this is a prototype shared with design partners, not a product. Its build and
-release paths run end-to-end against a live demo repository.
-
-## Explore the implementation
-
-- [Reference implementation and setup](REFERENCE.md) — prerequisites, configuration,
-  entry points, approval controls, observability, and deployment instructions.
-- [Factory design](docs/design-partners-factory.md) — design principles and extension seams.
-- [Interactive pipeline overview](docs/pipeline-overview.html) — the complete build and
-  release flow, node by node.
-- [Build orchestration](packages/shared/README.md) — the shared agent runtime and tools.
-- [Release orchestration](packages/beacon/README.md) — the deploy notification contract,
-  release discovery, triggering, and monitoring.
-- [Architecture decisions](docs/adr/) — the reasoning behind the implementation.
-
-For local development:
-
-```bash
-npm install
-npm run build
-npm test
-npm run typecheck
-```
-
-This repository is public. `reference-private/` and `sources/repos/` are gitignored, and
-`npm run check:public` checks for obvious internal material before it is committed.
+- [Setup and reference](REFERENCE.md)
+- [Factory design](docs/design-partners-factory.md)
+- [Detailed pipeline](docs/pipeline-overview.html)
+- [Build orchestration](packages/shared/README.md)
+- [Release orchestration](packages/beacon/README.md)
+- [Architecture decisions](docs/adr/)
