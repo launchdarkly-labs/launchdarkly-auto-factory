@@ -23,12 +23,12 @@ flowchart LR
     subgraph BUILD["Build"]
         direction TB
         B1["Configure the factory<br/>(Config Bridge)"]
-        B2["Resolve runtime instructions<br/>(Agent Configs, Tools)"]
+        B2["Resolve runtime instructions<br/>(Agent Configs)<br/>(Tools)"]
         B3["Resolve orchestration topology<br/>(Agent Graphs)"]
         B4["Read production and code context<br/>(Observability and Code References)"]
         B5["Compose run context<br/>(Knowledge graph)"]
-        B6["Execute agents safely<br/>(Graph walker and runners, Sandbox tools and safety gates)"]
-        B7["Create control and evidence<br/>(Feature Flags, Metrics)"]
+        B6["Execute agents safely<br/>(Graph walker and runners)<br/>(Sandbox tools and safety gates)"]
+        B7["Create control and evidence<br/>(Feature Flags)<br/>(Metrics)"]
         B8["Evaluate implementation quality<br/>(Judges)"]
         B9["Capture release intent<br/>(Release manifest)"]
         B1 --> B2 --> B3 --> B4 --> B5 --> B6 --> B7 --> B8 --> B9
@@ -46,11 +46,11 @@ flowchart LR
 
     subgraph RELEASE["Release"]
         direction TB
-        R1["Discover release contract<br/>(Beacon, Release manifest)"]
+        R1["Discover release contract<br/>(Beacon)<br/>(Release manifest)"]
         R2{"Resolve release intent<br/>(Beacon)"}
         R3["Select release policy<br/>(Guarded and Progressive Releases)"]
-        R4["Control staged exposure<br/>(Feature Flags, Guarded and Progressive Releases)"]
-        R5["Evaluate production evidence<br/>(Metrics, Observability and Code References)"]
+        R4["Control staged exposure<br/>(Feature Flags)<br/>(Guarded and Progressive Releases)"]
+        R5["Evaluate production evidence<br/>(Metrics)<br/>(Observability and Code References)"]
         R6{"Decide release outcome<br/>(Guarded and Progressive Releases)"}
         R7["Complete exposure<br/>(Feature Flags)"]
         R8["Hold release<br/>(Beacon)"]
@@ -76,7 +76,7 @@ flowchart LR
     end
 
     classDef ld fill:#A34FDE,color:#FFFFFF,stroke:#713099,stroke-width:2px
-    classDef autofactory fill:#DDF7E3,color:#191919,stroke:#218739,stroke-width:2px
+    classDef autofactory fill:#218739,color:#FFFFFF,stroke:#155F28,stroke-width:2px
     classDef existing fill:#FFFFFF,color:#191919,stroke:#8C8C8C,stroke-width:1px
 
     class B2,B3,B4,B7,B8,D3,R3,R4,R5,R6,R7,R9,R10 ld
