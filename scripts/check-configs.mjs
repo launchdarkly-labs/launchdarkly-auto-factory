@@ -142,7 +142,8 @@ for (const file of listJson(GRAPH_DIR)) {
   // config with no runtime signal. This applies to every max_visits edge, not just
   // judge-driven ones: a plain verdict loop is equally killable by a forward edge
   // added above it.
-  const seenSourceEdge = new Set();
+  const seenSourceEdge = new Set();      // any edge seen from this source
+  const seenNonLoopSource = new Set();   // a NON-loop edge seen from this source
   for (const edge of graph.edges ?? []) {
     const mv = edge.handoff?.max_visits;
     const below = edge.handoff?.loop_if_judge_below;
@@ -176,13 +177,17 @@ for (const file of listJson(GRAPH_DIR)) {
         }
       }
     }
-    if (mv !== undefined && seenSourceEdge.has(edge.sourceConfig)) {
+    // Multiple loop edges from one source are legitimate (each has its own condition
+    // and budget), so only a preceding NON-loop edge is a problem.
+    if (mv !== undefined && seenNonLoopSource.has(edge.sourceConfig)) {
       fail(
-        `graph: the loop edge ${edge.sourceConfig} → ${edge.targetConfig} (max_visits: ${mv}) is declared AFTER another edge from '${edge.sourceConfig}'. ` +
-          `The walker takes the first passing edge, so this loop may never fire — move it above the others.`,
+        `graph: the loop edge ${edge.sourceConfig} → ${edge.targetConfig} (max_visits: ${mv}) is declared AFTER a non-loop edge from '${edge.sourceConfig}'. ` +
+          `The walker takes the first passing edge, so this loop may never fire. Move it above the forward edges — a loop edge's own ` +
+          `conditions decide whether it fires, so ordering it first is always safe.`,
       );
     }
     seenSourceEdge.add(edge.sourceConfig);
+    if (mv === undefined) seenNonLoopSource.add(edge.sourceConfig);
     if (mv !== undefined) {
       if (!Number.isInteger(mv) || mv < 1 || mv > MAX_VISITS_HARD_CAP) {
         fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has max_visits=${JSON.stringify(mv)} (must be an integer in [1, ${MAX_VISITS_HARD_CAP}]).`);

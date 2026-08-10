@@ -121,7 +121,7 @@
       "readBy": [
         "approval"
       ],
-      "description": "The reviewer's verdict (approve/approved/true vs reject/rejected/false). Read by the approval gate, and routes the bounded rework loop back to the implementer on the literal value \"false\" (max_visits: 2). NOTE: edge matching is exact equality while the approval gate normalizes, so a drifted verdict (\"rejected\") is still read as a rejection by approval — the run reports REJECTED — but does NOT trigger the rework loop. Fail-safe: no iteration is attempted and nothing reports success. Forced by NODE_REQUIRED_TAGS so the reviewer always records a verdict; absence means the reviewer never ran (INCOMPLETE), not a rejection."
+      "description": "The reviewer's verdict (approve/approved/true vs reject/rejected/false). Read by the approval gate, and routes the bounded rework loop back to the implementer on the literal value \"false\" (max_visits: 1). NOTE: edge matching is exact equality while the approval gate normalizes, so a drifted verdict (\"rejected\") is still read as a rejection by approval — the run reports REJECTED — but does NOT trigger the rework loop. Fail-safe: no iteration is attempted and nothing reports success. Forced by NODE_REQUIRED_TAGS so the reviewer always records a verdict; absence means the reviewer never ran (INCOMPLETE), not a rejection."
     },
     "risk_level": {
       "producedBy": "autofactory-code-reviewer",

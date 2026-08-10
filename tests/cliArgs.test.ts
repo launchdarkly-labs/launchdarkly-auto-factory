@@ -101,6 +101,13 @@ describe("autofactory CLI args — resume", () => {
     assert.match(err(["run", "--resume", "--grant-visits", "a:b=1"]), /requires --feedback/);
   });
 
+  it("rejects --resume with --dry-run", () => {
+    // A journal records a REAL walk that created real LaunchDarkly resources.
+    // Replaying it under a no-writer frontier reports a verdict over mixed state.
+    assert.match(err(["run", "--resume", "--dry-run"]), /cannot be combined with --dry-run/);
+    assert.match(err(["run", "--dry-run", "--resume"]), /cannot be combined with --dry-run/);
+  });
+
   it("rejects grants and feedback without --resume", () => {
     assert.match(err(["run", "--grant-visits", "a:b=1", "--feedback", "x"]), /only applies with --resume/);
     assert.match(err(["run", "--feedback", "x"]), /only applies with --resume/);

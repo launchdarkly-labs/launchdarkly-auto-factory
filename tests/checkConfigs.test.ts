@@ -162,6 +162,33 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
     assert.equal(code, 0, out);
   });
 
+  it("ALLOWS two loop edges from one source (the second follows only another loop)", () => {
+    // Ordering only matters against forward edges. A node with both a judge self-loop
+    // and a verdict loop is legitimate, and the first-pass version of this lint made
+    // it unrepresentable.
+    const { code, out } = runIn(
+      sandbox(
+        (g) => {
+          const i = g.edges.findIndex((e) => e.sourceConfig === "autofactory-metrics-author");
+          g.edges.splice(i + 1, 0, {
+            key: "edge-metrics-second-loop",
+            sourceConfig: "autofactory-metrics-author",
+            targetConfig: "autofactory-flag-implementer",
+            handoff: { max_visits: 1, require_tags: { needs_tests: "true" } },
+          });
+        },
+        (tags) => {
+          (tags.needs_tests!.edges ??= []).push({
+            from: "autofactory-metrics-author",
+            to: "autofactory-flag-implementer",
+            kind: "require_tags",
+          });
+        },
+      ),
+    );
+    assert.equal(code, 0, out);
+  });
+
   it("rejects a PLAIN (non-judge) loop edge declared after another edge from the same node", () => {
     // The lint originally only covered judge edges, but a verdict loop is equally
     // killable: add a forward edge above the reviewer's loop and rework silently
@@ -177,7 +204,7 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
     }));
     assert.equal(code, 1);
     assert.match(out, /loop edge autofactory-code-reviewer → autofactory-flag-implementer/);
-    assert.match(out, /declared AFTER another edge/);
+    assert.match(out, /declared AFTER a non-loop edge/);
   });
 
   it("rejects a judge loop declared AFTER another edge from the same node", () => {
@@ -189,7 +216,7 @@ describe("check-configs — judge loop edges (6d/6e)", () => {
       g.edges.push(edge!); // move it to the very end
     }));
     assert.equal(code, 1);
-    assert.match(out, /declared AFTER another edge/);
+    assert.match(out, /declared AFTER a non-loop edge/);
   });
 });
 

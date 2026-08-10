@@ -182,6 +182,11 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
         return { error: `unknown option '${arg}'` };
     }
   }
+  // A journal records a REAL walk that created real resources. Replaying it under a
+  // no-writer frontier would report a verdict over a mix of real and dry state.
+  if (options.resume && options.dryRun) {
+    return { error: "--resume cannot be combined with --dry-run: the saved journal describes a real run" };
+  }
   if (!options.resume) {
     if (Object.keys(options.grantVisits).length > 0) return { error: "--grant-visits only applies with --resume" };
     if (options.feedback !== undefined) return { error: "--feedback only applies with --resume" };
