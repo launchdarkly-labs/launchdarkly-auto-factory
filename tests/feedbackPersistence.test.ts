@@ -14,7 +14,13 @@ import {
 } from "@launchdarkly/server-sdk-ai";
 import type { AgentNodeRequest, AgentNodeResult, AgentRunner } from "@auto-factory/shared";
 import { walkGraph, type NodeRun } from "@auto-factory/shared";
-import { carryUnconsumedFeedback, readWalkState, writeWalkState } from "@auto-factory/phase1-cli";
+import {
+  buildResumeInput,
+  carryUnconsumedFeedback,
+  readWalkState,
+  writeWalkState,
+  type WalkState,
+} from "@auto-factory/phase1-cli";
 
 // ---------------------------------------------------------------------------
 // Round seven, finding 3: a granted resume's --feedback must survive the
@@ -111,34 +117,39 @@ describe("resume feedback survives an approval-gate halt", () => {
     assert.equal(r2.pendingApproval?.node, "implementer");
     assert.equal(r2runner.prompts.length, 0, "no live node ran, so nobody consumed the feedback");
 
-    // Persist the halt the way run.ts does: unconsumed feedback rides along.
-    writeWalkState(dir, {
-      graphKey: "g",
-      configStamp: "cfg",
-      head: "sha",
-      policyMode: "always",
-      base: "main",
-      grants: GRANT,
-      ...carryUnconsumedFeedback(FEEDBACK, r2.runs.length, journal.length),
-      haltedAt: { kind: "pending-approval", node: "implementer" },
-      runs: r2.runs,
-    });
+    // Persist the halt. The carry is NOT re-implemented here — writeWalkState applies it
+    // from these three numbers, which is the same code path run.ts drives. An earlier
+    // version of this test spread `carryUnconsumedFeedback(...)` in itself, so removing the
+    // production call site left every test green.
+    writeWalkState(
+      dir,
+      {
+        graphKey: "g",
+        configStamp: "cfg",
+        head: "sha",
+        policyMode: "always",
+        base: "main",
+        grants: GRANT,
+        haltedAt: { kind: "pending-approval", node: "implementer" },
+        runs: r2.runs,
+      },
+      { inForce: FEEDBACK, totalRuns: r2.runs.length, replayedRuns: journal.length },
+    );
     const saved = readWalkState(dir);
     assert.equal(saved?.humanFeedback, FEEDBACK, "the walk state must carry the undelivered feedback");
 
     // ROUND 3: --resume --approve implementer, with NO --feedback on the command
     // line (the pending-approval hint doesn't ask for one). run.ts falls back to
     // the saved feedback: opts.feedback ?? state.humanFeedback.
-    const optsFeedback: string | undefined = undefined; // no --feedback typed this round
-    const round3Feedback = optsFeedback ?? saved?.humanFeedback;
+    // Built by the SAME function run.ts calls, with no --feedback in opts — so this
+    // asserts the production re-injection path, not a copy of it.
+    const round3Resume = buildResumeInput(saved!, {});
+    const round3Feedback = round3Resume.humanFeedback;
+    assert.equal(round3Feedback, FEEDBACK, "the saved feedback is what a bare --resume picks up");
     const r3runner = new RecordingRunner({ reviewer: { review_approved: "true" } });
     const r3 = await walkGraph(buildGraph(), r3runner, {}, {
       gate: { steps: ["implementer"], resolve: () => true },
-      resume: {
-        journal: saved!.runs,
-        grants: saved!.grants,
-        ...(round3Feedback ? { humanFeedback: round3Feedback } : {}),
-      },
+      resume: round3Resume,
     });
     const impl = r3runner.prompts.find((p) => p.key === "implementer");
     assert.ok(impl, "the granted implementer iteration ran live");
@@ -161,16 +172,70 @@ describe("resume feedback survives an approval-gate halt", () => {
 
   it("humanFeedback round-trips through the walk-state file", () => {
     const dir = repo();
-    writeWalkState(dir, {
-      graphKey: "g",
-      configStamp: "cfg",
-      head: "sha",
-      policyMode: "always",
-      base: "main",
-      humanFeedback: FEEDBACK,
-      haltedAt: { kind: "pending-approval", node: "implementer" },
-      runs: [{ configKey: "implementer", status: "completed", output: "done", tags: {}, iteration: 1 }],
-    });
+    // humanFeedback cannot be set directly — it is excluded from the state parameter so a
+    // caller cannot bypass the carry decision. It arrives only via the third argument.
+    writeWalkState(
+      dir,
+      {
+        graphKey: "g",
+        configStamp: "cfg",
+        head: "sha",
+        policyMode: "always",
+        base: "main",
+        haltedAt: { kind: "pending-approval", node: "implementer" },
+        runs: [{ configKey: "implementer", status: "completed", output: "done", tags: {}, iteration: 1 }],
+      },
+      { inForce: FEEDBACK, totalRuns: 1, replayedRuns: 1 },
+    );
     assert.equal(readWalkState(dir)?.humanFeedback, FEEDBACK);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The RE-INJECTION half, which had no test at all: run.ts used to decide
+// `opts.feedback ?? state.humanFeedback` inline, so deleting the fallback left
+// every test green while a granted resume silently ran with no guidance. The
+// decision now lives in buildResumeInput, where it can be pinned.
+// ---------------------------------------------------------------------------
+describe("buildResumeInput", () => {
+  const journal: NodeRun[] = [
+    { configKey: "reviewer", status: "completed", output: "no", tags: { review_approved: "false" }, iteration: 1 },
+    { configKey: "implementer", status: "completed", output: "fix", tags: {}, iteration: 2 },
+  ];
+  const state = (extra: Partial<WalkState> = {}): WalkState =>
+    ({
+      version: 5,
+      graphKey: "g",
+      at: "2026-01-01T00:00:00.000Z",
+      haltedAt: { kind: "loop-exhausted", node: "reviewer" },
+      runs: journal,
+      ...extra,
+    }) as WalkState;
+
+  it("re-injects saved feedback when the command line carries none", () => {
+    const r = buildResumeInput(state({ humanFeedback: "the metrics miss error rate" }), {});
+    assert.equal(r.humanFeedback, "the metrics miss error rate");
+    assert.deepEqual(r.journal, journal, "the journal still replays");
+  });
+
+  it("a newly passed --feedback WINS over the saved one", () => {
+    // The human is looking at the failure again; their new words supersede the old.
+    const r = buildResumeInput(state({ humanFeedback: "stale guidance" }), { feedback: "fresh guidance" });
+    assert.equal(r.humanFeedback, "fresh guidance");
+  });
+
+  it("omits humanFeedback entirely when there is none in play", () => {
+    const r = buildResumeInput(state(), {});
+    assert.ok(!("humanFeedback" in r), "an absent key, not an empty string — the walker checks presence");
+  });
+
+  it("positions a new grant after the replayed journal, keeping prior grants", () => {
+    // The grant/feedback assembly is one function precisely because these two numbers
+    // are the same number: the journal length IS where a new grant takes effect.
+    const prior = [{ edge: "reviewer:implementer", visits: 1, effectiveAfterRuns: 0 }];
+    const r = buildResumeInput(state({ grants: prior }), { grantVisits: { "reviewer:implementer": 1 } });
+    assert.equal(r.grants?.length, 2);
+    assert.equal(r.grants?.[0]?.effectiveAfterRuns, 0, "prior grant keeps its position");
+    assert.equal(r.grants?.[1]?.effectiveAfterRuns, journal.length, "new grant takes effect at the frontier");
   });
 });

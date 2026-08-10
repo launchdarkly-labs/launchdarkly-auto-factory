@@ -197,16 +197,60 @@ export function computeTreeHash(root: string): string | undefined {
  * journal describing work the files no longer contain. Keeping the computation
  * inside this function makes that ordering mistake unrepresentable.
  */
-export function writeWalkState(root: string, state: Omit<WalkState, "version" | "at" | "treeHash">): void {
+/**
+ * For a caller with no feedback in play: a fresh run where `--feedback` was not passed, or
+ * a test not exercising feedback at all.
+ *
+ * Deliberately a named constant rather than a default parameter. `writeWalkState`'s third
+ * argument is REQUIRED so a resume path cannot silently omit the carry — that omission was a
+ * real defect and no test at that layer could see it. A default would restore exactly the
+ * silence; this makes "there was none" an explicit, greppable claim.
+ */
+export const NO_FEEDBACK_IN_PLAY = { inForce: undefined, totalRuns: 0, replayedRuns: 0 } as const;
+
+/**
+ * Persist a halted walk.
+ *
+ * Two fields are computed HERE rather than accepted, and both for the same reason: a
+ * caller that omits one produces a state file that looks valid and silently breaks a
+ * later resume, which no test at this layer can detect.
+ *
+ *  - `treeHash` — an earlier revision took it from the caller, which passed a hash
+ *    captured BEFORE the walk. Every realistic resume was refused, and reverting the
+ *    agents' edits made validation *pass*.
+ *  - `humanFeedback` — omitting the carry let a granted resume halt at a gate and lose
+ *    the human's guidance, so the granted iteration re-ran with no new information. It
+ *    is excluded from the `state` parameter's type and taken via `feedback` instead, so
+ *    "forgetting" it is a compile error rather than a silent behaviour change.
+ */
+export function writeWalkState(
+  root: string,
+  state: Omit<WalkState, "version" | "at" | "treeHash" | "humanFeedback">,
+  feedback: {
+    /** The feedback in force this round — `resume.humanFeedback`, or `--feedback` on a fresh run. */
+    inForce: string | undefined;
+    /** Total runs the walk produced, replayed + live. */
+    totalRuns: number;
+    /** How many of those were replayed (0 on a fresh run). */
+    replayedRuns: number;
+  },
+): void {
   try {
     const treeHash = computeTreeHash(root);
     if (!treeHash) {
       console.warn("could not hash the working tree — saving walk state anyway, but --resume will refuse it");
     }
+    const carried = carryUnconsumedFeedback(feedback.inForce, feedback.totalRuns, feedback.replayedRuns);
     writeFileSync(
       walkStatePath(root),
       JSON.stringify(
-        { version: WALK_STATE_VERSION, ...state, ...(treeHash ? { treeHash } : {}), at: new Date().toISOString() },
+        {
+          version: WALK_STATE_VERSION,
+          ...state,
+          ...carried,
+          ...(treeHash ? { treeHash } : {}),
+          at: new Date().toISOString(),
+        },
         null,
         2,
       ) + "\n",
@@ -373,7 +417,9 @@ export function validateGrants(state: WalkState, grants: Record<string, number>)
  * consume it. The walker delivers `humanFeedback` to the first LIVE node only, so
  * "consumed" is exactly "at least one run beyond the replayed journal" — a walk that
  * replayed everything and halted at the frontier's gate delivered it to nobody.
- * Spread the result into `writeWalkState`'s argument.
+ *
+ * NOT called by callers directly: `writeWalkState` applies it, because a caller that
+ * forgets to is a silent regression no test can see (see that function's note).
  */
 export function carryUnconsumedFeedback(
   feedback: string | undefined,
@@ -381,6 +427,33 @@ export function carryUnconsumedFeedback(
   replayedRuns: number,
 ): { humanFeedback: string } | Record<string, never> {
   return feedback !== undefined && totalRuns <= replayedRuns ? { humanFeedback: feedback } : {};
+}
+
+/**
+ * Assemble the walker's `resume` input from a validated saved state plus this round's
+ * CLI options — the journal to replay, the accumulated grants, and the feedback in force.
+ *
+ * ONE function rather than three inline steps in run.ts, because the three are not
+ * independent: the grants' effective position and the journal length are the same number,
+ * and the feedback decision ("newly passed wins, else re-inject the saved one") is
+ * meaningless without the journal it rides with. Assembling them apart is how a resume
+ * shipped that replayed correctly and dropped the human's guidance on the floor.
+ *
+ * The returned object IS the walker's `ResumeInput` shape, so a caller cannot use the
+ * journal while skipping the feedback — there is nothing left to skip.
+ */
+export function buildResumeInput(
+  state: WalkState,
+  opts: { grantVisits?: Record<string, number>; feedback?: string },
+): { journal: readonly NodeRun[]; grants?: LoopGrant[]; humanFeedback?: string } {
+  const replayedRuns = state.runs.length;
+  const allGrants = appendGrants(state.grants ?? [], opts.grantVisits ?? {}, replayedRuns);
+  const feedback = opts.feedback ?? state.humanFeedback;
+  return {
+    journal: state.runs,
+    ...(allGrants.length > 0 ? { grants: allGrants } : {}),
+    ...(feedback ? { humanFeedback: feedback } : {}),
+  };
 }
 
 /**

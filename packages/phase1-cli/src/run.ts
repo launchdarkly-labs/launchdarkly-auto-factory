@@ -65,6 +65,7 @@ import {
 } from "@auto-factory/shared";
 import { type CliOptions, EXIT } from "./args.js";
 import {
+  buildResumeInput,
   carryUnconsumedFeedback,
   clearWalkState,
   computeTreeHash,
@@ -403,16 +404,12 @@ async function run(opts: CliOptions): Promise<number> {
     // One list: prior grants keep their positions, and this round's grant takes effect at
     // the frontier (after the replayed runs). Replay then re-derives the original budget
     // decisions exactly, with no assumption about the graph's shape.
-    const allGrants = appendGrants(priorGrants, opts.grantVisits, replayedRuns);
-    // A newly passed --feedback wins; otherwise re-inject the saved one, which exists
-    // exactly when no live node has consumed it yet (a gate can halt a granted resume
-    // before the loop target runs — the guidance must survive that round trip).
-    carriedFeedback = opts.feedback ?? check.state.humanFeedback;
-    resume = {
-      journal: check.state.runs,
-      ...(allGrants.length > 0 ? { grants: allGrants } : {}),
-      ...(carriedFeedback ? { humanFeedback: carriedFeedback } : {}),
-    };
+    // Journal + grants + in-force feedback come from ONE function (walkState.ts). Assembling
+    // them separately is how a resume shipped that replayed correctly and dropped the human's
+    // guidance on the floor: a newly passed --feedback wins, otherwise the saved one is
+    // re-injected, and it survives exactly when no live node has consumed it yet.
+    resume = buildResumeInput(check.state, opts);
+    carriedFeedback = resume.humanFeedback;
     console.log(
       `Resuming the walk saved at ${check.state.at}: replaying ${check.state.runs.length} step(s) ` +
         `(no model calls, no duplicate LaunchDarkly writes), then continuing from '${check.state.haltedAt.node}'.` +
@@ -521,13 +518,14 @@ async function run(opts: CliOptions): Promise<number> {
           const all = appendGrants(priorGrants, opts.grantVisits, replayedRuns);
           return all.length > 0 ? { grants: all } : {};
         })(),
-        // Feedback nobody consumed this round (no live node ran) rides along, so the
-        // next --resume re-delivers it instead of burning the granted iteration with
-        // a rework preamble and zero human guidance.
-        ...carryUnconsumedFeedback(carriedFeedback, walk.runs.length, replayedRuns),
         haltedAt: halt,
         runs: walk.runs,
-      });
+      },
+      // writeWalkState applies the carry itself — see its note. Feedback nobody consumed
+      // (no live node ran) must survive to the next --resume, or the granted iteration
+      // re-runs with a rework preamble and zero human guidance.
+      { inForce: carriedFeedback, totalRuns: walk.runs.length, replayedRuns },
+    );
     } else {
       clearWalkState(root);
     }

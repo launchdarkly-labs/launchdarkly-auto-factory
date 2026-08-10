@@ -48,7 +48,7 @@ export interface BeaconDeps {
   gh?: GitHubClient;
   /** Hook fired when a release is started (or found already running); the
    *  default monitors it to a terminal state. Injectable for tests. */
-  onReleaseStarted?: (flagKey: string, environmentKey: string) => void;
+  onReleaseStarted?: (flagKey: string, environmentKey: string) => void | Promise<unknown>;
 }
 
 /** Constant-time secret comparison (hashed first to equalize lengths). */
@@ -71,16 +71,22 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
   const gh = deps.gh ?? new GitHubClient(cfg.githubToken);
   const store = deps.store ?? new FileDeployStateStore(cfg.stateFile);
   const monitorSettings = monitorSettingsFromEnv();
-  const onReleaseStarted =
+  // Detached on purpose: a guarded release runs for minutes-to-days; the notification
+  // response must not wait on it.
+  const attachMonitor =
     deps.onReleaseStarted ??
-    // Detached on purpose: a guarded release runs for minutes-to-days; the
-    // notification response must not wait on it. Deduped per flag/environment so a
-    // redelivered `already_running` doesn't stack a second 24h poll loop onto a
-    // release that already has one watching it.
-    dedupeMonitors(async (flagKey: string, environmentKey: string): Promise<void> => {
+    (async (flagKey: string, environmentKey: string): Promise<void> => {
       if (!monitorSettings.enabled) return;
       await monitorTriggeredRelease(ld, flagKey, environmentKey, monitorSettings);
     });
+  // Dedup wraps the attach function UNCONDITIONALLY, including an injected one. "One watch
+  // per flag/environment in flight" is a property Beacon wants whoever does the watching —
+  // a redelivered `already_running` must not stack a second 24h poll loop onto a release
+  // that already has one. And when the dedup lived only in the `??` default branch, every
+  // test injected straight past it, so the property was unverifiable by construction.
+  const onReleaseStarted = dedupeMonitors(async (flagKey: string, environmentKey: string) =>
+    attachMonitor(flagKey, environmentKey),
+  );
 
   async function handleDeploy(n: DeployNotification): Promise<{ status: number; body: unknown }> {
     // Every notification leaves a trace: silent successes are indistinguishable

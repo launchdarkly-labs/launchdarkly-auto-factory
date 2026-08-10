@@ -7,6 +7,7 @@ import { after, describe, it } from "node:test";
 
 import { readRepoState } from "@auto-factory/shared";
 import {
+  NO_FEEDBACK_IN_PLAY,
   WALK_STATE_VERSION,
   clearWalkState,
   computeTreeHash,
@@ -51,7 +52,7 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
       base: "main",
       haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
       runs: sampleRuns,
-    });
+    }, NO_FEEDBACK_IN_PLAY);
     const p = walkStatePath(dir);
     assert.match(p, /[\\/]\.git[\\/]autofactory-walk-state\.json$/);
     // The whole reason for the .git location: `git status` must stay clean.
@@ -80,14 +81,14 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
       grants,
       haltedAt: { kind: "loop-exhausted", node: "review", exhaustedEdges: ["review→flag"] },
       runs: sampleRuns,
-    });
+    }, NO_FEEDBACK_IN_PLAY);
     assert.deepEqual(readWalkState(dir)?.grants, grants, "positions must survive the round trip");
   });
 
   it("reads as absent before a write and after a clear", () => {
     const dir = repo();
     assert.equal(readWalkState(dir), undefined);
-    writeWalkState(dir, { graphKey: "g", haltedAt: { kind: "loop-exhausted", node: "n" }, runs: sampleRuns });
+    writeWalkState(dir, { graphKey: "g", haltedAt: { kind: "loop-exhausted", node: "n" }, runs: sampleRuns }, NO_FEEDBACK_IN_PLAY);
     assert.ok(readWalkState(dir));
     clearWalkState(dir);
     assert.equal(readWalkState(dir), undefined);
@@ -236,7 +237,7 @@ describe("walk state captures the tree AT THE HALT, not before the walk", () => 
       baseSha: "base-sha-1",
       haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
       runs: sampleRuns,
-    });
+    }, NO_FEEDBACK_IN_PLAY);
 
   it("resuming immediately after a halt is ACCEPTED (the normal path must work)", () => {
     const dir = repo();
@@ -323,7 +324,7 @@ describe("resume invalidation pins the base COMMIT, not the ref name", () => {
       baseSha: before.resolvedBaseSha!,
       haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
       runs: sampleRuns,
-    });
+    }, NO_FEEDBACK_IN_PLAY);
 
     // While the human decides, an IDE auto-fetch advances origin/main: a new commit
     // lands on the remote main (same tree here, which makes the case HARDER — only
@@ -367,7 +368,7 @@ describe("resume invalidation pins the base COMMIT, not the ref name", () => {
       baseSha: before.resolvedBaseSha!,
       haltedAt: { kind: "pending-approval", node: "n" },
       runs: sampleRuns,
-    });
+    }, NO_FEEDBACK_IN_PLAY);
     // The remote-tracking ref disappears; resolveBase falls through to local main.
     git(["update-ref", "-d", "refs/remotes/origin/main"]);
     const after = await readRepoState(dir, "main");
@@ -396,7 +397,7 @@ describe("resume invalidation pins the base COMMIT, not the ref name", () => {
       // no baseSha — e.g. state written where rev-parse failed
       haltedAt: { kind: "pending-approval", node: "n" },
       runs: sampleRuns,
-    });
+    }, NO_FEEDBACK_IN_PLAY);
     const r = validateWalkState(readWalkState(dir), {
       graphKey: "g",
       configStamp: "cfg123",

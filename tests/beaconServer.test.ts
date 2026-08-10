@@ -98,7 +98,9 @@ function startHarness(
   const app = createApp(cfg, fakeLd(activeReleases, patches, ldOpts), {
     store: new MemoryDeployStateStore(),
     gh: fakeGh(listDirRefs),
-    onReleaseStarted: (flagKey) => monitored.push(flagKey),
+    onReleaseStarted: (flagKey) => {
+      monitored.push(flagKey);
+    },
   });
   return new Promise((resolveStart) => {
     const server: Server = app.listen(0, () => {
@@ -282,7 +284,9 @@ describe("beacon: fullstack readiness check failure", () => {
     const app = createApp(fullCfg, fakeLd({}, patches), {
       store: new MemoryDeployStateStore(),
       gh,
-      onReleaseStarted: (flagKey) => monitored.push(flagKey),
+      onReleaseStarted: (flagKey) => {
+      monitored.push(flagKey);
+    },
     });
     return new Promise((resolveStart) => {
       const server: Server = app.listen(0, () => {
@@ -421,5 +425,62 @@ describe("beacon: release trigger failure", () => {
     const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
     assert.equal(res.status, 200);
     assert.equal(res.json.outcomes[0].action, "already_running");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One watch per flag/environment in flight, asserted THROUGH createApp.
+//
+// The dedup used to sit only in the `deps.onReleaseStarted ?? …` default branch,
+// so every test — all of which inject that dep — ran straight past it. Sabotaging
+// the wrapper changed no test result. It now wraps the attach function
+// unconditionally, which is both the property Beacon wants and the only way this
+// is observable from outside.
+// ---------------------------------------------------------------------------
+describe("beacon: release monitors are deduped per flag/environment", () => {
+  const harnesses: Array<{ close(): void }> = [];
+  after(() => harnesses.forEach((h) => h.close()));
+
+  it("a redelivered already_running does not stack a second watch", async () => {
+    const attaches: string[] = [];
+    let release!: () => void;
+    const hanging = new Promise<void>((r) => {
+      release = r;
+    });
+    // A real monitor polls for up to 24h. Dedup is only observable while one is
+    // IN FLIGHT, so the injected attach must not settle until we say so.
+    const app = createApp(cfg, fakeLd({ "enable-one": "rel-9" }, []), {
+      store: new MemoryDeployStateStore(),
+      gh: fakeGh([]),
+      onReleaseStarted: async (flagKey, environmentKey) => {
+        attaches.push(`${flagKey}/${environmentKey}`);
+        await hanging;
+      },
+    });
+    const server: Server = await new Promise((res) => {
+      const s = app.listen(0, () => res(s));
+    });
+    harnesses.push({ close: () => server.close() });
+    const { port } = server.address() as { port: number };
+    const post = async (): Promise<number> => {
+      const r = await fetch(`http://127.0.0.1:${port}/flag-releases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-beacon-secret": SECRET },
+        body: JSON.stringify({ service: "demo-backend", sha: "sha1", environment: "production" }),
+      });
+      return r.status;
+    };
+
+    assert.equal(await post(), 200);
+    assert.equal(await post(), 200, "a redelivery is still acked");
+    assert.deepEqual(attaches, ["enable-one/production"], "the second delivery must not attach a second watch");
+
+    // Once the first watch settles the key frees, so a later release can be watched —
+    // that is the Beacon-restart recovery path, and it must not be dedup'd away forever.
+    release();
+    await hanging;
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(await post(), 200);
+    assert.equal(attaches.length, 2, "a settled watch frees the key for the next release");
   });
 });
