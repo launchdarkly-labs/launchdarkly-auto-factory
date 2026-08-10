@@ -534,17 +534,17 @@ describe("walkGraph — loop-back edges", () => {
     assert.equal(r.inventory.flag_key, "enable-y", "still last-write-wins");
   });
 
-  it("5e. warns when a loop edge's skip_if EXIT can never match (fires every pass, not never)", async () => {
-    // The twin of 5c, and the costlier one: an unsatisfiable require_tags makes the loop
-    // never fire, while an unreachable skip_if exit makes it fire until budget — burning a
-    // full live iteration each pass. Only the require case was warned about.
+  it("5e. an unreachable loop EXIT is reported per-iteration, then asserted at exhaustion", async () => {
+    // Two strengths, both evidence-based. Per pass: "this iteration was taken while the
+    // exit tag went unemitted" — factual, and conditional about the future, because a tag
+    // emitted only on affirmative passes is legitimate. At exhaustion: "never satisfiable
+    // across N iterations" — now a record, so it can name the served graph.
     const g = graphFrom({
       root: "research",
       edges: {
         research: [{ key: "flag" }],
         flag: [{ key: "review" }],
-        // `needs_tests` is the metrics author's routing tag; the reviewer never emits it,
-        // so this exit can never match.
+        // `needs_tests` belongs to the metrics author; the reviewer never emits it.
         review: [{ key: "flag", handoff: { max_visits: 2, skip_if_tags: { needs_tests: "true" } } }],
       },
     });
@@ -558,13 +558,49 @@ describe("walkGraph — loop-back edges", () => {
     } finally {
       console.warn = realWarn;
     }
-    // It really does burn the whole budget: flag runs 1 + max_visits(2) times.
-    assert.equal(countOf(r, "flag"), 3);
+    assert.equal(countOf(r, "flag"), 3, "it really does burn the whole budget");
     assert.equal(r.loopExhausted?.reason, "budget");
-    const warn = warnings.find((w) => w.includes("can never EXIT"));
-    assert.ok(warn, `expected an unreachable-exit warning, got: ${warnings.join(" | ")}`);
-    assert.match(warn!, /needs_tests/);
-    assert.match(warn!, /full budget every time/, "the diagnosis must be 'fires every pass', not 'never fires'");
+
+    const perPass = warnings.filter((w) => w.includes("iteration taken while its exit named"));
+    assert.equal(perPass.length, 1, "deduped: once per edge per walk, not once per pass");
+    assert.match(perPass[0]!, /needs_tests/);
+    assert.match(perPass[0]!, /If it never emits them/, "conditional, not a categorical claim");
+
+    const earned = warnings.find((w) => w.includes("never satisfiable"));
+    assert.ok(earned, `expected the exhaustion claim, got: ${warnings.join(" | ")}`);
+    assert.match(earned!, /exhausted 2 iteration\(s\)/, "the claim cites the record");
+    assert.match(earned!, /SERVED graph/);
+  });
+
+  it("5f. an exit tag the source DOES emit draws neither warning", async () => {
+    // Discriminating against over-warning: this is a healthy loop that exits normally, and
+    // the previous design would have flagged it on the passes before the exit fired.
+    const g = graphFrom({
+      root: "research",
+      edges: {
+        research: [{ key: "flag" }],
+        flag: [{ key: "review" }],
+        review: [{ key: "flag", handoff: { max_visits: 3, skip_if_tags: { review_approved: "true" } } }],
+      },
+    });
+    // Omits the tag on pass 1 (still not approved), emits it on pass 2 — the intermittent
+    // emitter pattern that a static "can never exit" claim would libel.
+    const runner = new ScriptedRunner({ review: [{ tags: {} }, { tags: { review_approved: "true" } }] });
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+    let r;
+    try {
+      r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+    } finally {
+      console.warn = realWarn;
+    }
+    assert.equal(r.loopExhausted, undefined, "it exited normally on pass 2");
+    assert.equal(countOf(r, "flag"), 2);
+    assert.ok(
+      !warnings.some((w) => w.includes("never satisfiable")),
+      `no categorical claim for a loop that exited: ${warnings.join(" | ")}`,
+    );
   });
 
   it("9. envelope inheritance: a re-run inherits the first-entry max_turns/capabilities", async () => {

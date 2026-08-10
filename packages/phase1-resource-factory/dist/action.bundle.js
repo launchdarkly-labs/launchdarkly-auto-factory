@@ -33679,15 +33679,10 @@ function unionCsv(existing, incoming) {
   const split = (s) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   return [.../* @__PURE__ */ new Set([...split(existing), ...split(incoming)])].join(",");
 }
-function warnIfExitUnreachable(isLoop, source, target, skip, accumulated, fresh) {
-  if (!isLoop || !skip)
-    return;
-  if (!tagsMatch(accumulated, skip))
-    return;
-  const foreign = Object.keys(skip).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === void 0);
-  if (foreign.length === 0)
-    return;
-  console.warn(`[loop] edge ${source} \u2192 ${target} can never EXIT: its skip_if_tags names routing tag(s) ${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched against the source run's own tags, so this loop will run to its full budget every time \u2014 check the SERVED graph.`);
+function unemittedExitTags(skip, fresh) {
+  if (!skip)
+    return [];
+  return Object.keys(skip).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === void 0);
 }
 function tagsMatch(tags, cond) {
   return Object.entries(cond).every(([k, v]) => tags[k] === v);
@@ -33814,6 +33809,8 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
   const gatedSteps = new Set(gate?.steps ?? []);
   const edgeCounts = /* @__PURE__ */ new Map();
   const budgetSpent = /* @__PURE__ */ new Map();
+  const exitWarned = /* @__PURE__ */ new Set();
+  const exitNeverPossible = /* @__PURE__ */ new Map();
   const routingSnapshots = [];
   const entryEdgeFields = /* @__PURE__ */ new Map();
   const runCountByKey = /* @__PURE__ */ new Map();
@@ -33969,7 +33966,6 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         continue;
       }
       const skip = handoffTags(h, "skip_if_tags");
-      warnIfExitUnreachable(isLoop, key, edge.key, skip, accumulatedTags, matchAgainst);
       if (skip && tagsMatch(matchAgainst, skip))
         continue;
       const below = handoffNumber(h, "loop_if_judge_below");
@@ -33994,6 +33990,10 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
             ...trig ? { trigger: trig } : {}
           };
           budgetBlocked.push(spent);
+          if (exitNeverPossible.get(ek) === true) {
+            const named = Object.keys(handoffTags(h, "skip_if_tags") ?? {}).join(", ");
+            console.warn(`[loop] ${key} \u2192 ${edge.key} exhausted ${traversals} iteration(s) and its exit (${named}) was never satisfiable \u2014 '${key}' emitted none of those tags on any pass. This edge can only ever end by budget; check the SERVED graph.`);
+          }
           budgetSpent.set(`${key}\u2192${edge.key}`, spent);
           continue;
         }
@@ -34058,6 +34058,12 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       }
       const ek = `${key}\u2192${next}`;
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
+      const unemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+      if (unemitted.length > 0 && !exitWarned.has(ek)) {
+        exitWarned.add(ek);
+        console.warn(`[loop] ${key} \u2192 ${next}: iteration taken while its exit named routing tag(s) ${unemitted.join(", ")}, which '${key}' did not emit this pass. If it never emits them, this loop can only end by exhausting its budget.`);
+      }
       const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
       pendingLoopTrigger = {
         source: key,

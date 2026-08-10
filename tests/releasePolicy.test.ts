@@ -4,6 +4,8 @@ import { describe, it } from "node:test";
 import type { LdClient } from "@auto-factory/shared";
 import {
   findActiveRelease,
+  monitorRelease,
+  readReleasePolicy,
   isReleaseFinished,
   isReleaseRunning,
   normalizeReleasePolicy,
@@ -127,10 +129,17 @@ describe("findActiveRelease treats any non-terminal release as active", () => {
     return { ld, calls };
   };
 
-  it("finds a PAUSED release, which the old status:in_progress filter missed", async () => {
-    const { ld } = releases([{ id: "r1", status: "paused" }]);
+  it("finds a PAUSED release among terminal ones — starting another would double up", async () => {
+    // The previous version of this test passed with the change REVERTED: the old code
+    // returned items[0] and the stub ignored the filter, so a lone paused item "passed"
+    // either way. Terminal entries ahead of it make the client-side classification the
+    // only thing that can produce the right answer.
+    const { ld } = releases([
+      { id: "done", status: "completed" },
+      { id: "paused-one", status: "paused" },
+    ]);
     const active = await findActiveRelease(ld, "enable-x", "production");
-    assert.equal(active?.id, "r1", "a paused release is still active — starting another would double up");
+    assert.equal(active?.id, "paused-one");
   });
 
   it("skips terminal releases and returns the first active one", async () => {
@@ -155,5 +164,129 @@ describe("findActiveRelease treats any non-terminal release as active", () => {
     assert.doesNotMatch(calls[0] ?? "", /in_progress/);
     assert.doesNotMatch(calls[0] ?? "", /limit=1(&|$)/);
     assert.match(calls[0] ?? "", /environmentKey%3Aproduction/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Policy drift is classified by RECOGNIZED FIELDS, not by whether the body looks empty.
+// The no-policy body is NOT empty — it carries empty strings — so an emptiness heuristic
+// would flag every policy-free flag on every release.
+// ---------------------------------------------------------------------------
+describe("readReleasePolicy: drift detection without emptiness guessing", () => {
+  const read = async (status: number, data: unknown) => {
+    const ld = {
+      projectKey: "p",
+      request: async () => {
+        if (status >= 400) return { status, ok: false, data };
+        return { status, ok: true, data };
+      },
+    } as unknown as LdClient;
+    return readReleasePolicy(ld, "enable-x", "production");
+  };
+
+  it("the real no-policy body is ABSENT and silent, not drift", async () => {
+    // Observed live: empty strings, not an empty object, not a 404.
+    const r = await read(200, { releaseMethod: "", releasePolicyKey: "", releasePolicyName: "" });
+    assert.equal(r.status, "absent");
+  });
+
+  it("the real policy body is OK", async () => {
+    const r = await read(200, {
+      releaseMethod: "guarded-release",
+      releasePolicyKey: "test",
+      releasePolicyName: "Prod policy",
+      guardedReleaseConfig: { rolloutContextKindKey: "user", metricKeys: ["m1"], rollbackOnRegression: false },
+    });
+    assert.equal(r.status, "ok");
+    assert.equal(r.status === "ok" && r.policy.rollbackOnRegression, false);
+  });
+
+  it("an unmappable releaseMethod is drift, not absence", async () => {
+    // Previously vanished into `absent`: silent demo defaults and auto-rollback flipped on.
+    const r = await read(200, { releaseMethod: "canary-release" });
+    assert.equal(r.status, "unreadable");
+    assert.match((r as { reason: string }).reason, /unrecognized releaseMethod 'canary-release'/);
+  });
+
+  it("PARTIAL drift is caught — the case an emptiness check cannot see", async () => {
+    // A recognised method beside a renamed inner config yields a NON-empty policy with the
+    // metrics silently gone, so `Object.keys(policy).length === 0` never fires.
+    const r = await read(200, {
+      releaseMethod: "guarded-release",
+      guardedReleaseConfig: { metricKeysV2: ["m1"], rollbackOnRegressionV2: false },
+    });
+    assert.equal(r.status, "unreadable");
+    assert.match((r as { reason: string }).reason, /guardedReleaseConfig had content but nothing in it was recognized/);
+  });
+
+  it("an unrecognized POPULATED top-level field is drift; empty ones are not", async () => {
+    const drifted = await read(200, { releaseMethod: "", somethingNew: "value" });
+    assert.equal(drifted.status, "unreadable");
+    assert.match((drifted as { reason: string }).reason, /somethingNew/);
+    // Known boilerplate and empty values must stay silent, or `absent` rots into noise.
+    const fine = await read(200, { releaseMethod: "", _links: { self: {} }, futureField: "" });
+    assert.equal(fine.status, "absent");
+  });
+
+  it("404 and transport failures are unreadable, with the cause", async () => {
+    const notFound = await read(404, {});
+    assert.equal(notFound.status, "unreadable");
+    assert.match((notFound as { reason: string }).reason, /404/);
+    const threw = await readReleasePolicy(
+      { projectKey: "p", request: async () => { throw new Error("socket hang up"); } } as unknown as LdClient,
+      "enable-x",
+      "production",
+    );
+    assert.equal(threw.status, "unreadable");
+    assert.match((threw as { reason: string }).reason, /socket hang up/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Monitoring a release that pauses. Keeping the watch is what lets a human resume it and
+// still have the completion observed — completion is what repoints child flags.
+// ---------------------------------------------------------------------------
+describe("monitorRelease keeps watching an unrecognised (paused) state", () => {
+  const poller = (statuses: string[]) => {
+    let i = 0;
+    const seen: string[] = [];
+    const ld = {
+      projectKey: "p",
+      request: async () => {
+        const status = statuses[Math.min(i, statuses.length - 1)] ?? "in_progress";
+        seen.push(status);
+        i++;
+        return { status: 200, ok: true, data: { id: "r1", kind: "guarded", status, latestStageIndex: 0, stages: [] } };
+      },
+    } as unknown as LdClient;
+    return { ld, seen };
+  };
+
+  it("polls through a pause and returns the release once a human resumes it to completion", async () => {
+    const { ld, seen } = poller(["in_progress", "paused", "paused", "completed"]);
+    const final = await monitorRelease(ld, "production", "r1", { pollMillis: 1, timeoutMillis: 5_000 });
+    assert.equal(final.status, "completed", "the resumed completion must be observed");
+    assert.deepEqual(seen, ["in_progress", "paused", "paused", "completed"]);
+  });
+
+  it("returns the last observation on timeout instead of throwing", async () => {
+    // Throwing made an unresolved pause look like a monitoring error.
+    const { ld } = poller(["paused"]);
+    const final = await monitorRelease(ld, "production", "r1", { pollMillis: 1, timeoutMillis: 20 });
+    assert.equal(final.status, "paused");
+  });
+
+  it("survives transient poll failures instead of ending monitoring for good", async () => {
+    let calls = 0;
+    const ld = {
+      projectKey: "p",
+      request: async () => {
+        calls++;
+        if (calls <= 2) throw new Error("connection reset");
+        return { status: 200, ok: true, data: { id: "r1", kind: "guarded", status: "completed", latestStageIndex: 0, stages: [] } };
+      },
+    } as unknown as LdClient;
+    const final = await monitorRelease(ld, "production", "r1", { pollMillis: 1, timeoutMillis: 5_000 });
+    assert.equal(final.status, "completed", "two transient failures must not strand the completion");
   });
 });

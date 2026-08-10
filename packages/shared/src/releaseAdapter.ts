@@ -298,8 +298,64 @@ export async function readReleasePolicy(
     };
   }
   const policy = normalizeReleasePolicy(res.data);
-  // A policy-free environment normalizes to {} (empty releaseMethod, no guardedReleaseConfig).
+  // Classify by RECOGNIZED FIELDS, not by whether the body "looks empty". A policy-free
+  // environment does not send an empty body — it sends
+  // {"releaseMethod":"","releasePolicyKey":"","releasePolicyName":""} (observed live) — so
+  // "has keys but normalized to nothing" would flag every policy-free flag on every
+  // release. Each rule below names what drifted instead of guessing at emptiness.
+  const drift = describePolicyDrift(res.data, policy);
+  if (drift) return { status: "unreadable", reason: drift };
   return Object.keys(policy).length === 0 ? { status: "absent" } : { status: "ok", policy };
+}
+
+/**
+ * Fields the no-policy response is known to carry, so their presence never reads as drift.
+ * Extend this as LaunchDarkly adds boilerplate — otherwise `absent` rots into noise.
+ */
+const KNOWN_SETTINGS_KEYS = new Set([
+  "releaseMethod",
+  "releasePolicyKey",
+  "releasePolicyName",
+  "guardedReleaseConfig",
+  "progressiveReleaseConfig",
+  "_links",
+]);
+
+/**
+ * Positive evidence that the response shape drifted, or undefined if it looks intact.
+ *
+ * This endpoint is documented as mid-rename, and total drift is not the dangerous case —
+ * PARTIAL drift is: a recognised `releaseMethod` alongside a renamed `guardedReleaseConfig`
+ * yields a non-empty policy with the metrics silently gone, which no emptiness check can
+ * see.
+ */
+function describePolicyDrift(raw: RawReleaseSettings, normalized: ReleasePolicy): string | undefined {
+  const asRecord = (raw ?? {}) as unknown as Record<string, unknown>;
+  // (1) A method we cannot map. Positive signal, no guessing: the field is populated and
+  // normalizeMethod returned nothing.
+  if (raw.releaseMethod && !normalized.releaseMethod) {
+    return `release-settings reported an unrecognized releaseMethod '${raw.releaseMethod}'`;
+  }
+  // (2) A config block with content from which nothing was recovered — an inner rename.
+  for (const key of ["guardedReleaseConfig", "progressiveReleaseConfig"] as const) {
+    const cfg = asRecord[key];
+    if (cfg && typeof cfg === "object" && Object.keys(cfg as object).length > 0) {
+      const recovered =
+        normalized.randomizationUnit !== undefined ||
+        normalized.stages !== undefined ||
+        normalized.metricKeys !== undefined ||
+        normalized.metricGroupKeys !== undefined ||
+        normalized.rollbackOnRegression !== undefined;
+      if (!recovered) return `release-settings ${key} had content but nothing in it was recognized`;
+    }
+  }
+  // (3) Populated fields we have never seen. Only non-empty values count, so the
+  // empty-string no-policy body stays silent.
+  const unknown = Object.entries(asRecord)
+    .filter(([k, v]) => !KNOWN_SETTINGS_KEYS.has(k) && v !== "" && v !== null && v !== undefined)
+    .map(([k]) => k);
+  if (unknown.length > 0) return `release-settings carried unrecognized field(s): ${unknown.join(", ")}`;
+  return undefined;
 }
 
 /** Path for listing a flag's automated releases across environments (beta/internal). */
@@ -335,7 +391,16 @@ export async function findActiveRelease(
   return res.data.items?.find((r) => !isReleaseFinished(r.status)) ?? null;
 }
 
-/** Poll an automated release until it reaches a terminal state or times out. */
+/** Consecutive poll failures tolerated before monitoring gives up. */
+const POLL_ERROR_RETRIES = 5;
+
+/**
+ * Poll an automated release until it finishes or the deadline passes.
+ *
+ * Returns the last observation rather than throwing on timeout, and keeps polling states
+ * it does not recognise (a paused release resumed by a human must still be seen to
+ * complete — that is what repoints child flags).
+ */
 export async function monitorRelease(
   ld: LdClient,
   environmentKey: string,
@@ -344,15 +409,41 @@ export async function monitorRelease(
 ): Promise<AutomatedRelease> {
   const pollMillis = opts.pollMillis ?? 10_000;
   const deadline = Date.now() + (opts.timeoutMillis ?? 60 * 60 * 1000);
+  let consecutiveErrors = 0;
+  let lastSeen: AutomatedRelease | undefined;
+  let reportedUnknown: string | undefined;
   for (;;) {
-    const release = await getReleaseStatus(ld, environmentKey, releaseId);
-    // Stop on anything not positively running — terminal OR unrecognised. See
-    // KNOWN_RUNNING: a paused release polled until the deadline would surface as a
-    // monitoring timeout, which reads like a failure and says nothing about the pause.
-    if (!isReleaseRunning(release.status)) return release;
-    if (Date.now() > deadline) {
-      throw new Error(`Timed out monitoring release ${releaseId} (last status: ${release.status})`);
+    let release: AutomatedRelease;
+    try {
+      release = await getReleaseStatus(ld, environmentKey, releaseId);
+      consecutiveErrors = 0;
+    } catch (e) {
+      // A single transient read must not end monitoring for good: dying here strands the
+      // completion, and with it the child-flag repointing that only runs on `completed`.
+      if (++consecutiveErrors > POLL_ERROR_RETRIES) throw e;
+      console.warn(
+        `[release] poll ${consecutiveErrors}/${POLL_ERROR_RETRIES} failed for ${releaseId} ` +
+          `(retrying): ${e instanceof Error ? e.message : e}`,
+      );
+      await new Promise((r) => setTimeout(r, pollMillis));
+      continue;
     }
+    lastSeen = release;
+    if (isReleaseFinished(release.status)) return release;
+    // Not finished and not recognised as running — most plausibly PAUSED on a regression,
+    // which `rollbackOnRegression: false` asks for. KEEP POLLING: a human resuming it in
+    // LaunchDarkly must be observed, because completion is what triggers child-flag
+    // repointing. Announce the transition once so the wait is explained rather than silent.
+    if (!isReleaseRunning(release.status) && reportedUnknown !== release.status) {
+      reportedUnknown = release.status;
+      console.warn(
+        `[release] ${releaseId} is '${release.status}' — neither running nor finished, most likely ` +
+          `PAUSED awaiting a human. Still watching for it to resume or end.`,
+      );
+    }
+    // Timeout returns the last observation instead of throwing: "still paused after N
+    // hours" is a state to report, not an error to swallow.
+    if (Date.now() > deadline) return lastSeen;
     await new Promise((r) => setTimeout(r, pollMillis));
   }
 }

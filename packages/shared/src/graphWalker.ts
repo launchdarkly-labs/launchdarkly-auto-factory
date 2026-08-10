@@ -391,31 +391,15 @@ function unionCsv(existing: string | undefined, incoming: string): string {
 }
 
 /**
- * Warn when a loop edge's `skip_if_tags` exit can never match, because it names routing
- * tags the source run didn't emit. The loop then fires on every pass until its budget is
- * spent — burning a full live iteration each time — so this is the more expensive twin of
- * `warnIfOnlyStaleWouldMatch`, and it needs the opposite diagnosis.
+ * Routing tags a loop edge's `skip_if_tags` exit names that the source run did not emit.
+ * Empty when the exit is reachable as far as this pass shows.
  */
-function warnIfExitUnreachable(
-  isLoop: boolean,
-  source: string,
-  target: string,
+function unemittedExitTags(
   skip: Record<string, string> | undefined,
-  accumulated: Record<string, string>,
   fresh: Record<string, string>,
-): void {
-  if (!isLoop || !skip) return;
-  // Only interesting when the stale view WOULD have exited — otherwise the condition is
-  // simply unmet this pass, which is ordinary.
-  if (!tagsMatch(accumulated, skip)) return;
-  const foreign = Object.keys(skip).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === undefined);
-  if (foreign.length === 0) return;
-  console.warn(
-    `[loop] edge ${source} → ${target} can never EXIT: its skip_if_tags names routing tag(s) ` +
-      `${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched ` +
-      `against the source run's own tags, so this loop will run to its full budget every time — check the ` +
-      `SERVED graph.`,
-  );
+): string[] {
+  if (!skip) return [];
+  return Object.keys(skip).filter((k) => ROUTING_TAGS.has(k) && fresh[k] === undefined);
 }
 
 /** All key/value pairs in `cond` are present and equal in `tags`. */
@@ -777,6 +761,12 @@ export async function walkGraph(
   const edgeCounts = new Map<string, number>();
   // Loop edges whose budget ran out, keyed per edge so a revisited node records once.
   const budgetSpent = new Map<string, NonNullable<WalkResult["loopBudgetSpent"]>[number]>();
+  // Per-edge: warned about an unemitted exit tag already (once per walk, not per pass).
+  const exitWarned = new Set<string>();
+  // Per-edge: every traversal so far was taken while its exit tag went unemitted. Lets the
+  // categorical "the exit never had a chance" claim be a RECORD at exhaustion rather than a
+  // prediction from one pass.
+  const exitNeverPossible = new Map<string, boolean>();
   // Routing-tag state captured just before each run (parallel to `runs`), so a
   // loop re-entry can restore the target's pre-run routing state.
   const routingSnapshots: Array<Record<string, string>> = [];
@@ -1048,10 +1038,6 @@ export async function walkGraph(
         continue;
       }
       const skip = handoffTags(h, "skip_if_tags");
-      // A loop edge's skip_if is its EXIT. If it names a routing tag the source can't
-      // emit, the exit can never match and the loop runs to budget every single time —
-      // the opposite failure from an unsatisfiable require_tags, and the costlier one.
-      warnIfExitUnreachable(isLoop, key, edge.key, skip, accumulatedTags, matchAgainst);
       if (skip && tagsMatch(matchAgainst, skip)) continue;
       // Quality gate: take this edge only when the just-completed node scored BELOW
       // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
@@ -1080,6 +1066,17 @@ export async function walkGraph(
             ...(trig ? { trigger: trig } : {}),
           };
           budgetBlocked.push(spent);
+          // Now earned: the exit named a tag the source never emitted across every
+          // traversal, so it genuinely never had a chance. Unlike the per-pass note above,
+          // this is a record of N iterations, which is why it can name the served graph.
+          if (exitNeverPossible.get(ek) === true) {
+            const named = Object.keys(handoffTags(h, "skip_if_tags") ?? {}).join(", ");
+            console.warn(
+              `[loop] ${key} → ${edge.key} exhausted ${traversals} iteration(s) and its exit (${named}) was ` +
+                `never satisfiable — '${key}' emitted none of those tags on any pass. This edge can only ever ` +
+                `end by budget; check the SERVED graph.`,
+            );
+          }
           // Recorded whether or not the walk continues past this edge. An advisory
           // loop (one whose node also has a forward edge) falls through and finishes
           // normally, so this is the only place that "we gave up on quality" is
@@ -1164,6 +1161,23 @@ export async function walkGraph(
       // A judge-driven edge describes itself with the runtime score; a tag-driven one
       // with the tags that matched. `detail` carries the judge's reasoning, which —
       // unlike a verdict loop's critique — is NOT in the inbound brief.
+      // Evidence-based, and only for an edge actually TAKEN: this pass really did burn an
+      // iteration while the exit named a tag the source didn't emit. Stated as a
+      // conditional ("if it never emits") rather than the categorical "can never exit",
+      // because a tag emitted only on affirmative passes is legitimate — the definitive
+      // version is asserted at exhaustion, where "never" is a record and not a prediction.
+      const unemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      // AND across traversals: true only if EVERY pass took this edge with its exit tag
+      // unemitted. That turns "never" into a record by the time the budget runs out.
+      exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+      if (unemitted.length > 0 && !exitWarned.has(ek)) {
+        exitWarned.add(ek);
+        console.warn(
+          `[loop] ${key} → ${next}: iteration taken while its exit named routing tag(s) ` +
+            `${unemitted.join(", ")}, which '${key}' did not emit this pass. If it never emits them, this ` +
+            `loop can only end by exhausting its budget.`,
+        );
+      }
       const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
       pendingLoopTrigger = {
         source: key,

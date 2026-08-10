@@ -75,15 +75,15 @@ export async function monitorTriggeredRelease(
       // monitoring_stopped = a human intervened. Both are end states for us.
       console.warn(`${tag}: ended ${final.status.toUpperCase()} (stage ${final.latestStageIndex})`);
     } else {
-      // Not running and not finished: a state we do not model — most plausibly a release
-      // PAUSED on a regression, which is what `rollbackOnRegression: false` asks for.
-      // Say so loudly with the per-metric detail, because the whole point of choosing
-      // pause-over-rollback is that a human steps in, and nothing else here would tell
-      // them. Statuses are printed verbatim rather than interpreted: we do not know
-      // LaunchDarkly's vocabulary for this, and guessing it would be worse than quoting.
+      // Neither running nor finished when the watch window ran out — most plausibly still
+      // PAUSED on a regression, which `rollbackOnRegression: false` asks for. The poll loop
+      // keeps watching such a release (a human may resume it), so reaching here means it
+      // was still unresolved at the deadline. Per-metric detail is printed VERBATIM: we do
+      // not know LaunchDarkly's vocabulary for this state, and quoting beats guessing.
       console.warn(
-        `${tag}: release ${final.id} is neither running nor finished (status '${final.status}', stage ` +
-          `${final.latestStageIndex}) — most likely PAUSED awaiting a human. Monitoring stopped.`,
+        `${tag}: stopped watching release ${final.id} — still '${final.status}' (stage ` +
+          `${final.latestStageIndex}) after the monitoring window. Most likely PAUSED awaiting a human; ` +
+          `child-flag repointing will happen on the next deploy once it completes.`,
       );
       for (const m of final.metricConfigurations ?? []) {
         console.warn(`${tag}:   metric ${m.metricKey} status='${m.status}' autoRollback=${m.autoRollback}`);

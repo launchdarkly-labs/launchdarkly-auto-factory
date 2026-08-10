@@ -156,7 +156,15 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // An immediate release moves the fallthrough right here — re-point any
         // auto-factory children pinned on the previous variation (staged
         // releases do this when monitoring sees them complete).
-        if (result.method === "immediate") {
+        //
+        // `noop` matters for the same reason and was missing: it means the environment
+        // ALREADY serves the target variation, which is what a release completing outside
+        // our watch looks like — a release that paused on a regression, was resumed by a
+        // human, and finished after monitoring stopped. That noop is the only moment the
+        // external completion is visible to Beacon, so without this children pinned on the
+        // previous variation stay stranded forever. Idempotent: already-pointed children
+        // are skipped.
+        if (result.method === "immediate" || result.method === "noop") {
           await repointDependentPrerequisites(ld, flag.flagKey, n.environment);
         }
         outcomes.push({
