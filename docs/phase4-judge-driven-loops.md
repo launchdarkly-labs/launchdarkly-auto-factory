@@ -1,6 +1,9 @@
 # Phase 4 — Making the factory loop
 
-**Status:** proposed (rev 2)
+**Status:** Step 1 shipped · Step 2 shipped for the CLI, Action-side deferred · Step 3
+shipped. Each section carries its own SHIPPED banner and records where the built thing
+diverged from the plan; the deferred items are listed under Step 2c and in
+`docs/release-policy-metrics.md`.
 **Depends on:** Phase 1 (`31d2b86`), Phase 2 (`c647974`), Phase 3 (`d4a67c9`)
 **Companion:** `docs/loop-shapes.md` — the loop taxonomy, triggers, and reachability
 this sequence is derived from.
