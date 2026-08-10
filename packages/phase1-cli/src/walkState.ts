@@ -66,8 +66,22 @@ export interface WalkState {
   treeHash?: string;
   /** Approval mode in force, so a policy change invalidates the journal. */
   policyMode?: string;
-  /** Base ref the recorded walk diffed against — a different base is a different diff. */
+  /**
+   * The RESOLVED base ref the recorded walk diffed against (e.g. `origin/main`,
+   * not the `--base main` the user typed) — a different base is a different diff.
+   * Resolved, because `resolveBase` prefers `origin/<base>` and falls through to
+   * the local branch: two runs typing the same `--base` can diff against
+   * different refs, and the name must record which one it actually was.
+   */
   base?: string;
+  /**
+   * The commit `base` pointed at when the walk halted. The ref NAME alone is not
+   * an identity: `origin/main` moves on any `git fetch` — an IDE auto-fetch while
+   * the human decides on an approval is enough — with no change to HEAD or the
+   * working tree, and the live nodes would then analyse a different diff than the
+   * replayed journal was recorded against.
+   */
+  baseSha?: string;
   /**
    * Loop-edge grants in force for THIS walk, each stamped with the point it took effect
    * (see `LoopGrant`). Journalled because the walk branches on them, and POSITIONAL
@@ -113,7 +127,10 @@ export interface WalkStateKeys {
   head?: string;
   treeHash?: string;
   policyMode?: string;
+  /** Resolved base ref name (see WalkState.base). */
   base?: string;
+  /** Commit the resolved base points at NOW (see WalkState.baseSha). */
+  baseSha?: string;
 }
 
 function gitDir(root: string): string {
@@ -266,8 +283,23 @@ export function validateWalkState(state: WalkState | undefined, keys: WalkStateK
   if (state.base !== keys.base) {
     // The whole walk was recorded against a diff. A different base is a different
     // diff, so replayed steps and live steps would be reasoning about different
-    // changes — a wrong result rather than a refusal.
+    // changes — a wrong result rather than a refusal. Both sides are the RESOLVED
+    // ref, so `origin/main` becoming unresolvable and falling through to local
+    // `main` is a mismatch here, not a silent substitution.
     return { ok: false, reason: `the base ref changed since the walk was saved ('${state.base}' → '${keys.base}')` };
+  }
+  if (!state.baseSha || !keys.baseSha) {
+    return { ok: false, reason: "could not determine the base commit on both sides — refusing to resume" };
+  }
+  if (state.baseSha !== keys.baseSha) {
+    // The ref NAME matching is not enough: `origin/main` moves on any `git fetch`
+    // (an IDE auto-fetch during an approval pause is the realistic case) with no
+    // change to HEAD or the working tree. The journal was recorded against the old
+    // commit's diff; the live nodes would analyse the new one.
+    return {
+      ok: false,
+      reason: `the base ref '${state.base}' moved since the walk was saved (${state.baseSha.slice(0, 12)} → ${keys.baseSha.slice(0, 12)}) — the journal describes a diff against the old base`,
+    };
   }
   if (state.policyMode !== keys.policyMode) {
     return {

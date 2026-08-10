@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
+import { readRepoState } from "@auto-factory/shared";
 import {
   WALK_STATE_VERSION,
   clearWalkState,
@@ -205,7 +206,8 @@ describe("walk state captures the tree AT THE HALT, not before the walk", () => 
     head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
     treeHash: computeTreeHash(dir),
     policyMode: "always",
-    base: "main",
+    base: "origin/main",
+    baseSha: "base-sha-1",
   });
   const save = (dir: string) =>
     writeWalkState(dir, {
@@ -213,7 +215,8 @@ describe("walk state captures the tree AT THE HALT, not before the walk", () => 
       configStamp: "cfg123",
       head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
       policyMode: "always",
-      base: "main",
+      base: "origin/main",
+      baseSha: "base-sha-1",
       haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
       runs: sampleRuns,
     });
@@ -259,5 +262,134 @@ describe("walk state captures the tree AT THE HALT, not before the walk", () => 
     save(dir);
     assert.notEqual(readWalkState(dir)?.treeHash, preWalk);
     assert.equal(readWalkState(dir)?.treeHash, computeTreeHash(dir));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round seven, finding 4: resume invalidation must pin the base COMMIT, not the
+// ref name. The stored/compared value used to be the literal `--base` string
+// ("main"), while the walk actually diffs against `resolveBase`'s answer —
+// which prefers `origin/main`, a ref that moves on any `git fetch` with no
+// change to HEAD or the working tree. Every other invalidation key then passed
+// and the live nodes analysed a different diff than the replayed journal.
+// ---------------------------------------------------------------------------
+describe("resume invalidation pins the base COMMIT, not the ref name", () => {
+  it("readRepoState reports the resolved base's SHA (and prefers origin/<base>)", async () => {
+    const dir = repo();
+    const git = (args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+    const sha = git(["rev-parse", "HEAD"]);
+    git(["update-ref", "refs/remotes/origin/main", sha]); // simulate a remote-tracking main
+    const state = await readRepoState(dir, "main");
+    assert.equal(state.resolvedBase, "origin/main");
+    assert.equal(state.resolvedBaseSha, sha);
+  });
+
+  it("a fetch that advances origin/main REFUSES the resume — HEAD and tree unchanged", async () => {
+    const dir = repo();
+    const git = (args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+    const baseSha = git(["rev-parse", "HEAD"]);
+    git(["update-ref", "refs/remotes/origin/main", baseSha]);
+    // The change under review: a feature branch one commit ahead of the base.
+    git(["checkout", "-q", "-b", "feature"]);
+    writeFileSync(join(dir, "feature.ts"), "export const f = 1;\n");
+    git(["add", "-A"]);
+    execFileSync("git", ["commit", "-q", "-m", "feature"], { cwd: dir });
+
+    // Halt: save the walk state the way run.ts now does — resolved ref + its SHA.
+    const before = await readRepoState(dir, "main");
+    writeWalkState(dir, {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: git(["rev-parse", "--short", "HEAD"]),
+      policyMode: "always",
+      base: before.resolvedBase!,
+      baseSha: before.resolvedBaseSha!,
+      haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
+      runs: sampleRuns,
+    });
+
+    // While the human decides, an IDE auto-fetch advances origin/main: a new commit
+    // lands on the remote main (same tree here, which makes the case HARDER — only
+    // the commit identity moves).
+    const tree = git(["rev-parse", `${baseSha}^{tree}`]);
+    const movedSha = git(["commit-tree", tree, "-p", baseSha, "-m", "someone else's merge"]);
+    git(["update-ref", "refs/remotes/origin/main", movedSha]);
+
+    // HEAD did not move and the working tree is untouched — the pre-fix keys all pass.
+    const after = await readRepoState(dir, "main");
+    assert.equal(after.head, before.head, "HEAD unmoved");
+    assert.equal(after.resolvedBase, "origin/main", "same resolved ref NAME");
+    assert.notEqual(after.resolvedBaseSha, before.resolvedBaseSha, "but a different commit");
+
+    const r = validateWalkState(readWalkState(dir), {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: git(["rev-parse", "--short", "HEAD"]),
+      treeHash: computeTreeHash(dir),
+      policyMode: "always",
+      base: after.resolvedBase!,
+      baseSha: after.resolvedBaseSha!,
+    });
+    assert.equal(r.ok, false, "a moved base is a different diff — must refuse");
+    assert.match((r as { reason: string }).reason, /moved since the walk was saved/);
+  });
+
+  it("origin/main becoming unresolvable does NOT silently fall through to local main", async () => {
+    const dir = repo();
+    const git = (args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+    const sha = git(["rev-parse", "HEAD"]);
+    git(["update-ref", "refs/remotes/origin/main", sha]);
+    const before = await readRepoState(dir, "main");
+    assert.equal(before.resolvedBase, "origin/main");
+    writeWalkState(dir, {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: sha,
+      policyMode: "always",
+      base: before.resolvedBase!,
+      baseSha: before.resolvedBaseSha!,
+      haltedAt: { kind: "pending-approval", node: "n" },
+      runs: sampleRuns,
+    });
+    // The remote-tracking ref disappears; resolveBase falls through to local main.
+    git(["update-ref", "-d", "refs/remotes/origin/main"]);
+    const after = await readRepoState(dir, "main");
+    assert.notEqual(after.resolvedBase, "origin/main");
+    const r = validateWalkState(readWalkState(dir), {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: sha,
+      treeHash: computeTreeHash(dir),
+      policyMode: "always",
+      base: after.resolvedBase!,
+      baseSha: after.resolvedBaseSha!,
+    });
+    assert.equal(r.ok, false, "a substituted base ref must refuse, even at the same commit");
+    assert.match((r as { reason: string }).reason, /base ref changed/);
+  });
+
+  it("an unknown base commit on either side fails closed", () => {
+    const dir = repo();
+    writeWalkState(dir, {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: "sha1",
+      policyMode: "always",
+      base: "origin/main",
+      // no baseSha — e.g. state written where rev-parse failed
+      haltedAt: { kind: "pending-approval", node: "n" },
+      runs: sampleRuns,
+    });
+    const r = validateWalkState(readWalkState(dir), {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: "sha1",
+      treeHash: computeTreeHash(dir),
+      policyMode: "always",
+      base: "origin/main",
+      baseSha: "abc123",
+    });
+    assert.equal(r.ok, false);
+    assert.match((r as { reason: string }).reason, /base commit/);
   });
 });

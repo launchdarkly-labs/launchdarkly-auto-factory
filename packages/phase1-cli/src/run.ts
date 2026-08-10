@@ -350,7 +350,13 @@ async function run(opts: CliOptions): Promise<number> {
     ...(state.head ? { head: state.head } : {}),
     ...(treeHash ? { treeHash } : {}),
     policyMode: policy.mode,
-    base: opts.base,
+    // The RESOLVED base ref and its commit, not the `--base` name the user typed:
+    // `origin/main` moves on any `git fetch` with no change to HEAD or the tree, and
+    // an unresolvable `origin/<base>` silently falls through to the local branch —
+    // both change the diff the walk reasons about while the NAME compares equal.
+    // Left absent when unresolvable, which validation fails closed on.
+    ...(state.resolvedBase ? { base: state.resolvedBase } : {}),
+    ...(state.resolvedBaseSha ? { baseSha: state.resolvedBaseSha } : {}),
   };
   let resume: ResumeInput | undefined;
   // Grants carried in from a saved walk, each keeping the position it took effect at.
@@ -507,7 +513,8 @@ async function run(opts: CliOptions): Promise<number> {
         ...(state.branch ? { branch: state.branch } : {}),
         ...(stateKeys.head ? { head: stateKeys.head } : {}),
         ...(stateKeys.policyMode ? { policyMode: stateKeys.policyMode } : {}),
-        base: opts.base,
+        ...(stateKeys.base ? { base: stateKeys.base } : {}),
+        ...(stateKeys.baseSha ? { baseSha: stateKeys.baseSha } : {}),
         // Positional, so a later round replays this round's granted traversals at the
         // position they actually happened rather than from the start of the journal.
         ...((): { grants?: LoopGrant[] } => {

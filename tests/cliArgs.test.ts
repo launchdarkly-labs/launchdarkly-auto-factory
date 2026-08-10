@@ -151,12 +151,21 @@ describe("walk state validation (fail-closed)", () => {
     head: "sha1",
     treeHash: "tree1",
     policyMode: "always",
-    base: "main",
+    base: "origin/main",
+    baseSha: "base-sha-1",
     haltedAt: { kind: "pending-approval" as const, node: "n" },
     runs: [{ configKey: "n", status: "completed" as const, output: "o", tags: {}, iteration: 1 }],
     at: "2026-08-09T00:00:00.000Z",
   };
-  const keys = { graphKey: "g", configStamp: "cfg123", head: "sha1", treeHash: "tree1", policyMode: "always", base: "main" };
+  const keys = {
+    graphKey: "g",
+    configStamp: "cfg123",
+    head: "sha1",
+    treeHash: "tree1",
+    policyMode: "always",
+    base: "origin/main",
+    baseSha: "base-sha-1",
+  };
 
   it("accepts a state whose every key matches", () => {
     const r = validateWalkState(base, keys);
@@ -184,12 +193,17 @@ describe("walk state validation (fail-closed)", () => {
   rejects({ treeHash: "tree2" }, /working tree changed/, "the working tree changed");
   rejects({ policyMode: "yolo" }, /approval policy changed/, "the approval policy changed");
   rejects({ base: "develop" }, /base ref changed/, "the base ref changed — a different diff entirely");
+  rejects(
+    { baseSha: "base-sha-2" },
+    /moved since the walk was saved/,
+    "the base COMMIT moved under an unchanged ref name (origin/main after a fetch)",
+  );
   rejects({ runs: [] }, /empty journal/, "the journal is empty");
 
   it("refuses when ANY key is unknown on either side, not just the tree hash", () => {
     // Fail-closed means "couldn't check" == "refuse". Previously only treeHash
     // enforced this while the doc claimed all of them did.
-    for (const key of ["configStamp", "head", "policyMode", "base"] as const) {
+    for (const key of ["configStamp", "head", "policyMode", "base", "baseSha"] as const) {
       const missingStored = validateWalkState({ ...base, [key]: undefined }, keys);
       assert.equal(missingStored.ok, false, `stored ${key} missing`);
       assert.match((missingStored as { reason: string }).reason, /could not (verify|determine)/, key);
