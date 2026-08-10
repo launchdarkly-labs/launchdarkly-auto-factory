@@ -15,6 +15,7 @@ import {
   isReleaseFinished,
   isReleaseRunning,
   findActiveRelease,
+  findLatestRelease,
   monitorRelease,
   type AutomatedRelease,
   type LdClient,
@@ -51,10 +52,23 @@ export async function monitorTriggeredRelease(
   try {
     let active: AutomatedRelease | null = null;
     for (let attempt = 0; attempt < 5 && !active; attempt++) {
-      if (attempt > 0) await sleep(2_000);
+      // Never longer than the poll interval, so tests (and short stages) aren't
+      // pinned to a hardcoded 2s; production settings keep the original 2s.
+      if (attempt > 0) await sleep(Math.min(2_000, settings.pollMillis));
       active = await findActiveRelease(ld, flagKey, environmentKey);
     }
     if (!active) {
+      // findActiveRelease filters to NOT-finished, so a release that completed
+      // inside this retry envelope is invisible to it. One unfiltered look: if the
+      // newest release is already `completed`, run the completion path — otherwise
+      // "it may have completed instantly" was exactly the case that skipped the
+      // child-flag repointing it names.
+      const latest = await findLatestRelease(ld, flagKey, environmentKey);
+      if (latest?.status === "completed") {
+        console.log(`${tag}: COMPLETED before monitoring could attach (release ${latest.id}) — rolled out to 100%`);
+        await repointDependentPrerequisites(ld, flagKey, environmentKey);
+        return latest;
+      }
       console.warn(`${tag}: started but no in-progress release found to monitor (it may have completed instantly)`);
       return null;
     }

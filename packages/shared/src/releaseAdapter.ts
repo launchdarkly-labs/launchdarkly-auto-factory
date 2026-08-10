@@ -493,6 +493,29 @@ export async function findActiveRelease(
   return res.data.items?.find((r) => !isReleaseFinished(r.status)) ?? null;
 }
 
+/**
+ * The most recent automated release for a flag in an environment, terminal or not.
+ *
+ * Exists for the blind spot `findActiveRelease` has BY DESIGN: it filters to
+ * not-finished, so a release that completes inside the post-trigger retry envelope
+ * is invisible to it — and the caller would skip the completion path (child-flag
+ * repointing) for exactly the release it just started. One unfiltered look at the
+ * newest item (the listing is newest-first, which `findActiveRelease`'s no-limit-1
+ * comment already relies on) closes that.
+ */
+export async function findLatestRelease(
+  ld: LdClient,
+  flagKey: string,
+  environmentKey: string,
+): Promise<AutomatedRelease | null> {
+  const filter = encodeURIComponent(`environmentKey:${environmentKey}`);
+  const res = await ld.request<{ items?: AutomatedRelease[] }>({
+    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=1`,
+    headers: BETA_HEADER,
+  });
+  return res.data.items?.[0] ?? null;
+}
+
 /** Consecutive poll failures tolerated before monitoring gives up. */
 const POLL_ERROR_RETRIES = 5;
 
