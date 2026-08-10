@@ -9,6 +9,7 @@ import {
   clearWalkState,
   computeTreeHash,
   readWalkState,
+  validateWalkState,
   walkStatePath,
   writeWalkState,
 } from "@auto-factory/phase1-cli";
@@ -44,7 +45,6 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
       configStamp: "cfg123",
       branch: "feature",
       head: "sha1",
-      treeHash: "tree1",
       policyMode: "always",
       haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
       runs: sampleRuns,
@@ -131,5 +131,74 @@ describe("computeTreeHash — HEAD alone cannot detect what agents change", () =
     const dir = mkdtempSync(join(tmpdir(), "af-nogit-"));
     tmps.push(dir);
     assert.equal(computeTreeHash(dir), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The bug this file previously missed: it tested computeTreeHash in isolation and
+// the file round-trip in isolation, but never the SEQUENCE — that the hash stored
+// at a halt reflects the tree as the agents left it. Getting that wrong broke
+// resume outright AND inverted the check (reverting the agents' edits made it
+// pass, replaying a journal describing work no longer in the files).
+// ---------------------------------------------------------------------------
+describe("walk state captures the tree AT THE HALT, not before the walk", () => {
+  const keysFor = (dir: string) => ({
+    graphKey: "g",
+    configStamp: "cfg123",
+    head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
+    treeHash: computeTreeHash(dir),
+    policyMode: "always",
+  });
+  const save = (dir: string) =>
+    writeWalkState(dir, {
+      graphKey: "g",
+      configStamp: "cfg123",
+      head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
+      policyMode: "always",
+      haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
+      runs: sampleRuns,
+    });
+
+  it("resuming immediately after a halt is ACCEPTED (the normal path must work)", () => {
+    const dir = repo();
+    // Stand in for the agents having edited the tree before the halt.
+    writeFileSync(join(dir, "app.ts"), "export const x = 2; // agent edit\n");
+    save(dir);
+    const r = validateWalkState(readWalkState(dir), keysFor(dir));
+    assert.equal(r.ok, true, `a halt-then-resume with an untouched tree must validate: ${JSON.stringify(r)}`);
+  });
+
+  it("a human editing files after the halt is REFUSED", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "app.ts"), "export const x = 2; // agent edit\n");
+    save(dir);
+    writeFileSync(join(dir, "app.ts"), "export const x = 3; // human edit\n");
+    const r = validateWalkState(readWalkState(dir), keysFor(dir));
+    assert.equal(r.ok, false);
+    assert.match((r as { reason: string }).reason, /working tree changed/);
+  });
+
+  it("REVERTING the agents' edits is refused, not accepted", () => {
+    // The safety inversion. `git checkout -- .` is the reflex on seeing unwanted
+    // agent edits; if the stored hash were the PRE-walk tree, that reflex would make
+    // the check pass and replay a journal claiming work the files no longer contain.
+    const dir = repo();
+    const pristine = "export const x = 1;\n";
+    writeFileSync(join(dir, "app.ts"), "export const x = 2; // agent edit\n");
+    save(dir);
+    writeFileSync(join(dir, "app.ts"), pristine); // revert
+    const r = validateWalkState(readWalkState(dir), keysFor(dir));
+    assert.equal(r.ok, false, "reverting the recorded work must NOT validate");
+    assert.match((r as { reason: string }).reason, /working tree changed/);
+  });
+
+  it("stores a hash that differs from the pre-walk tree when the walk edited files", () => {
+    // Directly pins what the sequence bug got wrong.
+    const dir = repo();
+    const preWalk = computeTreeHash(dir);
+    writeFileSync(join(dir, "app.ts"), "export const x = 2; // agent edit\n");
+    save(dir);
+    assert.notEqual(readWalkState(dir)?.treeHash, preWalk);
+    assert.equal(readWalkState(dir)?.treeHash, computeTreeHash(dir));
   });
 });

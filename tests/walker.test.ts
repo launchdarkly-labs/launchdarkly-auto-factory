@@ -799,6 +799,44 @@ describe("walkGraph — resume (event-log replay)", () => {
     assert.match(r.replayDiverged?.detail ?? "", /before consuming the whole journal/);
   });
 
+  it("8b. a grant on a MID-JOURNAL edge does not rewrite replayed history", async () => {
+    // The grant must apply only at the frontier. Applied during replay it lets a
+    // replayed step take a loop the original walk fell through, which surfaces as a
+    // bogus "the graph changed" divergence — and granting the edge named in a
+    // "quality loop used all attempts" warning is the natural human response.
+    //
+    // The fall-through must be MID-journal for this to bite: at the LAST journalled
+    // step the journal is already consumed, so the grant applies either way.
+    const g = (): AgentGraphDefinition =>
+      graphFrom({
+        root: "metrics",
+        edges: {
+          metrics: [
+            { key: "metrics", handoff: { max_visits: 1, require_tags: { retry: "yes" } } },
+            { key: "mid", handoff: {} },
+          ],
+          mid: [{ key: "gated", handoff: {} }],
+          gated: [],
+        },
+      });
+    const script = { metrics: { tags: { retry: "yes" } } };
+    // Loop fires once, budget spent, falls through to `mid`, then halts at `gated`.
+    // Journal: [metrics#1, metrics#2, mid#1] — the fall-through is at index 1.
+    const first = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
+      gate: { steps: ["gated"], resolve: async () => false },
+    });
+    assert.deepEqual(first.runs.map((r) => r.configKey), ["metrics", "metrics", "mid"]);
+    assert.equal(first.pendingApproval?.node, "gated");
+    assert.ok(first.loopBudgetSpent, "the advisory loop spent its budget mid-walk");
+
+    const resumed = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
+      gate: { steps: ["gated"], resolve: async () => true },
+      resume: { journal: first.runs, extraVisits: { "metrics→metrics": 1 }, humanFeedback: "try again" },
+    });
+    assert.equal(resumed.replayDiverged, undefined, "replayed steps must re-derive the ORIGINAL budget decision");
+    assert.deepEqual(resumed.runs.map((r) => r.configKey), ["metrics", "metrics", "mid", "gated"]);
+  });
+
   it("8. an extraVisits grant cannot exceed the hard cap", async () => {
     // A grant raises a ceiling; it can never remove one.
     const g = () => graphFrom(reworkGraphValue(2));

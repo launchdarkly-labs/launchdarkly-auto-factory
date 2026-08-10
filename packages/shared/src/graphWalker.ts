@@ -863,6 +863,14 @@ export async function walkGraph(
     let nextIsLoopEdge = false;
     // The judge threshold the taken loop edge fired on, for the trigger message.
     let nextJudgeThreshold: number | undefined;
+    // A resume grant applies only once the journal is spent — i.e. at the frontier
+    // and beyond. NOT `!replaying`: the exhausted edge's budget check happens during
+    // the LAST journalled iteration (the run is already pushed, so runs.length has
+    // caught up), so gating on `replaying` would stop the grant from ever firing.
+    // Gating on journal-consumed instead means replayed steps re-derive the ORIGINAL
+    // budget decisions — otherwise a grant on a mid-journal edge would make replay
+    // take a loop the first walk fell through, and report that as divergence.
+    const journalConsumed = runs.length >= journal.length;
     const budgetBlocked: LoopExhaustedInfo["exhausted"] = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
@@ -882,8 +890,8 @@ export async function walkGraph(
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
         // A human's resume grant raises this edge's ceiling but can never remove it:
-        // the hard cap still clamps the total.
-        const grant = Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0));
+        // the hard cap still clamps the total. Frontier-only (see journalConsumed).
+        const grant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {

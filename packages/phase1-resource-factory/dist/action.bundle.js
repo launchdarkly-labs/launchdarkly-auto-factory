@@ -33909,6 +33909,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let nextHandoff;
     let nextIsLoopEdge = false;
     let nextJudgeThreshold;
+    const journalConsumed = runs.length >= journal.length;
     const budgetBlocked = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
@@ -33927,7 +33928,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== void 0) {
         const ek = `${key}\u2192${edge.key}`;
-        const grant = Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0));
+        const grant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {

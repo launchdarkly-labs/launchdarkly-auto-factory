@@ -329,9 +329,14 @@ async function run(opts: CliOptions): Promise<number> {
   // live from where it stopped. Fail-closed — every key must match, because the
   // agents' recorded work only means anything against the files it was recorded
   // from. Refusing costs a re-run; replaying stale state corrupts the result.
+  // These are the keys as of NOW, before anything runs — correct for VALIDATING a
+  // saved journal (has the world moved since the halt?). They are deliberately not
+  // reused when persisting: `writeWalkState` re-hashes the tree itself, because by
+  // then the agents have edited it. See the comment on writeWalkState.
+  const configStamp = localConfigHash();
   const stateKeys: WalkStateKeys = {
     graphKey: opts.graphKey,
-    ...(localConfigHash() ? { configStamp: localConfigHash() } : {}),
+    ...(configStamp ? { configStamp } : {}),
     ...(state.head ? { head: state.head } : {}),
     ...(computeTreeHash(root) ? { treeHash: computeTreeHash(root) } : {}),
     policyMode: policy.mode,
@@ -426,14 +431,19 @@ async function run(opts: CliOptions): Promise<number> {
         ? ({ kind: "loop-exhausted", node: walk.loopExhausted.node } as const)
         : undefined;
     if (walk.replayDiverged) {
-      clearWalkState(root); // the journal no longer describes this repo
+      // Left in place, NOT deleted. A divergence means the saved journal no longer
+      // matches this repo, but the cause may be reversible (a graph edit, a config
+      // change) — and validation refuses it on every subsequent attempt anyway, so a
+      // stale journal is inert rather than dangerous. A plain run clears it at its own
+      // terminal. Deleting recoverable state on a refusal is the wrong trade.
     } else if (halt) {
+      // NOTE: no treeHash here — writeWalkState hashes the tree itself, at the halt,
+      // after the agents have edited it.
       writeWalkState(root, {
         graphKey: opts.graphKey,
         ...(stateKeys.configStamp ? { configStamp: stateKeys.configStamp } : {}),
         ...(state.branch ? { branch: state.branch } : {}),
         ...(stateKeys.head ? { head: stateKeys.head } : {}),
-        ...(stateKeys.treeHash ? { treeHash: stateKeys.treeHash } : {}),
         ...(stateKeys.policyMode ? { policyMode: stateKeys.policyMode } : {}),
         haltedAt: halt,
         runs: walk.runs,
@@ -453,7 +463,7 @@ async function run(opts: CliOptions): Promise<number> {
         "",
         `⛔ Resume aborted at journal position ${d.atIndex}: expected '${d.expected}', the walk re-derived '${d.actual}'.`,
         `   ${d.detail}`,
-        "   The saved journal has been discarded. Run again without --resume.",
+        "   Run again without --resume to start a fresh walk (the saved journal is left in place but will keep being refused).",
       ].join("\n"),
     );
     return EXIT.FAILED;

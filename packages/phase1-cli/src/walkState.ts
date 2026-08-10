@@ -108,12 +108,31 @@ export function computeTreeHash(root: string): string | undefined {
   }
 }
 
-/** Best-effort persist; a failure only means the walk can't be resumed. */
-export function writeWalkState(root: string, state: Omit<WalkState, "version" | "at">): void {
+/**
+ * Best-effort persist; a failure only means the walk can't be resumed.
+ *
+ * `treeHash` is computed HERE, not accepted from the caller, and that is the whole
+ * point: it must reflect the tree as it stands at the halt — after the agents have
+ * edited it. A caller that computed the hash earlier in the run (say, alongside the
+ * other invalidation keys before the walk started) would persist the PRE-walk tree,
+ * which breaks resume two ways: every realistic halt refuses because agent edits
+ * moved the tree, and worse, reverting those edits makes the check PASS and replay a
+ * journal describing work the files no longer contain. Keeping the computation
+ * inside this function makes that ordering mistake unrepresentable.
+ */
+export function writeWalkState(root: string, state: Omit<WalkState, "version" | "at" | "treeHash">): void {
   try {
+    const treeHash = computeTreeHash(root);
+    if (!treeHash) {
+      console.warn("could not hash the working tree — saving walk state anyway, but --resume will refuse it");
+    }
     writeFileSync(
       walkStatePath(root),
-      JSON.stringify({ version: WALK_STATE_VERSION, ...state, at: new Date().toISOString() }, null, 2) + "\n",
+      JSON.stringify(
+        { version: WALK_STATE_VERSION, ...state, ...(treeHash ? { treeHash } : {}), at: new Date().toISOString() },
+        null,
+        2,
+      ) + "\n",
       "utf8",
     );
   } catch (e) {
@@ -160,14 +179,24 @@ export function validateWalkState(state: WalkState | undefined, keys: WalkStateK
   if (state.graphKey !== keys.graphKey) {
     return { ok: false, reason: `saved walk state is for graph '${state.graphKey}', not '${keys.graphKey}'` };
   }
+  // Fail-closed on every key, including UNKNOWN on either side: "we couldn't check"
+  // is the case where replaying is most dangerous, so it must never read as "no
+  // change". Note the deployment consequence — a packaged install without
+  // config/agentcontrol can't compute a config stamp, so it can't resume.
+  if (!state.configStamp || !keys.configStamp) {
+    return { ok: false, reason: "could not verify the agent configs are unchanged — refusing to resume against unknown config state" };
+  }
   if (state.configStamp !== keys.configStamp) {
     return {
       ok: false,
       reason: "the agent configs changed since the walk was saved (config stamp differs) — the journal describes a different graph",
     };
   }
+  if (!state.head || !keys.head) {
+    return { ok: false, reason: "could not determine HEAD on both sides — refusing to resume against unknown commit state" };
+  }
   if (state.head !== keys.head) {
-    return { ok: false, reason: `HEAD moved since the walk was saved (${state.head ?? "unknown"} → ${keys.head ?? "unknown"})` };
+    return { ok: false, reason: `HEAD moved since the walk was saved (${state.head} → ${keys.head})` };
   }
   if (!state.treeHash || !keys.treeHash) {
     return { ok: false, reason: "could not verify the working tree is unchanged — refusing to resume against unknown file state" };
@@ -175,10 +204,13 @@ export function validateWalkState(state: WalkState | undefined, keys: WalkStateK
   if (state.treeHash !== keys.treeHash) {
     return { ok: false, reason: "the working tree changed since the walk was saved — the agents' recorded work no longer matches the files" };
   }
+  if (!state.policyMode || !keys.policyMode) {
+    return { ok: false, reason: "could not determine the approval policy on both sides — refusing to resume" };
+  }
   if (state.policyMode !== keys.policyMode) {
     return {
       ok: false,
-      reason: `the approval policy changed since the walk was saved ('${state.policyMode ?? "none"}' → '${keys.policyMode ?? "none"}')`,
+      reason: `the approval policy changed since the walk was saved ('${state.policyMode}' → '${keys.policyMode}')`,
     };
   }
   return { ok: true, state };

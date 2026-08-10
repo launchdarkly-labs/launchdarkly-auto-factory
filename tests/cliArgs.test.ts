@@ -154,6 +154,19 @@ describe("walk state validation (fail-closed)", () => {
   rejects({ policyMode: "yolo" }, /approval policy changed/, "the approval policy changed");
   rejects({ runs: [] }, /empty journal/, "the journal is empty");
 
+  it("refuses when ANY key is unknown on either side, not just the tree hash", () => {
+    // Fail-closed means "couldn't check" == "refuse". Previously only treeHash
+    // enforced this while the doc claimed all of them did.
+    for (const key of ["configStamp", "head", "policyMode"] as const) {
+      const missingStored = validateWalkState({ ...base, [key]: undefined }, keys);
+      assert.equal(missingStored.ok, false, `stored ${key} missing`);
+      assert.match((missingStored as { reason: string }).reason, /could not (verify|determine)/, key);
+      const missingCurrent = validateWalkState(base, { ...keys, [key]: undefined });
+      assert.equal(missingCurrent.ok, false, `current ${key} missing`);
+      assert.match((missingCurrent as { reason: string }).reason, /could not (verify|determine)/, key);
+    }
+  });
+
   it("refuses when the tree hash is UNKNOWN on either side (never assumes 'unchanged')", () => {
     // The dangerous case: git could not answer. Skipping the check here would
     // replay recorded work against file contents nobody verified.
