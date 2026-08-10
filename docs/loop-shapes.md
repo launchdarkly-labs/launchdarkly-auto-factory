@@ -217,3 +217,12 @@ requires no change to a protective halt.
   untagged loop fails the build rather than running to the node cap.
 - The **served** graph in LaunchDarkly must be updated too, not just the committed
   file.
+
+## Where these shapes stop
+
+Every shape on this page lives inside a single PR-time walk. None of them can reach the
+release: the graph hands Beacon one manifest, that manifest carries no loop or judge signal,
+and there is no edge back. A guarded rollout that regresses in production cannot ask the
+graph for a rework — that would need a new entrypoint, release evidence in agent context,
+and an authority model, not another `max_visits` edge. See **`docs/loop-seam.md`** for the
+three distinct gaps at that boundary and the order worth closing them in.

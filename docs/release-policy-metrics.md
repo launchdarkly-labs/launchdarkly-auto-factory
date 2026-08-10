@@ -223,6 +223,14 @@ common case.
   only when *some* deploy arrives, since there is no scheduler. Children stay stranded until
   then; the monitor now says so rather than promising otherwise.
 
+  **Superseded in scope by `docs/loop-seam.md`.** A late completion is one instance of a
+  general defect: Beacon evaluates each manifest exactly once, so *every* non-final outcome
+  strands — `held`, `waiting`, `error`, a paused release, a late completion. Scoping the fix
+  to monitoring alone would leave the others, and would miss the property that matters most:
+  re-reading the manifest at the current SHA is what makes a human's fix to a `held` release
+  take effect, which filename-diff discovery currently makes a no-op. Build the general
+  re-evaluation ledger, not a monitoring-specific one.
+
 - **Per-metric rollback preference from a human.** The motivating case is a dev who knows
   their feature adds latency and wants a p95 breach to pause rather than roll back. The
   API supports it per metric, so this is expressible — but the setting belongs in
