@@ -116,14 +116,25 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     store.record(n.service, n.environment, n.sha);
 
     const outcomes: FlagOutcome[] = [];
-    // Set when a flag's work could not be COMPLETED — an idempotency check that
-    // couldn't be verified, a fullstack readiness check that couldn't be finished, or
-    // a release trigger that threw mid-flight. The response then carries a RETRIABLE
-    // status so the provider redelivers, which the state store's two-deep history
-    // exists to make safe (a re-POST of the same SHA re-diffs the same range and
-    // rediscovers the flags we skipped; anything that did release comes back as
-    // `already_running`).
-    let retryNeeded = false;
+    // Set ONLY when the idempotency check could not be verified. That is the one case
+    // that answers retriably (503 → the provider redelivers), because it is the one case
+    // where we know nothing was started.
+    //
+    // Deliberately NOT set by the other two unfinished outcomes — an incomplete fullstack
+    // readiness check, and a trigger that threw. Both were briefly made retriable and then
+    // REVERTED, because "redelivery is safe by construction, a landed patch comes back as
+    // `already_running`" is false once a release reaches a terminal state:
+    // `findActiveRelease` excludes TERMINAL (`completed`/`reverted`/`monitoring_stopped`),
+    // so after LaunchDarkly REVERTS a guarded release on a metric regression, a redelivery
+    // finds no active release, the noop guard sees served(original) != target, and
+    // `triggerRelease` starts a SECOND release of the variation the guardrail just rolled
+    // back — the outcome state.ts calls out as destructive. Provider backoff routinely
+    // outlasts a short revert, so this is not a narrow race.
+    //
+    // Until the re-evaluation ledger exists (docs/loop-seam.md), an unfinished release
+    // STRANDS with a 200 and a log that asks for a re-POST. A stranded release is
+    // recoverable by a human; re-releasing a reverted flag is not.
+    let guardUnverifiable = false;
     for (const flag of discovered) {
       const scope = flag.scope ?? "frontend";
       const decision = decideScope(scope, service.side);
@@ -133,24 +144,31 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         continue;
       }
       if (decision === "check_fullstack") {
-        // TRI-STATE (see fullstack.ts): `absent` is a real verdict — the other side's
-        // own deploy notification is the retry. `unknown` has NO later event that
-        // retries it, so it must answer retriably rather than ack into "waiting":
-        // that used to misdiagnose a GitHub rate-limit blip as "the other side
-        // hasn't deployed" and strand the release until a manual re-POST.
+        // TRI-STATE (see fullstack.ts). The classifier is kept for the DIAGNOSIS, which
+        // is where the original defect actually did its damage: `absent` is a real
+        // verdict — the other side's own deploy notification is the retry — while
+        // `unknown` (status endpoint down, GitHub rate limit) is not a verdict at all.
+        // Collapsing them logged a rate-limit blip as "the other side hasn't deployed",
+        // which sends an operator to inspect the wrong service.
+        //
+        // Both ACK. `unknown` deliberately does not answer retriably — see
+        // guardUnverifiable above for why redelivery is not currently safe — so it
+        // reports `error` rather than `waiting`: `waiting` is a normal, expected,
+        // non-actionable state during bootstrap, and an unverifiable check is none of
+        // those. It needs a human, and the log says exactly which human action.
         const readiness = await otherSideHasFile(cfg, gh, service.side, flag.sourceFile);
         if (readiness.state === "unknown") {
-          retryNeeded = true;
           console.warn(
-            `[beacon] fullstack readiness check for '${flag.flagKey}' (file=${flag.sourceFile}) could not be ` +
-              `completed — NOT a verdict on whether the other side deployed. Answering retriably so the ` +
-              `provider redelivers. Cause: ${readiness.reason}`,
+            `[beacon] fullstack readiness UNVERIFIED for '${flag.flagKey}' (file=${flag.sourceFile}) — this is ` +
+              `NOT a verdict on whether the other side deployed. The release was NOT started, and nothing ` +
+              `will retry it automatically: re-POST /flag-releases for this service once both sides are ` +
+              `deployed. Cause: ${readiness.reason}`,
           );
           outcomes.push({
             flag: flag.flagKey,
             scope,
             action: "error",
-            detail: `fullstack readiness check could not be completed — release NOT started; redeliver this notification to retry: ${readiness.reason}`,
+            detail: `fullstack readiness could not be VERIFIED (not a verdict on the other side) — release not started, no automatic retry; re-POST to retry: ${readiness.reason}`,
           });
           continue;
         }
@@ -183,7 +201,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         try {
           active = await findActiveRelease(ld, flag.flagKey, n.environment);
         } catch (e) {
-          retryNeeded = true;
+          guardUnverifiable = true;
           console.warn(
             `[beacon] idempotency check failed for '${flag.flagKey}' — release NOT started (retriable): ${String(e)}`,
           );
@@ -231,21 +249,28 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           detail: result,
         });
       } catch (e) {
-        // RETRIABLE, like the guard above. This used to ack 200, which stranded the
-        // release: an LD 5xx or a dropped connection during the trigger got exactly one
-        // evaluation and no redelivery. Retrying is safe by construction — if the patch
-        // actually landed before the failure surfaced, the redelivery's idempotency
-        // check finds the running release and answers `already_running` instead of
-        // starting a second one.
-        retryNeeded = true;
+        // ACKS 200, and this STRANDS the flag. Deliberate, and the reverse of the guard
+        // above — the asymmetry is the point.
+        //
+        // A 503 here was tried and reverted. The argument for it was "retrying is safe by
+        // construction: a patch that landed comes back as `already_running`". That is only
+        // true while the release is RUNNING. The dangerous case is precisely the one a
+        // provider's backoff produces: the trigger patch landed, the response was lost, the
+        // guarded release ran, a metric regressed, LaunchDarkly REVERTED it. `reverted` is
+        // terminal, so a redelivery's idempotency check finds nothing active and starts a
+        // second release of the variation the guardrail just rolled back.
+        //
+        // Stranding is the lesser failure: a human re-POST recovers it, and the log below
+        // asks for one. Undoing a guardrail's rollback unattended does not recover.
         console.warn(
-          `[beacon] release trigger ERROR for '${flag.flagKey}' (retriable — redelivery will retry): ${String(e)}`,
+          `[beacon] release trigger ERROR for '${flag.flagKey}' — release NOT started, and nothing will retry ` +
+            `it automatically; re-POST /flag-releases for this service to retry: ${String(e)}`,
         );
         outcomes.push({
           flag: flag.flagKey,
           scope,
           action: "error",
-          detail: `release trigger failed — redeliver this notification to retry: ${String(e)}`,
+          detail: `release trigger failed — not started, no automatic retry; re-POST to retry: ${String(e)}`,
         });
       }
     }
@@ -254,10 +279,11 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     }
 
     return {
-      // 503 when any flag's work could not be completed: the work is unfinished and
-      // redelivery is how it gets retried. Answering 200 would tell the provider the
-      // notification was handled, stranding those flags until a manual re-POST.
-      status: retryNeeded ? 503 : 200,
+      // 503 ONLY when an idempotency check could not be verified — nothing was started,
+      // so redelivery is safe and is how it gets retried. Every other unfinished outcome
+      // acks 200 and strands (see guardUnverifiable above): a redelivery can re-release a
+      // flag LaunchDarkly already reverted, which is worse than a strand a human can fix.
+      status: guardUnverifiable ? 503 : 200,
       body: {
         service: n.service,
         environment: n.environment,

@@ -308,7 +308,7 @@ describe("beacon: fullstack readiness check failure", () => {
     });
   }
 
-  it("answers RETRIABLY when the readiness check cannot be completed (GitHub error)", async () => {
+  it("DIAGNOSES an incomplete readiness check distinctly, and acks rather than retrying", async () => {
     // gh.fileExists throws on any non-404 (github.ts) — a 403 rate limit is the
     // review's exact failure scenario, with both sides actually deployed.
     const h = await fullstackHarness(async () => {
@@ -316,14 +316,21 @@ describe("beacon: fullstack readiness check failure", () => {
     });
     harnesses.push(h);
     const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
-    // THE DISCRIMINATOR: 503 so the provider redelivers. Under `.catch(() => false)`
-    // this was 200 + action "waiting", misdiagnosed as "the other side hasn't yet".
-    assert.equal(res.status, 503);
+
+    // THE DISCRIMINATOR IS THE DIAGNOSIS, NOT THE STATUS. Under `.catch(() => false)`
+    // this reported action "waiting" / "other service not deployed yet" — a confident
+    // claim about a service it never reached, which sends an operator to the wrong
+    // place. The tri-state classifier is kept for exactly this.
     const outcome = res.json.outcomes[0];
-    assert.equal(outcome.action, "error");
-    assert.match(String(outcome.detail), /could not be completed/);
-    assert.match(String(outcome.detail), /redeliver/);
+    assert.equal(outcome.action, "error", "an unverifiable check is not the normal 'waiting' state");
+    assert.match(String(outcome.detail), /could not be VERIFIED/);
     assert.doesNotMatch(String(outcome.detail), /not deployed/, "must not assert the other side is behind");
+
+    // 200, NOT 503, and the strand is deliberate: a redelivery can re-release a flag
+    // LaunchDarkly already reverted (round eight, F1), which is worse than a strand a
+    // human can fix. The detail must therefore not promise an automatic retry.
+    assert.equal(res.status, 200);
+    assert.match(String(outcome.detail), /no automatic retry/);
     assert.deepEqual(h.patches, [], "no release started on an unverified readiness");
   });
 
@@ -373,34 +380,42 @@ describe("beacon: idempotency guard failure", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Round seven, finding 2: a triggerRelease throw must be RETRIABLE, not acked.
-// The comment above the guard claims redelivery "is the retry mechanism for
-// everything else here too", but a throw from the trigger (LD 5xx, a dropped
-// connection mid-patch — LdClient retries only 429s) yielded action "error"
-// with HTTP 200: the provider marked the delivery handled and the release
-// stranded. Retrying is safe by construction: if the patch landed before the
-// failure surfaced, the redelivery's idempotency check answers already_running.
+// A triggerRelease throw ACKS 200 and strands the flag — and must keep doing so.
+//
+// Round seven wanted this retriable, on the argument that retrying is safe by
+// construction (a landed patch comes back as `already_running`). Round eight
+// falsified it: that holds only while the release is RUNNING. The case a
+// provider's backoff actually produces is the patch landing, the response being
+// lost, the guarded release running, a metric regressing, and LaunchDarkly
+// REVERTING it. `reverted` is terminal, so `findActiveRelease` sees nothing, the
+// noop guard sees served(original) != target, and the redelivery starts a SECOND
+// release of the variation the guardrail just rolled back.
+//
+// So this asserts the ABSENCE of a retriable answer. It is a deliberate strand,
+// pending the re-evaluation ledger in docs/loop-seam.md.
 // ---------------------------------------------------------------------------
 describe("beacon: release trigger failure", () => {
   const harnesses: Harness[] = [];
   after(() => harnesses.forEach((h) => h.close()));
 
-  it("answers RETRIABLY when the trigger throws mid-release", async () => {
+  it("acks 200 and asks for a human re-POST when the trigger throws mid-release", async () => {
     const h = await startHarness({}, { patchThrows: true });
     harnesses.push(h);
     const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });
-    // THE DISCRIMINATOR: 503 so the provider redelivers. This was 200.
-    assert.equal(res.status, 503);
+    // 503 here would invite the redelivery that re-releases a reverted flag.
+    assert.equal(res.status, 200);
     const outcome = res.json.outcomes[0];
     assert.equal(outcome.action, "error");
-    assert.match(String(outcome.detail), /redeliver/);
-    assert.match(String(outcome.detail), /HTTP 502/);
+    assert.match(String(outcome.detail), /HTTP 502/, "the cause must survive into the outcome");
+    assert.match(String(outcome.detail), /no automatic retry/);
+    assert.match(String(outcome.detail), /re-POST/, "the recovery action must be stated");
     assert.deepEqual(h.monitored, [], "nothing handed to the monitor for a failed trigger");
   });
 
-  it("a redelivery that finds the release already running acks 200 (retry converges)", async () => {
-    // The safety-by-construction half: if the failed patch actually landed,
-    // the retried notification must settle rather than loop on 503.
+  it("a re-POST while the release is still running converges on already_running", async () => {
+    // The recovery path a human takes after the strand above. Note this converges
+    // only because the release is RUNNING — once it reaches a terminal status the
+    // guard cannot see it, which is precisely why the 503 was reverted.
     const h = await startHarness({ "enable-one": "rel-9" }, { patchThrows: true });
     harnesses.push(h);
     const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1" });

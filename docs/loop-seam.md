@@ -97,10 +97,10 @@ that moment never gets another.
 | Outcome | Why it isn't final | Recovery today |
 |---|---|---|
 | `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | manual re-POST |
-| `waiting` | the fullstack counterpart definitively hasn't deployed (the readiness check is tri-state now; an *incomplete* check no longer reads as "not deployed" — it answers **503 → redelivery**) | the other side's deploy notification re-evaluates; if lost, manual re-POST |
-| `error`, idempotency guard unverifiable | the read that would prove no release is running failed | **503 → provider redelivery** (automatic) |
-| `error`, readiness check incomplete | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | **503 → provider redelivery** (automatic) |
-| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **503 → provider redelivery** (automatic; a landed patch converges via `already_running`) |
+| `waiting` | the fullstack counterpart **definitively** hasn't deployed — the readiness check is tri-state, so this is now a real verdict rather than a shrug | the other side's deploy notification re-evaluates; if lost, manual re-POST |
+| `error`, idempotency guard unverifiable | the read that would prove no release is running failed | **503 → provider redelivery** (automatic — the one case where we know nothing was started) |
+| `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | manual re-POST — but it is now *diagnosed* as unverified instead of reported as "not deployed" |
+| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | manual re-POST |
 | paused release resumed late | monitoring stopped at the deadline | manual re-POST → `noop` → children repointed |
 | release completed after the window | same | same |
 
@@ -118,9 +118,34 @@ is a filename diff, so a file present at both SHAs is never rediscovered, and tw
 indefinitely. The gap is that this requires a human who knows to do it, and the two 200-acked
 paths above mean nobody is told that they should.
 
-Two retriable paths already exist, both deliberate: the 503 above, and a **502 on discovery
-failure** which does not record the SHA so the next notification re-diffs the same range
-(`server.ts:103-107`). The ledger generalises what those two do case-by-case.
+Two retriable paths exist, both deliberate and both narrow: the idempotency-guard **503**, and a
+**502 on discovery failure** which does not record the SHA so the next notification re-diffs the
+same range (`server.ts:103-107`). The ledger generalises what those two do case-by-case.
+
+**Why the other unfinished outcomes are NOT retriable — the decision worth knowing.** Round
+seven made the readiness check and a trigger throw answer 503 as well. Round eight falsified the
+argument for it, and both were reverted. The argument had been "retrying is safe by
+construction: a patch that landed comes back as `already_running`" — true only while the release
+is **running**. `findActiveRelease` excludes terminal statuses, and the sequence a provider's
+backoff actually produces is: the trigger patch lands, the response is lost, the guarded release
+runs, a metric regresses, **LaunchDarkly reverts it**. `reverted` is terminal, so the redelivery
+finds no active release, the noop guard sees served(original) ≠ target, and Beacon starts a
+*second* release of the variation the guardrail just rolled back — the outcome `state.ts` itself
+calls out as destructive.
+
+So the trade is deliberate: **an unfinished release strands with a 200, because a strand is
+recoverable by a human and undoing a guardrail's rollback is not.** Two things make that
+tolerable rather than merely resigned — the tri-state classifier is kept, so an unverifiable
+readiness check is now *diagnosed* as unverified rather than misreported as "the other side
+hasn't deployed", and every stranding log states the recovery action. What it costs is that
+nobody is *told* automatically, which is the ledger's job.
+
+Two further reasons redelivery is a weak foundation here, both worth checking before anyone
+revisits this: a 503'd SHA **is still recorded** (`server.ts` records before evaluating
+outcomes), so one intervening deploy makes the redelivery diff a range where the manifest exists
+at both ends — it discovers nothing and acks 200; and **Railway, the only adapter in the repo,
+is not known to redeliver on failure at all**, which would make every "retriable" answer here
+aspirational for the deployed provider. Verify that before relying on it.
 
 **This is the gap that is already causing harm**, and it is the only silent one. It is also
 the one this branch made worse, correctly: refusing free-form dates puts more manifests into
@@ -133,12 +158,18 @@ cleared on a final outcome. What it buys is not the retry mechanism — re-POST 
 but that **no human has to know to invoke it.** Both recoveries above exist and both require
 someone to notice; the ledger is what notices.
 
-Two defects found in round seven belonged here rather than to the architecture, and are now
-**fixed** independently of the ledger: the fullstack readiness check no longer fails open into
-`waiting` (it is tri-state — an *incomplete* check answers retriably instead of reading as "the
-other side hasn't deployed"), and a `triggerRelease` throw is no longer acked 200. Both route
-through the same retriable-status path the idempotency guard uses; retrying a failed trigger is
-safe by construction, since a write that did land comes back as `already_running`.
+One round-seven defect belonged here rather than to the architecture and is **fixed**: the
+fullstack readiness check no longer fails open, because it is now tri-state (`fullstack.ts`) —
+"the other side has not deployed" and "we could not find out" are distinct answers, and only the
+first is a verdict. That fix is entirely about **diagnosis**; what to *do* about an unverifiable
+answer is the retry question above, which the ledger owns.
+
+Still open, and known: a redelivery arriving after a release reached a terminal status can start
+a second release (no guard consults terminal history before triggering — `findLatestRelease`
+exists and would serve); a 503'd SHA is recorded, so an intervening deploy breaks the retry;
+`discovery.ts` classifies a transient non-JSON response as a permanently malformed manifest,
+because `SyntaxError` is thrown both by `JSON.parse` on file content and by `res.json()` on a
+proxy interstitial. That last one is a sixth instance of the anti-pattern, inside a fix.
 
 What it still would not fix: it is webhook-gated. A `notBefore` date passing causes nothing
 until *some* deploy arrives. Closing that needs a timer, which makes Beacon a scheduler —
