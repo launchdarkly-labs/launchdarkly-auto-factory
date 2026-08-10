@@ -129,7 +129,8 @@ describe("resume feedback survives an approval-gate halt", () => {
     // ROUND 3: --resume --approve implementer, with NO --feedback on the command
     // line (the pending-approval hint doesn't ask for one). run.ts falls back to
     // the saved feedback: opts.feedback ?? state.humanFeedback.
-    const round3Feedback = undefined ?? saved?.humanFeedback;
+    const optsFeedback: string | undefined = undefined; // no --feedback typed this round
+    const round3Feedback = optsFeedback ?? saved?.humanFeedback;
     const r3runner = new RecordingRunner({ reviewer: { review_approved: "true" } });
     const r3 = await walkGraph(buildGraph(), r3runner, {}, {
       gate: { steps: ["implementer"], resolve: () => true },

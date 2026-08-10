@@ -176,8 +176,9 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
         const parsed = parseVisitGrant(v);
         if ("error" in parsed) return { error: `--grant-visits ${parsed.error}` };
         // Repeating an edge is almost certainly a mistake, and the two plausible readings
-        // (overwrite vs sum) disagree — `mergeGrants` sums across resume rounds, while this
-        // used to overwrite within one. Refuse rather than pick silently.
+        // (overwrite vs sum) disagree — grants ACCUMULATE across resume rounds
+        // (`appendGrants` in walkState.ts stacks positional entries), while this used to
+        // overwrite within one command line. Refuse rather than pick silently.
         if (parsed.key in options.grantVisits) {
           return { error: `--grant-visits names ${parsed.key.replace("→", ":")} more than once` };
         }

@@ -777,9 +777,13 @@ export async function walkGraph(
   const runCountByKey = new Map<string, number>();
 
   const rootKey = graphDef.getConfig().root;
-  // Run-level termination backstop, scaled to graph size so it never preempts a
-  // legal per-edge budget (nodeCount × (hardCap+1)); the true control is the
-  // per-loop-edge cap. Guards untagged cycles and a maliciously edited served graph.
+  // Run-level termination backstop, scaled to graph size (nodeCount × (hardCap+1));
+  // the true control is the per-loop-edge cap. Guards untagged cycles and a
+  // maliciously edited served graph. NOT a guarantee of never preempting a legal
+  // walk: a graph that chains several long loop segments can in principle exceed
+  // this within its per-edge budgets. Unreachable with the committed graph even at
+  // maximum grants (~56 runs vs a cap of 66), and tripping early fails SAFE — the
+  // walk reports loopExhausted (run-cap), never a false success.
   const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
   let totalRuns = 0;
 

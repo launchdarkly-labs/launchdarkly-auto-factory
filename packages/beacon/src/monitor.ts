@@ -39,6 +39,28 @@ export function monitorSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): Mo
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Wrap a per-(flag, environment) async task so at most ONE runs at a time per key.
+ *
+ * Exists for redelivered `already_running` notifications: monitoring is re-attached
+ * on each one (deliberately — that is how a restarted Beacon picks a release back
+ * up), but every redelivery used to attach ANOTHER detached 24h poll loop for the
+ * same release — duplicate polling and duplicate (idempotent) repoints. Keyed
+ * in-process: once the running task settles, the key frees, so a genuine re-attach
+ * after a completed/abandoned watch still works.
+ */
+export function dedupeMonitors(
+  run: (flagKey: string, environmentKey: string) => Promise<unknown>,
+): (flagKey: string, environmentKey: string) => void {
+  const inFlight = new Set<string>();
+  return (flagKey, environmentKey) => {
+    const key = `${flagKey}/${environmentKey}`;
+    if (inFlight.has(key)) return;
+    inFlight.add(key);
+    void run(flagKey, environmentKey).finally(() => inFlight.delete(key));
+  };
+}
+
+/**
  * Resolve the active release's id for a flag (retrying briefly — the listing
  * is eventually consistent right after the start), then poll to completion.
  */

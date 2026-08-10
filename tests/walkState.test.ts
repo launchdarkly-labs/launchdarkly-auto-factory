@@ -190,6 +190,23 @@ describe("computeTreeHash — HEAD alone cannot detect what agents change", () =
     tmps.push(dir);
     assert.equal(computeTreeHash(dir), undefined);
   });
+
+  it("handles an UNTRACKED file with a non-ASCII name (core.quotePath default)", () => {
+    // With git's default core.quotePath=true, `ls-files` C-quotes non-ASCII names
+    // ("na\303\257ve…"); `hash-object` then failed on the literal quoted string and
+    // computeTreeHash returned undefined — permanently refusing resume in that repo.
+    // Fail-closed, but availability lost for no reason; `-z` emits unquoted paths.
+    const dir = repo();
+    execFileSync("git", ["config", "core.quotePath", "true"], { cwd: dir });
+    const before = computeTreeHash(dir);
+    const name = "naïve-ページ.ts";
+    writeFileSync(join(dir, name), "export const z = 1;\n");
+    const withFile = computeTreeHash(dir);
+    assert.ok(withFile, "must stay computable with a non-ASCII untracked filename");
+    assert.notEqual(withFile, before, "the new file counts");
+    writeFileSync(join(dir, name), "export const z = 2;\n");
+    assert.notEqual(computeTreeHash(dir), withFile, "its contents still count");
+  });
 });
 
 // ---------------------------------------------------------------------------

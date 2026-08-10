@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { monitorTriggeredRelease } from "@auto-factory/beacon";
+import { dedupeMonitors, monitorTriggeredRelease } from "@auto-factory/beacon";
 import type { LdClient } from "@auto-factory/shared";
 
 // ---------------------------------------------------------------------------
@@ -85,5 +85,37 @@ describe("monitorTriggeredRelease — release finished before it could be listed
     const final = await monitorTriggeredRelease(fakeLd("reverted", patches), "parent-flag", "production", settings);
     assert.equal(final, null);
     assert.deepEqual(patches, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round seven, finding 8: every redelivery of an `already_running` flag attached
+// ANOTHER detached 24h monitor loop for the same release — duplicate polling and
+// duplicate (idempotent) repoints. The default onReleaseStarted is now deduped
+// per flag/environment while a watch is in flight.
+// ---------------------------------------------------------------------------
+describe("dedupeMonitors", () => {
+  it("attaches at most one in-flight watch per flag/environment", async () => {
+    let started = 0;
+    let release: () => void = () => {};
+    const gateP = new Promise<void>((r) => (release = r));
+    const attach = dedupeMonitors(async () => {
+      started++;
+      await gateP;
+    });
+    attach("flag-a", "production");
+    attach("flag-a", "production"); // redelivered already_running — must not stack
+    attach("flag-a", "production");
+    assert.equal(started, 1, "one watch, however many redeliveries");
+    // A different key is independent.
+    attach("flag-b", "production");
+    assert.equal(started, 2);
+    // Once the watch ends (completed, or Beacon gave up), a re-attach is legitimate
+    // — that is how a restarted/redelivered notification picks a release back up.
+    release();
+    await gateP;
+    await new Promise((r) => setImmediate(r)); // let .finally free the key
+    attach("flag-a", "production");
+    assert.equal(started, 3, "re-attachable after the previous watch settles");
   });
 });

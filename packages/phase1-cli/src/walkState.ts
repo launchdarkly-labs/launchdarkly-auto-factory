@@ -158,14 +158,21 @@ export function computeTreeHash(root: string): string | undefined {
       execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     const head = git(["rev-parse", "HEAD"]).trim();
     const trackedDiff = git(["diff", "HEAD"]);
-    const untracked = git(["ls-files", "--others", "--exclude-standard"])
-      .split("\n")
-      .map((s) => s.trim())
+    // `-z`: NUL-separated, UNQUOTED paths. Without it, git's default
+    // core.quotePath=true C-quotes any non-ASCII filename ("na\303\257ve.ts"),
+    // hash-object then fails on the literal quoted string, and this function
+    // returned undefined — permanently refusing resume in that repo (fail-closed,
+    // but availability lost for no reason).
+    const untracked = git(["ls-files", "--others", "--exclude-standard", "-z"])
+      .split("\0")
       .filter(Boolean)
       .sort();
     let untrackedDigest = "";
     if (untracked.length > 0) {
       // Content hashes, so an untracked file's *contents* changing invalidates too.
+      // Paths ride as argv (execFileSync, no shell), which is exact for any filename;
+      // the residual risk is OS argv-length limits on a VERY long untracked list,
+      // where execFileSync throws and this fails closed to "cannot resume".
       const hashes = git(["hash-object", "--", ...untracked])
         .split("\n")
         .map((s) => s.trim())

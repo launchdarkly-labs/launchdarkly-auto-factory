@@ -22,7 +22,7 @@ import { type BeaconConfig, loadBeaconConfig } from "./config.js";
 import { discoverNewReleaseFlags } from "./discovery.js";
 import { otherSideHasFile } from "./fullstack.js";
 import { GitHubClient } from "./github.js";
-import { monitorSettingsFromEnv, monitorTriggeredRelease } from "./monitor.js";
+import { dedupeMonitors, monitorSettingsFromEnv, monitorTriggeredRelease } from "./monitor.js";
 import { repointDependentPrerequisites } from "./repoint.js";
 import { parseRailwayWebhook } from "./railway.js";
 import { decideScope } from "./scope.js";
@@ -73,11 +73,13 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
   const monitorSettings = monitorSettingsFromEnv();
   const onReleaseStarted =
     deps.onReleaseStarted ??
-    ((flagKey: string, environmentKey: string): void => {
+    // Detached on purpose: a guarded release runs for minutes-to-days; the
+    // notification response must not wait on it. Deduped per flag/environment so a
+    // redelivered `already_running` doesn't stack a second 24h poll loop onto a
+    // release that already has one watching it.
+    dedupeMonitors(async (flagKey: string, environmentKey: string): Promise<void> => {
       if (!monitorSettings.enabled) return;
-      // Detached on purpose: a guarded release runs for minutes-to-days; the
-      // notification response must not wait on it.
-      void monitorTriggeredRelease(ld, flagKey, environmentKey, monitorSettings);
+      await monitorTriggeredRelease(ld, flagKey, environmentKey, monitorSettings);
     });
 
   async function handleDeploy(n: DeployNotification): Promise<{ status: number; body: unknown }> {
