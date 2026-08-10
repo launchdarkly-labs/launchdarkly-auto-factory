@@ -22,44 +22,62 @@ change, whether it works for them, and whether it should keep rolling out.
 flowchart LR
     subgraph BUILD["Build"]
         direction TB
-        B1["Understand the change"]
-        B2["Assess scope and risk"]
-        B3["Add flag and control path"]
-        B4["Define metrics and tests"]
-        B5["Review the change"]
-        B6["Write release manifest"]
-        B1 --> B2 --> B3 --> B4 --> B5 --> B6
+        B1["AutoFactory: trigger the run"]
+        B2["LaunchDarkly: resolve Agent Configs and Tools"]
+        B3["LaunchDarkly: resolve Agent Graph"]
+        B4["LaunchDarkly: read Observability and Code References"]
+        B5["AutoFactory: compose knowledge graph"]
+        B6["AutoFactory: run agents and sandbox tools"]
+        B7["LaunchDarkly: create Feature Flags and Metrics"]
+        B8["LaunchDarkly: evaluate Judges and monitoring"]
+        B9["AutoFactory: write release manifest"]
+        B1 --> B2 --> B3 --> B4 --> B5 --> B6 --> B7 --> B8 --> B9
     end
 
     subgraph DEPLOY["Deploy"]
         direction TB
-        D1["Build artifact"]
-        D2["Deploy through existing CD"]
-        D3["Keep new behavior off"]
-        D4["Notify service and SHA"]
+        D1["Existing CI: build artifact"]
+        D2["Existing CD: deploy code"]
+        D3["LaunchDarkly: keep new behavior off"]
+        D4["AutoFactory: notify service and SHA"]
         D1 --> D2 --> D3 --> D4
     end
 
     subgraph RELEASE["Release"]
         direction TB
-        R1["Discover release manifest"]
-        R2["Resolve intent and dependencies"]
-        R3["Select release policy"]
-        R4["Roll out by audience and stage"]
-        R5["Evaluate production guardrails"]
-        R6{"Outcome"}
-        R7["Complete"]
-        R8["Hold or stop"]
-        R9["Roll back"]
-        R1 --> R2 --> R3 --> R4 --> R5 --> R6
+        R1["AutoFactory Beacon: discover manifest"]
+        R2{"AutoFactory Beacon: resolve release intent"}
+        R3["LaunchDarkly: select release policy"]
+        R4["LaunchDarkly: run guarded or progressive release"]
+        R5["LaunchDarkly: evaluate Metrics and Observability"]
+        R6{"LaunchDarkly: release outcome"}
+        R7["LaunchDarkly: complete"]
+        R8["AutoFactory Beacon: hold"]
+        R9["LaunchDarkly: stop"]
+        R10["LaunchDarkly: automatic rollback"]
+        R1 --> R2
+        R2 -->|"Release"| R3
+        R2 -->|"Hold"| R8
+        R3 --> R4 --> R5 --> R6
         R6 --> R7
-        R6 --> R8
         R6 --> R9
+        R6 --> R10
     end
 
-    B6 -->|"Code and contract"| D1
+    B9 -->|"Code and contract"| D1
     D4 -->|"Deploy succeeded"| R1
+
+    classDef ld fill:#405BFF,color:#FFFFFF,stroke:#2A3BA6,stroke-width:2px
+    classDef autofactory fill:#F8F8F8,color:#191919,stroke:#A34FDE,stroke-width:2px
+    classDef existing fill:#FFFFFF,color:#191919,stroke:#8C8C8C,stroke-width:1px
+
+    class B2,B3,B4,B7,B8,D3,R3,R4,R5,R6,R7,R9,R10 ld
+    class B1,B5,B6,B9,D4,R1,R2,R8 autofactory
+    class D1,D2 existing
 ```
+
+LaunchDarkly steps are blue. AutoFactory components have a purple border. Existing CI/CD
+steps are gray.
 
 ## The flow
 
@@ -74,30 +92,32 @@ from idea to customer value, with control where uncertainty is highest.
 
 ## LaunchDarkly Primitives
 
-The reference implementation composes LaunchDarkly primitives through a small set of
-AutoFactory components.
+| Primitive | What it contributes |
+|---|---|
+| **Agent Configs** | Runtime-defined instructions, models, parameters, variations, targeting, and monitoring |
+| **Tools** | Reusable tool descriptions and schemas attached to agent variations |
+| **Agent Graphs** | Agent topology and handoff metadata resolved at runtime |
+| **Judges** | Sampled quality scores for implementation and metrics changes |
+| **Feature Flags** | Multivariate variations, targeting, prerequisites, and operational controls |
+| **Observability and Code References** | LLM traces, service dependencies, telemetry coverage, and flag wrap points |
+| **Metrics** | Custom, trace-based, and Sentry-backed measures tied to flag exposure |
+| **Guarded and Progressive Releases** | Release policies, staged exposure, production guardrails, and automatic rollback |
 
-| LaunchDarkly primitive | What it contributes | AutoFactory component |
-|---|---|---|
-| **AgentControl** | Runtime-configured instructions, models, tools, Agent Graphs, judges, and monitoring | Config Bridge provisions the control plane; the Phase 1 graph walker runs the agents |
-| **Feature flags** | Multivariate variations, targeting, prerequisites, and operational controls | Flag Implementer wires the change; approval and provider flags configure the factory |
-| **Observability and code references** | LLM traces, service dependencies, and flag wrap points | Research builds the knowledge graph; Metrics Author closes telemetry gaps |
-| **Metrics** | Custom, trace-based, and Sentry-backed measures tied to flag exposure | Metrics Author instruments signals and records them in the release manifest |
-| **Guarded and progressive releases** | Release policies, staged exposure, production guardrails, and automatic rollback | Beacon turns a successful deploy into a controlled release |
+## What AutoFactory Adds
+
+| Component | What it adds |
+|---|---|
+| **Phase 1 front ends** | GitHub, editor, Cursor, and Claude Code entry points for starting the build workflow |
+| **Config Bridge** | Provisioning and synchronization for Agent Configs, Tools, Agent Graphs, flags, and metrics |
+| **Graph walker and runners** | Agent traversal, model-provider execution, routing, approvals, and handoffs |
+| **Sandbox tools and safety gates** | Code edits, flag and metric creation, test execution, capability limits, and evidence checks |
+| **Knowledge graph** | Per-run composition of observability traces, code references, and repository context |
+| **Release manifest** | A versioned contract carrying release plan, human intent, metrics, dependencies, and scope through deployment |
+| **Beacon** | Deploy notification handling, manifest discovery, intent enforcement, release triggering, and outcome monitoring |
 
 Claude Code and Cursor provide execution surfaces. Sentry provides external error telemetry
-and Seer Autofix. AutoFactory connects them to LaunchDarkly; they are integrations, not
-LaunchDarkly primitives.
-
-## How the reference implementation works
-
-- A configurable AI-agent graph prepares each change for release.
-- Any CD system deploys the code while new behavior remains off.
-- Beacon translates a successful deploy into guarded or progressive LaunchDarkly releases.
-- `.release-flags/` carries the versioned contract from build to release.
-
-The reference implementation supports GitHub, editor, Cursor, and CLI entry points. Build
-and release run end to end against a live demo repository.
+and Seer Autofix. They integrate with this reference implementation; LaunchDarkly provides
+the primitives above.
 
 ## Go deeper
 
