@@ -5,6 +5,8 @@ import {
   EXIT,
   WALK_STATE_VERSION,
   type WalkState,
+  appendGrants,
+  grantIsAbsorbedByCap,
   grantableEdges,
   parseArgs,
   validateGrants,
@@ -324,5 +326,40 @@ describe("resume grants are bounded to the halting edge", () => {
     const legacy = state({ kind: "loop-exhausted", node: "n" });
     assert.equal(validateGrants(legacy, { "a→b": 1 }).ok, false);
     assert.equal(grantableEdges(legacy).size, 0);
+  });
+});
+
+describe("grant absorbed by the hard cap", () => {
+  it("detects when a further grant cannot raise the ceiling", () => {
+    // declared 2 + 8 already granted = 10 = the cap, so another grant is inert. The CLI
+    // refuses it rather than replaying, doing nothing, and suggesting a grant again.
+    const prior = [{ edge: "a→b", visits: 8, effectiveAfterRuns: 3 }];
+    assert.equal(grantIsAbsorbedByCap(2, prior, "a→b", 10), true);
+    assert.equal(grantIsAbsorbedByCap(1, prior, "a→b", 10), false, "1 + 8 = 9, still room");
+  });
+
+  it("counts only grants for the edge in question", () => {
+    const prior = [{ edge: "other→edge", visits: 9, effectiveAfterRuns: 0 }];
+    assert.equal(grantIsAbsorbedByCap(1, prior, "a→b", 10), false);
+  });
+
+  it("treats no prior grants as room available", () => {
+    assert.equal(grantIsAbsorbedByCap(1, undefined, "a→b", 10), false);
+    assert.equal(grantIsAbsorbedByCap(10, undefined, "a→b", 10), true, "declared already at the cap");
+  });
+});
+
+describe("appendGrants stamps the position a grant takes effect", () => {
+  it("appends with the replayed journal length, preserving prior positions", () => {
+    const prior = [{ edge: "a→b", visits: 1, effectiveAfterRuns: 4 }];
+    assert.deepEqual(appendGrants(prior, { "a→b": 1, "c→d": 2 }, 9), [
+      { edge: "a→b", visits: 1, effectiveAfterRuns: 4 },
+      { edge: "a→b", visits: 1, effectiveAfterRuns: 9 },
+      { edge: "c→d", visits: 2, effectiveAfterRuns: 9 },
+    ]);
+  });
+
+  it("is a no-op when nothing new is granted", () => {
+    assert.deepEqual(appendGrants(undefined, {}, 5), []);
   });
 });

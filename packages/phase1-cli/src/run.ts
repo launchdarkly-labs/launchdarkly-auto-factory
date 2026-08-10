@@ -29,6 +29,7 @@ import {
   LdClient,
   LdResourceWriter,
   type ResumeInput,
+  type LoopGrant,
   type StallInfo,
   appConnection,
   assembleKnowledgeGraph,
@@ -36,7 +37,9 @@ import {
   buildWorkingTreeContext,
   buildWorkingTreeVariables,
   closeLdSdk,
+  MAX_VISITS_HARD_CAP,
   computeConfigHash,
+  declaredMaxVisits,
   createAnthropicJudgeCompletion,
   createJudgeHook,
   createPolicyGate,
@@ -64,7 +67,8 @@ import { type CliOptions, EXIT } from "./args.js";
 import {
   clearWalkState,
   computeTreeHash,
-  mergeGrants,
+  appendGrants,
+  grantIsAbsorbedByCap,
   readWalkState,
   validateGrants,
   validateWalkState,
@@ -348,8 +352,10 @@ async function run(opts: CliOptions): Promise<number> {
     base: opts.base,
   };
   let resume: ResumeInput | undefined;
-  // Grants carried in from a saved walk, so the next save records the running total.
-  let priorGrants: Record<string, number> = {};
+  // Grants carried in from a saved walk, each keeping the position it took effect at.
+  let priorGrants: LoopGrant[] = [];
+  // Length of the journal replayed this round — the point any NEW grant takes effect.
+  let replayedRuns = 0;
   if (opts.resume) {
     const check = validateWalkState(readWalkState(root), stateKeys);
     if (!check.ok) {
@@ -365,14 +371,29 @@ async function run(opts: CliOptions): Promise<number> {
       console.error(`⛔ cannot resume: ${grantCheck.reason}`);
       return EXIT.USAGE;
     }
+    // A grant the hard cap would swallow does nothing: the resume replays, performs no
+    // live work, and re-halts identically — while the halt message suggests granting
+    // again. Refuse it with the reason instead of looping the human.
+    for (const edge of Object.keys(opts.grantVisits)) {
+      const declared = declaredMaxVisits(graphDef, edge);
+      if (declared !== undefined && grantIsAbsorbedByCap(declared, check.state.grants, edge, MAX_VISITS_HARD_CAP)) {
+        console.error(
+          `⛔ cannot resume: ${edge.replace("→", ":")} has already reached the hard cap of ` +
+            `${MAX_VISITS_HARD_CAP} traversals, so a further grant would have no effect.`,
+        );
+        return EXIT.USAGE;
+      }
+    }
     const grants = Object.entries(opts.grantVisits);
-    priorGrants = check.state.grants ?? {};
+    priorGrants = check.state.grants ?? [];
+    replayedRuns = check.state.runs.length;
+    // One list: prior grants keep their positions, and this round's grant takes effect at
+    // the frontier (after the replayed runs). Replay then re-derives the original budget
+    // decisions exactly, with no assumption about the graph's shape.
+    const allGrants = appendGrants(priorGrants, opts.grantVisits, replayedRuns);
     resume = {
       journal: check.state.runs,
-      // Grants already in force for the recorded walk replay too, so a traversal it
-      // paid for isn't budget-blocked here and misreported as divergence.
-      ...(Object.keys(priorGrants).length > 0 ? { priorExtraVisits: priorGrants } : {}),
-      ...(grants.length > 0 ? { extraVisits: opts.grantVisits } : {}),
+      ...(allGrants.length > 0 ? { grants: allGrants } : {}),
       ...(opts.feedback ? { humanFeedback: opts.feedback } : {}),
     };
     console.log(
@@ -473,11 +494,11 @@ async function run(opts: CliOptions): Promise<number> {
         ...(stateKeys.head ? { head: stateKeys.head } : {}),
         ...(stateKeys.policyMode ? { policyMode: stateKeys.policyMode } : {}),
         base: opts.base,
-        // Running total, so a second grant round replays the first one's traversals
-        // instead of diverging on them.
-        ...((): { grants?: Record<string, number> } => {
-          const total = mergeGrants(priorGrants, opts.grantVisits);
-          return Object.keys(total).length > 0 ? { grants: total } : {};
+        // Positional, so a later round replays this round's granted traversals at the
+        // position they actually happened rather than from the start of the journal.
+        ...((): { grants?: LoopGrant[] } => {
+          const all = appendGrants(priorGrants, opts.grantVisits, replayedRuns);
+          return all.length > 0 ? { grants: all } : {};
         })(),
         haltedAt: halt,
         runs: walk.runs,

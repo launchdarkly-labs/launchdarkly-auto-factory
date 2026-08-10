@@ -33666,6 +33666,15 @@ function warnIfOnlyStaleWouldMatch(isLoop, source, target, kind, cond, accumulat
     return;
   console.warn(`[loop] edge ${source} \u2192 ${target} can never fire: its ${kind} names routing tag(s) ${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched against the source run's own tags, so this condition is unsatisfiable \u2014 check the SERVED graph.`);
 }
+function grantedVisits(grants, edge, runsConsumed) {
+  let total = 0;
+  for (const g of grants ?? []) {
+    if (g.edge === edge && runsConsumed >= g.effectiveAfterRuns) {
+      total += Math.max(0, Math.floor(g.visits));
+    }
+  }
+  return total;
+}
 function unionCsv(existing, incoming) {
   const split = (s) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   return [.../* @__PURE__ */ new Set([...split(existing), ...split(incoming)])].join(",");
@@ -33948,7 +33957,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let nextHandoff;
     let nextIsLoopEdge = false;
     let nextJudgeThreshold;
-    const journalConsumed = runs.length >= journal.length;
+    const runsConsumed = runs.length;
     const budgetBlocked = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
@@ -33972,9 +33981,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== void 0) {
         const ek = `${key}\u2192${edge.key}`;
-        const priorGrant = Math.max(0, Math.floor(resume?.priorExtraVisits?.[ek] ?? 0));
-        const newGrant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
-        const grant = priorGrant + newGrant;
+        const grant = grantedVisits(resume?.grants, ek, runsConsumed);
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {

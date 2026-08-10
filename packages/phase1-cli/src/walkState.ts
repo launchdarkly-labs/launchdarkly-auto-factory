@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { NodeRun } from "@auto-factory/shared";
+import type { LoopGrant, NodeRun } from "@auto-factory/shared";
 
 /**
  * Bumped when the shape changes; a mismatch invalidates instead of mis-reading.
@@ -35,8 +35,12 @@ import type { NodeRun } from "@auto-factory/shared";
  * v3 added `haltedAt.exhaustedEdges`, which bounds what a grant may target. A v3 journal
  * read by a v2 build would accept a grant that build cannot validate, so the same
  * reasoning applies.
+ *
+ * v4 replaced the flat `grants` map with a positional list (`LoopGrant[]`). A v4 journal
+ * read by a v3 build would apply every grant uniformly and diverge; a v3 journal read by
+ * a v4 build has no positions to honour. Refuse both.
  */
-export const WALK_STATE_VERSION = 3;
+export const WALK_STATE_VERSION = 4;
 
 const FILE_NAME = "autofactory-walk-state.json";
 
@@ -60,12 +64,12 @@ export interface WalkState {
   /** Base ref the recorded walk diffed against — a different base is a different diff. */
   base?: string;
   /**
-   * Cumulative loop-edge grants that were in force for THIS walk, keyed
-   * `${source}→${target}`. Journalled because the walk branches on them: a replay
-   * that didn't know about them would budget-block a traversal the original walk
-   * took and report it as divergence, capping grant-and-feedback at one round.
+   * Loop-edge grants in force for THIS walk, each stamped with the point it took effect
+   * (see `LoopGrant`). Journalled because the walk branches on them, and POSITIONAL
+   * because a flat total applied uniformly un-blocks earlier positions and diverges — see
+   * the LoopGrant docs for the shape that failed.
    */
-  grants?: Record<string, number>;
+  grants?: LoopGrant[];
   /**
    * Why the walk stopped. `exhaustedEdges` (keys `${source}→${target}`) are the loop
    * edges whose budget ENDED this walk — the only edges a resume grant may target.
@@ -271,13 +275,15 @@ export type GrantCheck = { ok: true } | { ok: false; reason: string };
 /**
  * Validate a resume's requested grants against what the saved walk actually halted on.
  *
- * This is what keeps the walker's UNIFORM application of prior grants correct. A grant
- * confined to the halting edge can only change the decision at the frontier: that edge's
- * first budget-block IS the halt, so at every earlier journal position its traversal
- * count was already below the cap and raising the cap changes nothing. Allow a grant on
- * any other edge and that stops being true — replay re-derives a loop the recorded walk
- * fell through, reports it as divergence, and (because the journal is kept and every
- * invalidation key still matches) keeps re-diverging on every later attempt.
+ * USABILITY, not correctness: grants are positional now (see `LoopGrant`), so replay
+ * reproduces the journal whatever a grant targets. This check exists because granting a
+ * loop that already fell through is *incoherent* — its downstream work is recorded in the
+ * journal, so re-running it would mean invalidating everything after, which is a partial
+ * re-run rather than a resume. Refusing says so instead of quietly doing nothing useful.
+ *
+ * An earlier revision leaned on this for correctness, via "for an edge that ended the
+ * walk, its first budget-block IS the halt". That premise is false when the halting node
+ * has a second loop edge, which is why positions now carry the guarantee.
  */
 export function validateGrants(state: WalkState, grants: Record<string, number>): GrantCheck {
   const requested = Object.keys(grants);
@@ -305,14 +311,34 @@ export function validateGrants(state: WalkState, grants: Record<string, number>)
   };
 }
 
-/** Sum two grant maps; used to carry a resume's new grant into the saved state. */
-export function mergeGrants(
-  a: Record<string, number> | undefined,
-  b: Record<string, number> | undefined,
-): Record<string, number> {
-  const out: Record<string, number> = { ...(a ?? {}) };
-  for (const [k, v] of Object.entries(b ?? {})) out[k] = (out[k] ?? 0) + v;
-  return out;
+/**
+ * Carry a resume's new grants into the saved state, stamped with the point they took
+ * effect — the length of the journal that was replayed this round.
+ */
+export function appendGrants(
+  prior: LoopGrant[] | undefined,
+  added: Record<string, number>,
+  effectiveAfterRuns: number,
+): LoopGrant[] {
+  return [
+    ...(prior ?? []),
+    ...Object.entries(added).map(([edge, visits]) => ({ edge, visits, effectiveAfterRuns })),
+  ];
+}
+
+/**
+ * Would a grant of `visits` on `edge` actually raise its ceiling, or is the hard cap
+ * already reached? A grant the cap swallows makes the resume replay, do no live work, and
+ * re-halt identically — while the CLI cheerfully suggests granting again.
+ */
+export function grantIsAbsorbedByCap(
+  declaredMaxVisits: number,
+  prior: LoopGrant[] | undefined,
+  edge: string,
+  hardCap: number,
+): boolean {
+  const already = (prior ?? []).filter((g) => g.edge === edge).reduce((n, g) => n + Math.max(0, g.visits), 0);
+  return Math.max(1, Math.floor(declaredMaxVisits)) + already >= hardCap;
 }
 
 /**

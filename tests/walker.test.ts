@@ -834,7 +834,11 @@ describe("walkGraph — resume (event-log replay)", () => {
       flag: { tags: { flag_ready: "true" } },
       review: { tags: { review_approved: "true" } },
     }), { PR_NUMBER: "1" }, {
-      resume: { journal: first.runs, extraVisits: { "review→flag": 1 }, humanFeedback: "scope the flag to the checkout path only" },
+      resume: {
+        journal: first.runs,
+        grants: [{ edge: "review→flag", visits: 1, effectiveAfterRuns: first.runs.length }],
+        humanFeedback: "scope the flag to the checkout path only",
+      },
     });
     assert.equal(resumed.loopExhausted, undefined, "the grant let it converge");
     assert.equal(resumed.replayDiverged, undefined);
@@ -922,7 +926,11 @@ describe("walkGraph — resume (event-log replay)", () => {
 
     const resumed = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
       gate: { steps: ["gated"], resolve: async () => true },
-      resume: { journal: first.runs, extraVisits: { "metrics→metrics": 1 }, humanFeedback: "try again" },
+      resume: {
+        journal: first.runs,
+        grants: [{ edge: "metrics→metrics", visits: 1, effectiveAfterRuns: first.runs.length }],
+        humanFeedback: "try again",
+      },
     });
     assert.equal(resumed.replayDiverged, undefined, "replayed steps must re-derive the ORIGINAL budget decision");
     assert.deepEqual(resumed.runs.map((r) => r.configKey), ["metrics", "metrics", "mid", "gated"]);
@@ -944,7 +952,7 @@ describe("walkGraph — resume (event-log replay)", () => {
 
     // Round 2: grant one more pass; still rejected, so exhausted again.
     const r2 = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" }, {
-      resume: { journal: r1.runs, extraVisits: { [EDGE]: 1 }, humanFeedback: "first attempt" },
+      resume: { journal: r1.runs, grants: [{ edge: EDGE, visits: 1, effectiveAfterRuns: r1.runs.length }], humanFeedback: "first attempt" },
     });
     assert.equal(r2.replayDiverged, undefined);
     assert.equal(r2.loopExhausted?.reason, "budget", "the granted pass also failed");
@@ -958,8 +966,12 @@ describe("walkGraph — resume (event-log replay)", () => {
     }), { PR_NUMBER: "1" }, {
       resume: {
         journal: r2.runs,
-        priorExtraVisits: { [EDGE]: 1 },
-        extraVisits: { [EDGE]: 1 },
+        // Round 2's grant keeps the position it took effect at; round 3's applies at the
+        // new frontier. Flattening these is what diverged.
+        grants: [
+          { edge: EDGE, visits: 1, effectiveAfterRuns: r1.runs.length },
+          { edge: EDGE, visits: 1, effectiveAfterRuns: r2.runs.length },
+        ],
         humanFeedback: "second attempt",
       },
     });
@@ -968,13 +980,58 @@ describe("walkGraph — resume (event-log replay)", () => {
     assert.equal(countOf(r3, "flag"), 4, "3 replayed + 1 live rework");
   });
 
+  it("8d. TWO loop edges on the halting node: a grant does not un-block the earlier position", async () => {
+    // The case that broke the flat-total model. `x` has two loop edges; the first spends
+    // its budget mid-journal while the second keeps the walk moving, so BOTH end up
+    // recorded as exhausted at the halt. A flat grant on the first then un-blocked its
+    // mid-journal position on replay and diverged — permanently, since the journal is kept.
+    const g = () =>
+      graphFrom({
+        root: "x",
+        edges: {
+          x: [
+            { key: "a", handoff: { max_visits: 1, require_tags: { go: "yes" } } },
+            { key: "b", handoff: { max_visits: 2, require_tags: { go: "yes" } } },
+          ],
+          a: [{ key: "x" }],
+          b: [{ key: "x" }],
+        },
+      });
+    const script = { x: { tags: { go: "yes" } } };
+    const first = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" });
+    assert.equal(first.loopExhausted?.reason, "budget");
+    const spentEdges = (first.loopExhausted?.exhausted ?? []).map((e) => `${e.source}→${e.target}`);
+    assert.ok(spentEdges.includes("x→a"), `expected x→a among ${spentEdges.join(", ")}`);
+    assert.ok(spentEdges.includes("x→b"), "both edges are recorded as exhausted at the halt");
+
+    // Grant the edge whose FIRST block was mid-journal, not at the halt.
+    const resumed = await walkGraph(g(), new ScriptedRunner(script), { PR_NUMBER: "1" }, {
+      resume: {
+        journal: first.runs,
+        grants: [{ edge: "x→a", visits: 1, effectiveAfterRuns: first.runs.length }],
+        humanFeedback: "one more",
+      },
+    });
+    assert.equal(
+      resumed.replayDiverged,
+      undefined,
+      `replay must reproduce the journal; diverged: ${JSON.stringify(resumed.replayDiverged)}`,
+    );
+    // The journal replays verbatim, and the grant fires only at the frontier.
+    assert.deepEqual(
+      resumed.runs.slice(0, first.runs.length).map((r) => `${r.configKey}#${r.iteration}`),
+      first.runs.map((r) => `${r.configKey}#${r.iteration}`),
+    );
+    assert.ok(resumed.runs.length > first.runs.length, "the grant did unlock further work");
+  });
+
   it("8. an extraVisits grant cannot exceed the hard cap", async () => {
     // A grant raises a ceiling; it can never remove one.
     const g = () => graphFrom(reworkGraphValue(2));
     const rejecting = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "false" } } };
     const first = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" });
     const resumed = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" }, {
-      resume: { journal: first.runs, extraVisits: { "review→flag": 1000 } },
+      resume: { journal: first.runs, grants: [{ edge: "review→flag", visits: 1000, effectiveAfterRuns: first.runs.length }] },
     });
     assert.equal(resumed.loopExhausted?.reason, "budget");
     assert.equal(resumed.loopExhausted?.exhausted[0]?.maxVisits, 10, "clamped to MAX_VISITS_HARD_CAP");

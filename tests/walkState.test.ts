@@ -64,6 +64,25 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
     assert.equal(read?.version, WALK_STATE_VERSION, "stamped with the current schema version");
   });
 
+  it("round-trips POSITIONAL grants, so a later resume can honour where each took effect", () => {
+    const dir = repo();
+    const grants = [
+      { edge: "review→flag", visits: 1, effectiveAfterRuns: 4 },
+      { edge: "review→flag", visits: 1, effectiveAfterRuns: 9 },
+    ];
+    writeWalkState(dir, {
+      graphKey: "g",
+      configStamp: "cfg",
+      head: "sha",
+      policyMode: "always",
+      base: "main",
+      grants,
+      haltedAt: { kind: "loop-exhausted", node: "review", exhaustedEdges: ["review→flag"] },
+      runs: sampleRuns,
+    });
+    assert.deepEqual(readWalkState(dir)?.grants, grants, "positions must survive the round trip");
+  });
+
   it("reads as absent before a write and after a clear", () => {
     const dir = repo();
     assert.equal(readWalkState(dir), undefined);

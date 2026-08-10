@@ -43,7 +43,20 @@ import type { JudgeHook } from "./judges.js";
 const JUDGE_REASONING_MAX = 1000;
 
 /** Hard ceiling on any declared `max_visits`, so config can't remove the guarantee. */
-const MAX_VISITS_HARD_CAP = 10;
+export const MAX_VISITS_HARD_CAP = 10;
+
+/**
+ * The `max_visits` declared on the edge keyed `${source}→${target}`, or undefined if the
+ * edge doesn't exist or isn't a loop edge. Lets a caller tell whether a grant could raise
+ * that edge's ceiling at all, rather than issuing one the hard cap silently swallows.
+ */
+export function declaredMaxVisits(graphDef: AgentGraphDefinition, edgeKey: string): number | undefined {
+  const [source, target] = edgeKey.split("→");
+  if (!source || !target) return undefined;
+  const node = graphDef.getNode(source);
+  const edge = node?.getEdges().find((e) => e.key === target);
+  return edge ? handoffNumber(edge.handoff, "max_visits") : undefined;
+}
 
 /**
  * Tags produced by the LLM (routing/verdict) — REWOUND when a loop edge re-enters
@@ -351,6 +364,20 @@ function warnIfOnlyStaleWouldMatch(
       `${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched ` +
       `against the source run's own tags, so this condition is unsatisfiable — check the SERVED graph.`,
   );
+}
+
+/**
+ * Extra traversals granted to `edge` for a budget decision taken after `runsConsumed` runs.
+ * Clamped non-negative and integral; the caller still applies the hard cap.
+ */
+function grantedVisits(grants: readonly LoopGrant[] | undefined, edge: string, runsConsumed: number): number {
+  let total = 0;
+  for (const g of grants ?? []) {
+    if (g.edge === edge && runsConsumed >= g.effectiveAfterRuns) {
+      total += Math.max(0, Math.floor(g.visits));
+    }
+  }
+  return total;
 }
 
 /** Merge two comma-separated key lists, deduped, order-stable, whitespace-tolerant. */
@@ -676,6 +703,25 @@ export interface WalkInputs {
  * between the journal and what the walk re-derives IS detected, and is reported as
  * `WalkResult.replayDiverged`.
  */
+/** A human-granted increase to one loop edge's budget, from a point in the journal on. */
+export interface LoopGrant {
+  /** Edge key, `${source}→${target}`. */
+  edge: string;
+  /** Extra traversals granted. */
+  visits: number;
+  /**
+   * The grant applies to budget decisions made once this many runs have been recorded.
+   *
+   * Off-by-one warning, learned the hard way: the walker pushes a node's run BEFORE
+   * selecting the next edge, so the decision that follows journal entry `j` executes with
+   * `runs.length === j + 1`. A grant issued when the journal held `L` entries therefore
+   * first applied at the selection where `runs.length === L`. The predicate is
+   * `runs.length >= effectiveAfterRuns` — expressed in entries CONSUMED, not entry index,
+   * which is also exactly the existing frontier test (`runs.length >= journal.length`).
+   */
+  effectiveAfterRuns: number;
+}
+
 export interface ResumeInput {
   /**
    * Node results from the interrupted walk, in order — `WalkResult.runs` verbatim.
@@ -684,25 +730,25 @@ export interface ResumeInput {
    */
   journal: readonly NodeRun[];
   /**
-   * Grants that were ALREADY in force for the walk that produced this journal.
-   * Applied during replay as well as at the frontier, so replayed steps re-derive
-   * the same budget decisions the original walk made.
+   * Loop-budget grants, each stamped with the point in the journal from which it took
+   * effect. ONE list covers both the grants already in force for the recorded walk and
+   * the new grant this resume adds — a new grant is simply one whose
+   * `effectiveAfterRuns` equals the journal's length.
    *
-   * Without this, a granted loop traversal recorded in the journal would be
-   * budget-blocked on the next replay and reported as divergence — which capped
-   * grant-and-feedback at exactly one round and blamed "the graph changed". It is
-   * also required by this bundle's own invariant: the walk branches on it, so it
-   * must be journalled.
+   * POSITION is the whole point. Two earlier shapes failed:
+   *
+   *  - not journalling grants at all, so a granted traversal recorded in the journal was
+   *    budget-blocked on the next replay and reported as divergence;
+   *  - journalling them as a flat per-edge total applied uniformly, justified by "for an
+   *    edge that ended the walk, its first budget-block IS the halt". That is false
+   *    whenever the halting node has a second loop edge (or a forward edge whose
+   *    conditions change across iterations): the first edge gets blocked mid-journal
+   *    while the other keeps the walk moving, both are recorded as exhausted, and a grant
+   *    on the first then un-blocks its earlier position on replay — diverging forever.
+   *
+   * With positions there is no premise about walk shape left to be wrong about.
    */
-  priorExtraVisits?: Record<string, number>;
-  /**
-   * A NEW grant from this resume, keyed `${source}→${target}`. Applied only once the
-   * journal is consumed — at the frontier and beyond — so it cannot rewrite a
-   * decision the recorded walk already made. Added on top of the declared
-   * `max_visits` plus any prior grants, and still clamped to the hard cap, so a
-   * grant can raise a ceiling but never remove it.
-   */
-  extraVisits?: Record<string, number>;
+  grants?: readonly LoopGrant[];
   /**
    * Human guidance for the first live node, rendered as its own authoritative
    * block. This is the point of resuming: extra budget with no new information
@@ -977,14 +1023,10 @@ export async function walkGraph(
     let nextIsLoopEdge = false;
     // The judge threshold the taken loop edge fired on, for the trigger message.
     let nextJudgeThreshold: number | undefined;
-    // A resume grant applies only once the journal is spent — i.e. at the frontier
-    // and beyond. NOT `!replaying`: the exhausted edge's budget check happens during
-    // the LAST journalled iteration (the run is already pushed, so runs.length has
-    // caught up), so gating on `replaying` would stop the grant from ever firing.
-    // Gating on journal-consumed instead means replayed steps re-derive the ORIGINAL
-    // budget decisions — otherwise a grant on a mid-journal edge would make replay
-    // take a loop the first walk fell through, and report that as divergence.
-    const journalConsumed = runs.length >= journal.length;
+    // Runs recorded so far. Both the frontier test and each grant's effective point are
+    // expressed against this — see LoopGrant.effectiveAfterRuns for why it is entries
+    // CONSUMED rather than an entry index.
+    const runsConsumed = runs.length;
     const budgetBlocked: LoopExhaustedInfo["exhausted"] = [];
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
@@ -1022,21 +1064,10 @@ export async function walkGraph(
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
-        // Prior grants apply everywhere (so replay re-derives the original decisions); a
-        // NEW grant applies only from the frontier on. The hard cap still clamps the
-        // total, so a grant raises a ceiling but never removes it.
-        //
-        // Applying prior grants UNIFORMLY across the journal is only sound because the
-        // caller bounds a grant to the edge whose exhaustion ended the walk (see
-        // walkState.ts `validateGrants`). For that edge the first budget-block IS the
-        // halt, so at every earlier position its traversal count was already below the
-        // cap and raising the cap changes no decision; traversal counts only increase, so
-        // there is no second case. Permit a grant on any other edge and this breaks:
-        // replay re-derives a loop the recorded walk fell through and reports it as
-        // divergence, permanently.
-        const priorGrant = Math.max(0, Math.floor(resume?.priorExtraVisits?.[ek] ?? 0));
-        const newGrant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
-        const grant = priorGrant + newGrant;
+        // Sum only the grants that were in force at THIS point of the walk. Replay then
+        // re-derives the original budget decisions exactly, with no premise about the
+        // graph's shape — which is what the previous two shapes got wrong.
+        const grant = grantedVisits(resume?.grants, ek, runsConsumed);
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {
