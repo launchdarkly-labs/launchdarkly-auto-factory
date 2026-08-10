@@ -43,6 +43,14 @@ const DEFAULT_GUARDED_STAGES: Stage[] = [
 ];
 const DEFAULT_RANDOMIZATION_UNIT = "user";
 
+/**
+ * Union of two key lists, deduped, order-stable. Merges the release policy's metric set
+ * with the manifest's additions.
+ */
+function unionKeys(a: string[] | undefined, b: string[] | undefined): string[] {
+  return [...new Set([...(a ?? []), ...(b ?? [])])];
+}
+
 interface FlagEnvConfig {
   on?: boolean;
   offVariation?: number;
@@ -246,8 +254,12 @@ export async function triggerRelease(
   }
 
   const ov = flag.releasePlan ?? flag.releaseOverrides ?? {};
-  const metricKeys = ov.metricKeys ?? policy?.metricKeys ?? [];
-  const metricGroupKeys = ov.metricGroupKeys ?? policy?.metricGroupKeys ?? [];
+  // UNION, not override. The manifest's metrics are what THIS PR added; the policy's are
+  // the org's baseline. Taking `ov ?? policy` meant one agent-authored metric silently
+  // dropped the whole standard set — five metrics became one, and the release was guarded
+  // by a single narrow signal. Policy first so the baseline reads first in reports.
+  const metricKeys = unionKeys(policy?.metricKeys, ov.metricKeys);
+  const metricGroupKeys = unionKeys(policy?.metricGroupKeys, ov.metricGroupKeys);
   const hasMetrics = metricKeys.length > 0 || metricGroupKeys.length > 0;
 
   const method: ReleaseKind =
@@ -270,8 +282,18 @@ export async function triggerRelease(
     ...metricKeys.map((key) => ({ key, isGroup: false })),
     ...metricGroupKeys.map((key) => ({ key, isGroup: true })),
   ];
+  // Inherit the policy's rollback choice rather than asserting over it. A policy set to
+  // "pause and wait for human intervention" (`rollbackOnRegression: false`) was previously
+  // overridden to auto-rollback on every metric — the same override bug as the metrics
+  // one above, and worse: that changes WHAT is watched, this changes what HAPPENS when it
+  // trips, and it failed toward the destructive action.
+  //
+  // The policy carries one value for the whole set while the API is per-metric, so this
+  // is a fan-out. With no policy there is nothing to inherit, so keep the previous
+  // default (true) rather than trading known behaviour for an unknown server-side one.
+  const autoRollback = policy?.rollbackOnRegression ?? true;
   const metricMonitoringPreferences: Record<string, { autoRollback: boolean }> = {};
-  for (const m of metrics) metricMonitoringPreferences[m.key] = { autoRollback: true };
+  for (const m of metrics) metricMonitoringPreferences[m.key] = { autoRollback };
 
   const stages =
     ov.stages ?? policy?.stages ?? (method === "guarded" ? DEFAULT_GUARDED_STAGES : DEFAULT_PROGRESSIVE_STAGES);

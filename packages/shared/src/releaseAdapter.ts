@@ -167,15 +167,30 @@ export interface ReleasePolicy {
   stages?: Stage[];
   metricKeys?: string[];
   metricGroupKeys?: string[];
+  /**
+   * The policy's rollback choice: `true` = roll back automatically on a metric
+   * regression, `false` = pause the release and wait for a human. ONE value for the
+   * whole metric set — the release API is per-metric
+   * (`metricMonitoringPreferences`), so a caller fans this out across the metrics.
+   * Undefined when the policy doesn't state it.
+   */
+  rollbackOnRegression?: boolean;
+  /** Policy identity, for reporting ("guarded by policy 'Prod policy'"). */
+  policyKey?: string;
+  policyName?: string;
 }
 
 interface RawReleaseSettings {
   releaseMethod?: string;
+  releasePolicyKey?: string;
+  releasePolicyName?: string;
   guardedReleaseConfig?: {
     rolloutContextKindKey?: string;
     metricKeys?: string[];
     metricGroupKeys?: string[];
     stages?: Stage[];
+    /** Roll back automatically vs pause and wait for a human. */
+    rollbackOnRegression?: boolean;
   };
   progressiveReleaseConfig?: {
     rolloutContextKindKey?: string;
@@ -203,6 +218,10 @@ export function normalizeReleasePolicy(raw: RawReleaseSettings): ReleasePolicy {
   const g = raw.guardedReleaseConfig;
   if (g?.metricKeys?.length) out.metricKeys = g.metricKeys;
   if (g?.metricGroupKeys?.length) out.metricGroupKeys = g.metricGroupKeys;
+  if (typeof g?.rollbackOnRegression === "boolean") out.rollbackOnRegression = g.rollbackOnRegression;
+  // Empty strings are what a non-policy environment returns; treat them as absent.
+  if (raw.releasePolicyKey) out.policyKey = raw.releasePolicyKey;
+  if (raw.releasePolicyName) out.policyName = raw.releasePolicyName;
   return out;
 }
 

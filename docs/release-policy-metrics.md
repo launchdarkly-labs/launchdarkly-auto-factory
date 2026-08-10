@@ -1,6 +1,6 @@
 # Action item — make the standard metric set visible at PR time, and preserve it at release
 
-**Status:** proposed
+**Status:** pieces 1 and 3 shipped; piece 2 (the PR-time tool) outstanding
 **Supersedes:** two gaps previously described separately — "the factory can't attach
 existing metrics" and "an orphaned metric can't be detected". Both are consequences of
 this one, and neither needs its own fix.
@@ -33,6 +33,36 @@ It reads `/internal/projects/{p}/flags/{flag}/environments/{env}/release-setting
 LaunchDarkly has already resolved environment and tag scoping down to that flag — the
 result is the **effective** set, not policy rules we would have to match ourselves. A 404
 returns `null`; the call is best-effort.
+
+**Verified against a real project** (`abram-backend`, single policy "Prod policy",
+2026-08-10). Every flag in production returns the same resolved policy — including flags
+never configured individually, which is the premise piece 2 depends on:
+
+```json
+{
+  "releaseMethod": "guarded-release",
+  "releasePolicyKey": "test",
+  "releasePolicyName": "Prod policy",
+  "guardedReleaseConfig": {
+    "metricKeys": ["ld_autogen__otel-default-http-5xx-rate",
+                   "ld_autogen__otel-request-average-latency", "login"],
+    "rollbackOnRegression": false,
+    "rolloutContextKindKey": "user"
+  }
+}
+```
+
+Three fields in there that `normalizeReleasePolicy` currently **discards**:
+`rollbackOnRegression` (the rollback-vs-pause choice — see piece 3),
+`releasePolicyKey`, and `releasePolicyName` (which piece 2's reporting wants: *"guarded by
+policy 'Prod policy'"* beats a bare key list). `metricGroupKeys` and `stages` are absent
+here, so Beacon still falls back to `DEFAULT_GUARDED_STAGES`.
+
+**Environment scoping is real.** The same flag in `dev` and `test` returns
+`{"releaseMethod":"","releasePolicyKey":"","releasePolicyName":""}` — no
+`guardedReleaseConfig` at all. `normalizeMethod("")` returns `undefined`, so a non-policy
+environment yields an effectively empty policy rather than an error. That happens to be
+correct behaviour; it should be deliberate rather than incidental.
 
 **Its only consumer is Beacon, at release time** (`trigger.ts:242`). No agent can reach
 it: `caps.createMetric` grants exactly `CREATE_METRIC_TOOL` and `LIST_METRICS_TOOL`
@@ -79,7 +109,7 @@ metrics.
 Each fixes a different problem and can ship on its own. Pieces 1 and 3 are Beacon-side
 and small; piece 2 is the larger one. Nothing here depends on piece 2.
 
-### 1. Merge at release time (Beacon)
+### 1. Merge at release time (Beacon) — SHIPPED
 
 Change the two `??` chains to a union, deduped, keeping singles and groups distinct —
 `startRelease` receives them as `{key, isGroup}` pairs (`trigger.ts:269-272`), so the two
@@ -113,7 +143,7 @@ chain the implementer runs before the metrics author, so that ordering already h
 the research planner runs *before* the flag exists, so its read must tolerate `null` (no
 flag yet ⇒ no per-flag policy) and reason without it.
 
-### 3. Stop overriding the policy's rollback-vs-pause choice (Beacon)
+### 3. Stop overriding the policy's rollback-vs-pause choice (Beacon) — SHIPPED
 
 A release policy carries **one** rollback setting — auto-rollback, or pause and wait for
 human intervention. The same choice exists **per metric** when metrics are added
@@ -136,15 +166,16 @@ individually. Same bug class as the metrics `??` override, and worse in conseque
 one changes *what* is watched, this changes *what happens when it trips*, and it fails
 toward the more destructive action.
 
-**Decision: inherit the policy's setting.** Two implementation paths, depending on one
-unverified fact (see below):
+**Decision: inherit the policy's setting, read explicitly.** The live probe settled this —
+the policy response carries `rollbackOnRegression`, so there is no need to rely on
+"omitting inherits". Extract it in `normalizeReleasePolicy` and map it through.
 
-- If **omitting** `metricMonitoringPreferences` makes LaunchDarkly apply the policy's
-  setting, omit it whenever a policy exists. One line.
-- If omission instead hits a server-side default, read the setting from the policy and
-  pass it explicitly — which means `normalizeReleasePolicy` must stop discarding it
-  (today it extracts only `metricKeys`, `metricGroupKeys`, `stages`, and
-  `rolloutContextKindKey` from `guardedReleaseConfig`).
+**Shape mismatch to design around:** the policy's setting is singular and policy-level
+(`rollbackOnRegression`), while the release instruction is per-metric
+(`metricMonitoringPreferences: { [key]: { autoRollback } }`). So the mapping is a fan-out:
+the policy's one value applies to every metric in the release. That is also what makes the
+deferred per-metric human intent a clean extension rather than a conflict — it would
+override individual entries in a map the policy fills uniformly.
 
 **When there is no policy, keep sending `autoRollback: true`.** There is nothing to
 inherit, and omitting would trade today's known behaviour for an unknown default. Scope
@@ -162,6 +193,22 @@ the change to exactly the case where we are currently overriding something.
   created metric stays visible, and drop the INCOMPLETE.
 - **Reporting** should read the union (policy + created), not just `metric_keys`.
 
+## Ask for LaunchDarkly engineering
+
+**Per-metric rollback in the release policy.** The policy carries a single
+`rollbackOnRegression` for the whole metric set, while a guarded release configured by
+hand in the UI has the checkbox **per metric** — and the API accepts per-metric
+preferences. So the policy is the narrower surface, and the factory has to fan one value
+out across every metric.
+
+The case for changing it is the same one that motivates the deferred human-intent field: a
+team wants auto-rollback on a 5xx-rate regression but pause-and-wait on latency, because a
+feature may knowingly cost latency. Today that can only be expressed per release, by hand
+— which is exactly what an automated factory can't do. If the policy grows per-metric
+settings, the factory inherits the right behaviour for each metric with no extra authoring
+surface of its own, and the deferred `releaseIntent` field becomes unnecessary for the
+common case.
+
 ## Deferred
 
 - **Per-metric rollback preference from a human.** The motivating case is a dev who knows
@@ -177,14 +224,10 @@ the change to exactly the case where we are currently overriding something.
 
 ## Open questions
 
-1. **Does omitting `metricMonitoringPreferences` inherit the policy's setting?** The one
-   fact blocking piece 3. Needs the internal API reference or a single live test against a
-   project whose policy is set to pause-and-wait. Verify before changing the code — guessing
-   here changes rollback behaviour on real releases.
-2. **Which environment for the agent-side read** — reuse `LD_ENVIRONMENT_KEY` for symmetry
+1. **Which environment for the agent-side read** — reuse `LD_ENVIRONMENT_KEY` for symmetry
    with Beacon, or a separate variable? Reusing it couples authoring-time reads to Beacon's
    release target, which is probably right but should be stated.
-3. **Beta API exposure.** Release settings sit on the same `/internal` beta surface as the
+2. **Beta API exposure.** Release settings sit on the same `/internal` beta surface as the
    automated-release read endpoints, which `releaseAdapter.ts:4-11` documents as mid-rename
    and expected to change. A tool wrapping `getReleasePolicy` inherits that containment
    (only `releaseAdapter.ts` changes when the public API lands) — but this is the in-flux

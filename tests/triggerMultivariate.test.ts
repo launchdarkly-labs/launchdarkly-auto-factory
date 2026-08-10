@@ -10,7 +10,10 @@ interface Patch {
 }
 
 /** Multivariate LdClient stub: AutoFactory lineage flags with per-env targeting. */
-function fakeLd(flags: Record<string, Record<string, unknown>>, opts: { dependents?: string[] } = {}) {
+function fakeLd(
+  flags: Record<string, Record<string, unknown>>,
+  opts: { dependents?: string[]; policy?: Record<string, unknown> } = {},
+) {
   const patches: Patch[] = [];
   const ld = {
     projectKey: "app-proj",
@@ -25,7 +28,9 @@ function fakeLd(flags: Record<string, Record<string, unknown>>, opts: { dependen
       return { status: 200, data: {} };
     },
     request: async () => {
-      throw new Error("policy read not stubbed"); // getReleasePolicy is best-effort
+      // getReleasePolicy is best-effort; unstubbed reads throw and fall back to defaults.
+      if (!opts.policy) throw new Error("policy read not stubbed");
+      return { status: 200, data: opts.policy };
     },
   } as unknown as LdClient;
   return { ld, patches };
@@ -157,5 +162,89 @@ describe("repointDependentPrerequisites", () => {
   it("never throws — a failed parent read logs and returns []", async () => {
     const { ld } = fakeLd({});
     assert.deepEqual(await repointDependentPrerequisites(ld, "gone", "production"), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Release policy inheritance. Shapes here mirror what abram-backend's "Prod policy"
+// actually returns (verified 2026-08-10), not an invented fixture.
+// ---------------------------------------------------------------------------
+describe("triggerRelease — release policy is inherited, not overridden", () => {
+  const POLICY_METRICS = ["ld_autogen__otel-default-http-5xx-rate", "ld_autogen__otel-request-average-latency"];
+  const prodPolicy = (extra: Record<string, unknown> = {}) => ({
+    releaseMethod: "guarded-release",
+    releasePolicyKey: "test",
+    releasePolicyName: "Prod policy",
+    guardedReleaseConfig: { rolloutContextKindKey: "user", metricKeys: POLICY_METRICS, ...extra },
+  });
+
+  /** The startAutomatedRelease instruction from the recorded patches. */
+  const releaseInstr = (patches: Patch[]) => {
+    for (const p of patches) {
+      const i = p.instructions.find((x) => x.kind === "startAutomatedRelease");
+      if (i) return i as Record<string, unknown>;
+    }
+    throw new Error(`no startAutomatedRelease instruction in ${JSON.stringify(patches)}`);
+  };
+
+  it("UNIONS the policy's metrics with the manifest's instead of replacing them", async () => {
+    // The bug this fixes: `ov.metricKeys ?? policy.metricKeys` meant one agent-authored
+    // metric dropped the org's entire baseline — guarding the release by a single narrow
+    // signal instead of five.
+    const { ld, patches } = fakeLd(
+      { "enable-x": mvFlag(["control", "v1"], { on: false }) },
+      { policy: prodPolicy() },
+    );
+    await triggerRelease(ld, discovered({ releasePlan: { metricKeys: ["checkout-conversion"] } }), "production");
+    const instr = releaseInstr(patches);
+    assert.deepEqual(
+      (instr.metrics as Array<{ key: string }>).map((m) => m.key),
+      [...POLICY_METRICS, "checkout-conversion"],
+      "policy baseline first, then this PR's addition",
+    );
+  });
+
+  it("does not duplicate a metric the manifest and the policy both name", async () => {
+    const { ld, patches } = fakeLd(
+      { "enable-x": mvFlag(["control", "v1"], { on: false }) },
+      { policy: prodPolicy() },
+    );
+    await triggerRelease(ld, discovered({ releasePlan: { metricKeys: [POLICY_METRICS[0]!, "extra"] } }), "production");
+    const keys = (releaseInstr(patches).metrics as Array<{ key: string }>).map((m) => m.key);
+    assert.deepEqual(keys, [...POLICY_METRICS, "extra"]);
+  });
+
+  it("INHERITS rollbackOnRegression:false as autoRollback:false on every metric", async () => {
+    // A policy set to "pause and wait for human intervention" was previously overridden
+    // to auto-rollback on every metric — failing toward the destructive action.
+    const { ld, patches } = fakeLd(
+      { "enable-x": mvFlag(["control", "v1"], { on: false }) },
+      { policy: prodPolicy({ rollbackOnRegression: false }) },
+    );
+    await triggerRelease(ld, discovered(), "production");
+    const prefs = releaseInstr(patches).metricMonitoringPreferences as Record<string, { autoRollback: boolean }>;
+    assert.deepEqual(Object.keys(prefs).sort(), [...POLICY_METRICS].sort());
+    for (const [key, v] of Object.entries(prefs)) {
+      assert.equal(v.autoRollback, false, `${key} must inherit pause-and-wait`);
+    }
+  });
+
+  it("inherits rollbackOnRegression:true as autoRollback:true", async () => {
+    const { ld, patches } = fakeLd(
+      { "enable-x": mvFlag(["control", "v1"], { on: false }) },
+      { policy: prodPolicy({ rollbackOnRegression: true }) },
+    );
+    await triggerRelease(ld, discovered(), "production");
+    const prefs = releaseInstr(patches).metricMonitoringPreferences as Record<string, { autoRollback: boolean }>;
+    for (const v of Object.values(prefs)) assert.equal(v.autoRollback, true);
+  });
+
+  it("keeps auto-rollback when there is NO policy to inherit from", async () => {
+    // Nothing to inherit, so preserve the previous behaviour rather than trading it for an
+    // unknown server-side default.
+    const { ld, patches } = fakeLd({ "enable-x": mvFlag(["control", "v1"], { on: false }) }); // policy read throws
+    await triggerRelease(ld, discovered({ releasePlan: { metricKeys: ["only-mine"] } }), "production");
+    const prefs = releaseInstr(patches).metricMonitoringPreferences as Record<string, { autoRollback: boolean }>;
+    assert.deepEqual(prefs, { "only-mine": { autoRollback: true } });
   });
 });

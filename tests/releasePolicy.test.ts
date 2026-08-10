@@ -34,4 +34,45 @@ describe("normalizeReleasePolicy", () => {
   it("returns an empty policy when nothing is configured", () => {
     assert.deepEqual(normalizeReleasePolicy({}), {});
   });
+
+  it("extracts rollbackOnRegression and the policy identity (verified against a real project)", () => {
+    // The shape abram-backend's "Prod policy" actually returns. All three of these were
+    // previously discarded — rollbackOnRegression is the rollback-vs-pause choice, and the
+    // key/name are what PR-time reporting needs.
+    const p = normalizeReleasePolicy({
+      releaseMethod: "guarded-release",
+      releasePolicyKey: "test",
+      releasePolicyName: "Prod policy",
+      guardedReleaseConfig: {
+        rolloutContextKindKey: "user",
+        metricKeys: [
+          "ld_autogen__otel-default-http-5xx-rate",
+          "ld_autogen__otel-request-average-latency",
+          "login",
+        ],
+        rollbackOnRegression: false,
+      },
+    });
+    assert.equal(p.releaseMethod, "guarded");
+    assert.equal(p.rollbackOnRegression, false, "pause and wait, not auto-rollback");
+    assert.equal(p.policyKey, "test");
+    assert.equal(p.policyName, "Prod policy");
+    assert.equal(p.metricKeys?.length, 3);
+    assert.equal(p.stages, undefined, "this policy carries no stages — Beacon falls back");
+  });
+
+  it("distinguishes rollbackOnRegression:true from an absent value", () => {
+    // Absent means "nothing to inherit", which callers treat as the previous default
+    // rather than as false.
+    assert.equal(
+      normalizeReleasePolicy({ guardedReleaseConfig: { rollbackOnRegression: true } }).rollbackOnRegression,
+      true,
+    );
+    assert.equal(normalizeReleasePolicy({ guardedReleaseConfig: {} }).rollbackOnRegression, undefined);
+  });
+
+  it("a non-policy environment normalizes to an empty policy, not a broken one", () => {
+    // dev/test in a project whose policy is production-only return empty strings.
+    assert.deepEqual(normalizeReleasePolicy({ releaseMethod: "", releasePolicyKey: "", releasePolicyName: "" }), {});
+  });
 });
