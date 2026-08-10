@@ -33489,31 +33489,36 @@ function normalizePrerequisites(v, issues) {
   }
   return { value: out, coerced };
 }
-var ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-var HAS_ZONE_RE = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+var ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?=$|[T\s])/;
+var LOOKS_ISO_RE = /^\d{4}-\d{2}-\d{2}/;
+var ISO_YEAR_MONTH_RE = /^\d{4}-\d{2}$/;
+function isRealCalendarDay(ymd) {
+  const d = /* @__PURE__ */ new Date(`${ymd}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === ymd;
+}
 function normalizeNotBefore(v, issues) {
   if (v === void 0 || v === null || v === "")
     return { value: "", coerced: false };
   const raw = String(v).trim();
-  if (ISO_DATE_RE.test(raw)) {
-    const utc = /* @__PURE__ */ new Date(`${raw}T00:00:00Z`);
-    if (!Number.isNaN(utc.getTime()) && utc.toISOString().slice(0, 10) === raw) {
-      return { value: raw, coerced: false };
+  const prefix = ISO_DATE_PREFIX_RE.exec(raw)?.[1];
+  if (prefix) {
+    if (isRealCalendarDay(prefix) && !Number.isNaN(new Date(raw).getTime())) {
+      return { value: prefix, coerced: prefix !== raw };
+    }
+  } else if (LOOKS_ISO_RE.test(raw)) {
+  } else if (ISO_YEAR_MONTH_RE.test(raw)) {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) {
+      return { value: parsed.toISOString().slice(0, 10), coerced: true };
     }
   } else {
     const parsed = new Date(raw);
     if (!Number.isNaN(parsed.getTime())) {
-      const iso = HAS_ZONE_RE.test(raw) ? (
-        // (2) An instant: the string named its own frame, so read it back in UTC.
-        parsed.toISOString().slice(0, 10)
-      ) : (
-        // (3) Parsed as local, so format from local fields.
-        [
-          parsed.getFullYear(),
-          String(parsed.getMonth() + 1).padStart(2, "0"),
-          String(parsed.getDate()).padStart(2, "0")
-        ].join("-")
-      );
+      const iso = [
+        parsed.getFullYear(),
+        String(parsed.getMonth() + 1).padStart(2, "0"),
+        String(parsed.getDate()).padStart(2, "0")
+      ].join("-");
       return { value: iso, coerced: iso !== raw };
     }
   }

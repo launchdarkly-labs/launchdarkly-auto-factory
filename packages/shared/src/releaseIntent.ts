@@ -85,53 +85,74 @@ function normalizePrerequisites(v: unknown, issues: string[]): { value: IntentPr
   return { value: out, coerced };
 }
 
-/** A bare calendar date — no time, no zone. */
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-/** An explicit zone designator: trailing `Z`, or a `±HH:MM` / `±HHMM` offset. */
-const HAS_ZONE_RE = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+/**
+ * A calendar date at the START of the string, cleanly terminated (end of string, or
+ * followed by `T`/whitespace before a time). This prefix IS the answer — see below.
+ */
+const ISO_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})(?=$|[T\s])/;
+/** Starts ISO-shaped but may not terminate cleanly (`2026-08-011`). */
+const LOOKS_ISO_RE = /^\d{4}-\d{2}-\d{2}/;
+/** A year-month with no day. V8 parses this in UTC. */
+const ISO_YEAR_MONTH_RE = /^\d{4}-\d{2}$/;
+
+/** Is `ymd` a real calendar day? `2026-02-30` is not, and V8 rolls it to March 2. */
+function isRealCalendarDay(ymd: string): boolean {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === ymd;
+}
 
 /**
  * Parse a notBefore value into ISO YYYY-MM-DD, or report it as an issue.
  *
- * Timezone-safe deliberately, because `Date` parses the shapes we accept in
- * DIFFERENT reference frames, and formatting one frame's parse through another
- * shifts the calendar date by a day. THREE classes, each formatted in the frame it
- * was parsed in:
+ * `notBefore` is a CALENDAR DATE, and the calendar date is whatever the human
+ * wrote. So when the string carries an ISO date prefix, that prefix is the answer
+ * and no reference-frame arithmetic happens at all:
  *
- *  1. A bare `YYYY-MM-DD` — a calendar date. Validated and passed through
- *     untouched, never round-tripped through a `Date` at all.
- *  2. A string carrying an explicit zone (`2026-08-01T00:00:00Z`, `…+02:00`) — an
- *     absolute INSTANT. Formatted in UTC, because that is the frame it names.
- *  3. Anything else (`Aug 1 2026`, `2026-08-01T00:00:00`) — parsed as LOCAL by
- *     spec, so formatted from local fields.
+ *   2026-08-01                  → 2026-08-01
+ *   2026-08-01T00:00:00Z        → 2026-08-01
+ *   2026-08-01T00:00:00+02:00   → 2026-08-01   (the author meant Aug 1, in +02:00)
+ *   2026-08-01 00:00 UTC        → 2026-08-01
+ *   2026-08-01T12:00:00         → 2026-08-01
  *
- * Both directions have bitten this function: formatting (3) via `toISOString()`
- * turned "Aug 1 2026" into 2026-07-31 east of UTC, and then formatting (2) via
- * local getters turned "2026-08-01T00:00:00Z" into 2026-07-31 west of it. A
- * `notBefore` a day early weakens Beacon's release hold, so both are real.
+ * Two earlier attempts got this wrong by picking a frame to format in, which is
+ * where the bugs lived: formatting via `toISOString()` shifted "Aug 1 2026" to
+ * 07-31 east of UTC; formatting via local getters then shifted
+ * "2026-08-01T00:00:00Z" to 07-31 west of it; and choosing UTC for any
+ * zone-suffixed string was wrong for every non-`Z` offset (`+02:00` midnight is
+ * 07-31 in UTC) while a word zone (`… UTC`, `… GMT`) wasn't detected as a zone at
+ * all, leaving it zone-dependent. Reading the prefix sidesteps all of it.
+ *
+ * Only genuinely non-ISO shapes (`Aug 1 2026`, `2026-8-1`) still need a `Date`;
+ * those parse as LOCAL per spec, so they are formatted from local fields.
  */
 function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coerced: boolean } {
   if (v === undefined || v === null || v === "") return { value: "", coerced: false };
   const raw = String(v).trim();
-  if (ISO_DATE_RE.test(raw)) {
-    // The regex admits impossible dates (2026-02-30), so confirm it round-trips as
-    // a real calendar day. Compared in UTC, matching how the string parses.
-    const utc = new Date(`${raw}T00:00:00Z`);
-    if (!Number.isNaN(utc.getTime()) && utc.toISOString().slice(0, 10) === raw) {
-      return { value: raw, coerced: false };
+  const prefix = ISO_DATE_PREFIX_RE.exec(raw)?.[1];
+  if (prefix) {
+    // The prefix must be a real day (V8 rolls 2026-02-30 to March 2 rather than
+    // rejecting it) AND the whole string must parse, so trailing junk is refused.
+    if (isRealCalendarDay(prefix) && !Number.isNaN(new Date(raw).getTime())) {
+      return { value: prefix, coerced: prefix !== raw };
+    }
+  } else if (LOOKS_ISO_RE.test(raw)) {
+    // ISO-shaped but not cleanly terminated (`2026-08-011`). V8 parses it anyway,
+    // into a zone-dependent instant — so refuse rather than guess.
+  } else if (ISO_YEAR_MONTH_RE.test(raw)) {
+    // No day component. Parsed in UTC by spec, so read it back in UTC: deterministic
+    // across zones, and normalises to the first of the month.
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) {
+      return { value: parsed.toISOString().slice(0, 10), coerced: true };
     }
   } else {
     const parsed = new Date(raw);
     if (!Number.isNaN(parsed.getTime())) {
-      const iso = HAS_ZONE_RE.test(raw)
-        ? // (2) An instant: the string named its own frame, so read it back in UTC.
-          parsed.toISOString().slice(0, 10)
-        : // (3) Parsed as local, so format from local fields.
-          [
-            parsed.getFullYear(),
-            String(parsed.getMonth() + 1).padStart(2, "0"),
-            String(parsed.getDate()).padStart(2, "0"),
-          ].join("-");
+      const iso = [
+        parsed.getFullYear(),
+        String(parsed.getMonth() + 1).padStart(2, "0"),
+        String(parsed.getDate()).padStart(2, "0"),
+      ].join("-");
       return { value: iso, coerced: iso !== raw };
     }
   }

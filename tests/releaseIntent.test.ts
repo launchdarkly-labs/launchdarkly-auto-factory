@@ -91,18 +91,24 @@ describe("normalizeReleaseIntent (deterministic, fail-closed)", () => {
 // ---------------------------------------------------------------------------
 describe("normalizeNotBefore is timezone-independent", () => {
   const MODULE = fileURLToPath(new URL("../packages/shared/dist/releaseIntent.js", import.meta.url));
-  // Every shape the normalizer accepts, not just the two the first version covered.
-  // A zone-suffixed timestamp is an INSTANT and a bare/zoneless one is a LOCAL
-  // calendar date; formatting either in the other's frame shifts the day.
+  // Every shape the normalizer accepts. A `notBefore` is a CALENDAR DATE, so the
+  // answer is whatever the author wrote — including for offsets and word zones,
+  // which two earlier attempts got wrong in opposite directions.
   const CASES = [
     "2026-08-01",
     "Aug 1 2026",
+    "2026-8-1",
     "2026-01-01",
     "Dec 31 2026",
     "2026-08-01T00:00:00Z",
     "2026-08-01T00:00:00.000Z",
-    "2026-08-01T22:00:00+02:00",
+    "2026-08-01T00:00:00+02:00",
+    "2026-08-01T09:00:00+10:00",
+    "2026-07-31T23:00:00-10:00",
+    "2026-08-01 00:00 UTC",
+    "2026-08-01 00:00:00 GMT",
     "2026-08-01T12:00:00",
+    "2026-08",
   ];
   // Sign, magnitude, a half-hour offset, and both extremes of the UTC range.
   const ZONES = [
@@ -134,17 +140,48 @@ describe("normalizeNotBefore is timezone-independent", () => {
     const expected = {
       "2026-08-01": "2026-08-01",
       "Aug 1 2026": "2026-08-01",
+      "2026-8-1": "2026-08-01",
       "2026-01-01": "2026-01-01",
       "Dec 31 2026": "2026-12-31",
-      // Instants: UTC is the frame the string named. 22:00+02:00 IS 20:00Z on the 1st.
       "2026-08-01T00:00:00Z": "2026-08-01",
       "2026-08-01T00:00:00.000Z": "2026-08-01",
-      "2026-08-01T22:00:00+02:00": "2026-08-01",
-      // No zone → local midday, which lands on the 1st in every real zone.
+      // Offsets: the author wrote Aug 1. Formatting these in UTC gave 07-31 — the
+      // regression that made this the third attempt.
+      "2026-08-01T00:00:00+02:00": "2026-08-01",
+      "2026-08-01T09:00:00+10:00": "2026-08-01",
+      // …and the date is the one WRITTEN, not the UTC instant: this is Aug 1 09:00Z.
+      "2026-07-31T23:00:00-10:00": "2026-07-31",
+      // Word zones were never detected as zones at all, leaving them zone-dependent.
+      "2026-08-01 00:00 UTC": "2026-08-01",
+      "2026-08-01 00:00:00 GMT": "2026-08-01",
       "2026-08-01T12:00:00": "2026-08-01",
+      // No day component: normalised to the first, deterministically.
+      "2026-08": "2026-08-01",
     };
     for (const tz of ZONES) {
       assert.deepEqual(notBeforeIn(tz), expected, `notBefore drifted under TZ=${tz}`);
+    }
+  });
+
+  it("malformed and impossible dates fail CLOSED, in every zone", () => {
+    // 2026-02-30 with a time suffix is the nastier one: V8 does not reject it, it
+    // rolls it to March 2 — so a run would have released two days early.
+    for (const bad of ["2026-02-30", "2026-02-30T00:00:00Z", "2026-08-011", "not a date"]) {
+      for (const tz of ["UTC", "America/Los_Angeles", "Pacific/Kiritimati"]) {
+        const script = `
+          const { normalizeReleaseIntent } = await import(${JSON.stringify(MODULE)});
+          const r = normalizeReleaseIntent({ action: "auto", notBefore: ${JSON.stringify(bad)} });
+          process.stdout.write(JSON.stringify({ action: r.intent.action, issues: r.issues.length }));
+        `;
+        const out = JSON.parse(
+          execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+            encoding: "utf8",
+            env: { ...process.env, TZ: tz },
+          }),
+        ) as { action: string; issues: number };
+        assert.equal(out.action, "hold", `${bad} @ ${tz}`);
+        assert.ok(out.issues > 0, `${bad} @ ${tz}`);
+      }
     }
   });
 
