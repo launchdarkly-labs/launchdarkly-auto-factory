@@ -19,42 +19,45 @@ change, whether it works for them, and whether it should keep rolling out.
 
 ```mermaid
 flowchart LR
-    subgraph BUILD["BUILD: make it ready"]
+    subgraph BUILD["Build"]
         direction TB
-        B1["Understand<br/>change • scope • risk"]
-        B2["Prepare<br/>flag • control path"]
-        B3["Prove<br/>metrics • tests • review"]
-        B4[["Release manifest<br/>intent • guardrails"]]
-        B1 --> B2 --> B3 --> B4
+        B1["Understand the change"]
+        B2["Assess scope and risk"]
+        B3["Add flag and control path"]
+        B4["Define metrics and tests"]
+        B5["Review the change"]
+        B6["Write release manifest"]
+        B1 --> B2 --> B3 --> B4 --> B5 --> B6
     end
 
-    subgraph DEPLOY["DEPLOY: make it available"]
+    subgraph DEPLOY["Deploy"]
         direction TB
         D1["Build artifact"]
-        D2["Existing CD deploys"]
-        D3["New behavior stays off"]
-        D4[["Notify<br/>service • SHA"]]
+        D2["Deploy through existing CD"]
+        D3["Keep new behavior off"]
+        D4["Notify service and SHA"]
         D1 --> D2 --> D3 --> D4
     end
 
-    subgraph RELEASE["RELEASE: make it real"]
+    subgraph RELEASE["Release"]
         direction TB
-        R1["Discover manifest"]
-        R2["Resolve<br/>intent • policy • dependencies"]
-        R3["Roll out<br/>audience • stages"]
-        R4["Measure<br/>production guardrails"]
-        R5{"Outcome"}
-        R6["Complete"]
-        R7["Hold / stop"]
-        R8["Roll back"]
-        R1 --> R2 --> R3 --> R4 --> R5
-        R5 --> R6
-        R5 --> R7
-        R5 --> R8
+        R1["Discover release manifest"]
+        R2["Resolve intent and dependencies"]
+        R3["Select release policy"]
+        R4["Roll out by audience and stage"]
+        R5["Evaluate production guardrails"]
+        R6{"Outcome"}
+        R7["Complete"]
+        R8["Hold or stop"]
+        R9["Roll back"]
+        R1 --> R2 --> R3 --> R4 --> R5 --> R6
+        R6 --> R7
+        R6 --> R8
+        R6 --> R9
     end
 
-    B4 -->|"code + contract"| D1
-    D4 -->|"deploy succeeded"| R1
+    B6 -->|"Code and contract"| D1
+    D4 -->|"Deploy succeeded"| R1
 ```
 
 ## The opinion
