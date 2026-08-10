@@ -10,6 +10,7 @@ export {
   type WalkStateKeys,
   clearWalkState,
   computeTreeHash,
+  mergeGrants,
   parseVisitGrant,
   readWalkState,
   validateWalkState,

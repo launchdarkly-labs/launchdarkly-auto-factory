@@ -33842,7 +33842,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         atIndex: runs.length,
         expected: `${replayEntry.configKey}#${replayEntry.iteration}`,
         actual: `${key}#${iteration}`,
-        detail: "the journal does not describe the node this walk re-derived \u2014 the graph, configs, or walker logic changed. A fresh run is required."
+        detail: "the journal does not describe the node this walk re-derived \u2014 the served graph, the agent configs, or the walker's routing changed under it. A fresh run is required."
       };
       onEvent?.({ type: "replay-diverged", info: replayDiverged });
       break;
@@ -33951,7 +33951,9 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== void 0) {
         const ek = `${key}\u2192${edge.key}`;
-        const grant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
+        const priorGrant = Math.max(0, Math.floor(resume?.priorExtraVisits?.[ek] ?? 0));
+        const newGrant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
+        const grant = priorGrant + newGrant;
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {

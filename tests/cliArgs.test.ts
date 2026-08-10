@@ -121,11 +121,12 @@ describe("walk state validation (fail-closed)", () => {
     head: "sha1",
     treeHash: "tree1",
     policyMode: "always",
+    base: "main",
     haltedAt: { kind: "pending-approval" as const, node: "n" },
     runs: [{ configKey: "n", status: "completed" as const, output: "o", tags: {}, iteration: 1 }],
     at: "2026-08-09T00:00:00.000Z",
   };
-  const keys = { graphKey: "g", configStamp: "cfg123", head: "sha1", treeHash: "tree1", policyMode: "always" };
+  const keys = { graphKey: "g", configStamp: "cfg123", head: "sha1", treeHash: "tree1", policyMode: "always", base: "main" };
 
   it("accepts a state whose every key matches", () => {
     const r = validateWalkState(base, keys);
@@ -152,12 +153,13 @@ describe("walk state validation (fail-closed)", () => {
   rejects({ head: "sha2" }, /HEAD moved/, "HEAD moved");
   rejects({ treeHash: "tree2" }, /working tree changed/, "the working tree changed");
   rejects({ policyMode: "yolo" }, /approval policy changed/, "the approval policy changed");
+  rejects({ base: "develop" }, /base ref changed/, "the base ref changed — a different diff entirely");
   rejects({ runs: [] }, /empty journal/, "the journal is empty");
 
   it("refuses when ANY key is unknown on either side, not just the tree hash", () => {
     // Fail-closed means "couldn't check" == "refuse". Previously only treeHash
     // enforced this while the doc claimed all of them did.
-    for (const key of ["configStamp", "head", "policyMode"] as const) {
+    for (const key of ["configStamp", "head", "policyMode", "base"] as const) {
       const missingStored = validateWalkState({ ...base, [key]: undefined }, keys);
       assert.equal(missingStored.ok, false, `stored ${key} missing`);
       assert.match((missingStored as { reason: string }).reason, /could not (verify|determine)/, key);

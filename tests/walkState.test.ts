@@ -46,6 +46,7 @@ describe("walk state file (lives in .git, never in the working tree)", () => {
       branch: "feature",
       head: "sha1",
       policyMode: "always",
+      base: "main",
       haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
       runs: sampleRuns,
     });
@@ -148,6 +149,7 @@ describe("walk state captures the tree AT THE HALT, not before the walk", () => 
     head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
     treeHash: computeTreeHash(dir),
     policyMode: "always",
+    base: "main",
   });
   const save = (dir: string) =>
     writeWalkState(dir, {
@@ -155,6 +157,7 @@ describe("walk state captures the tree AT THE HALT, not before the walk", () => 
       configStamp: "cfg123",
       head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
       policyMode: "always",
+      base: "main",
       haltedAt: { kind: "pending-approval", node: "autofactory-flag-implementer" },
       runs: sampleRuns,
     });

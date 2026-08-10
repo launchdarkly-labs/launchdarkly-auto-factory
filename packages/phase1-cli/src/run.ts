@@ -64,6 +64,7 @@ import { type CliOptions, EXIT } from "./args.js";
 import {
   clearWalkState,
   computeTreeHash,
+  mergeGrants,
   readWalkState,
   validateWalkState,
   type WalkStateKeys,
@@ -340,8 +341,11 @@ async function run(opts: CliOptions): Promise<number> {
     ...(state.head ? { head: state.head } : {}),
     ...(computeTreeHash(root) ? { treeHash: computeTreeHash(root) } : {}),
     policyMode: policy.mode,
+    base: opts.base,
   };
   let resume: ResumeInput | undefined;
+  // Grants carried in from a saved walk, so the next save records the running total.
+  let priorGrants: Record<string, number> = {};
   if (opts.resume) {
     const check = validateWalkState(readWalkState(root), stateKeys);
     if (!check.ok) {
@@ -350,8 +354,12 @@ async function run(opts: CliOptions): Promise<number> {
       return EXIT.USAGE;
     }
     const grants = Object.entries(opts.grantVisits);
+    priorGrants = check.state.grants ?? {};
     resume = {
       journal: check.state.runs,
+      // Grants already in force for the recorded walk replay too, so a traversal it
+      // paid for isn't budget-blocked here and misreported as divergence.
+      ...(Object.keys(priorGrants).length > 0 ? { priorExtraVisits: priorGrants } : {}),
       ...(grants.length > 0 ? { extraVisits: opts.grantVisits } : {}),
       ...(opts.feedback ? { humanFeedback: opts.feedback } : {}),
     };
@@ -431,11 +439,12 @@ async function run(opts: CliOptions): Promise<number> {
         ? ({ kind: "loop-exhausted", node: walk.loopExhausted.node } as const)
         : undefined;
     if (walk.replayDiverged) {
-      // Left in place, NOT deleted. A divergence means the saved journal no longer
-      // matches this repo, but the cause may be reversible (a graph edit, a config
-      // change) — and validation refuses it on every subsequent attempt anyway, so a
-      // stale journal is inert rather than dangerous. A plain run clears it at its own
-      // terminal. Deleting recoverable state on a refusal is the wrong trade.
+      // Left in place, NOT deleted: the cause may be reversible (a served-graph edit
+      // reverted, configs re-synced), and a plain run clears it at its own terminal.
+      // Note it is the REPLAY that refuses, not validation — the invalidation keys are
+      // all local and still match, so `--resume` will keep reaching this same point
+      // until the underlying change is undone or a fresh run is taken. Deleting
+      // recoverable state on a refusal is the wrong trade.
     } else if (halt) {
       // NOTE: no treeHash here — writeWalkState hashes the tree itself, at the halt,
       // after the agents have edited it.
@@ -445,6 +454,13 @@ async function run(opts: CliOptions): Promise<number> {
         ...(state.branch ? { branch: state.branch } : {}),
         ...(stateKeys.head ? { head: stateKeys.head } : {}),
         ...(stateKeys.policyMode ? { policyMode: stateKeys.policyMode } : {}),
+        base: opts.base,
+        // Running total, so a second grant round replays the first one's traversals
+        // instead of diverging on them.
+        ...((): { grants?: Record<string, number> } => {
+          const total = mergeGrants(priorGrants, opts.grantVisits);
+          return Object.keys(total).length > 0 ? { grants: total } : {};
+        })(),
         haltedAt: halt,
         runs: walk.runs,
       });

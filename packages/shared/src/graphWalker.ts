@@ -618,9 +618,23 @@ export interface ResumeInput {
    */
   journal: readonly NodeRun[];
   /**
-   * Extra loop-edge budget a human granted, keyed `${source}→${target}`. Added on
-   * top of the edge's declared `max_visits` and still clamped to the hard cap, so
-   * a grant can raise a ceiling but never remove it.
+   * Grants that were ALREADY in force for the walk that produced this journal.
+   * Applied during replay as well as at the frontier, so replayed steps re-derive
+   * the same budget decisions the original walk made.
+   *
+   * Without this, a granted loop traversal recorded in the journal would be
+   * budget-blocked on the next replay and reported as divergence — which capped
+   * grant-and-feedback at exactly one round and blamed "the graph changed". It is
+   * also required by this bundle's own invariant: the walk branches on it, so it
+   * must be journalled.
+   */
+  priorExtraVisits?: Record<string, number>;
+  /**
+   * A NEW grant from this resume, keyed `${source}→${target}`. Applied only once the
+   * journal is consumed — at the frontier and beyond — so it cannot rewrite a
+   * decision the recorded walk already made. Added on top of the declared
+   * `max_visits` plus any prior grants, and still clamped to the hard cap, so a
+   * grant can raise a ceiling but never remove it.
    */
   extraVisits?: Record<string, number>;
   /**
@@ -747,7 +761,7 @@ export async function walkGraph(
         expected: `${replayEntry.configKey}#${replayEntry.iteration}`,
         actual: `${key}#${iteration}`,
         detail:
-          "the journal does not describe the node this walk re-derived — the graph, configs, or walker logic changed. A fresh run is required.",
+          "the journal does not describe the node this walk re-derived — the served graph, the agent configs, or the walker's routing changed under it. A fresh run is required.",
       };
       onEvent?.({ type: "replay-diverged", info: replayDiverged });
       break;
@@ -923,9 +937,12 @@ export async function walkGraph(
       const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
-        // A human's resume grant raises this edge's ceiling but can never remove it:
-        // the hard cap still clamps the total. Frontier-only (see journalConsumed).
-        const grant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
+        // Prior grants apply everywhere (so replay re-derives the original
+        // decisions); a NEW grant applies only from the frontier on. The hard cap
+        // still clamps the total, so a grant raises a ceiling but never removes it.
+        const priorGrant = Math.max(0, Math.floor(resume?.priorExtraVisits?.[ek] ?? 0));
+        const newGrant = journalConsumed ? Math.max(0, Math.floor(resume?.extraVisits?.[ek] ?? 0)) : 0;
+        const grant = priorGrant + newGrant;
         const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
         const traversals = edgeCounts.get(ek) ?? 0;
         if (traversals >= maxVisits) {

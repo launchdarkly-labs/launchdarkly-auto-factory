@@ -47,6 +47,15 @@ export interface WalkState {
   treeHash?: string;
   /** Approval mode in force, so a policy change invalidates the journal. */
   policyMode?: string;
+  /** Base ref the recorded walk diffed against — a different base is a different diff. */
+  base?: string;
+  /**
+   * Cumulative loop-edge grants that were in force for THIS walk, keyed
+   * `${source}→${target}`. Journalled because the walk branches on them: a replay
+   * that didn't know about them would budget-block a traversal the original walk
+   * took and report it as divergence, capping grant-and-feedback at one round.
+   */
+  grants?: Record<string, number>;
   /** Why the walk stopped, for the resume hint. */
   haltedAt: { kind: "pending-approval" | "loop-exhausted"; node: string };
   /** `WalkResult.runs` verbatim — the replay journal. */
@@ -61,6 +70,7 @@ export interface WalkStateKeys {
   head?: string;
   treeHash?: string;
   policyMode?: string;
+  base?: string;
 }
 
 function gitDir(root: string): string {
@@ -207,6 +217,15 @@ export function validateWalkState(state: WalkState | undefined, keys: WalkStateK
   if (!state.policyMode || !keys.policyMode) {
     return { ok: false, reason: "could not determine the approval policy on both sides — refusing to resume" };
   }
+  if (!state.base || !keys.base) {
+    return { ok: false, reason: "could not determine the base ref on both sides — refusing to resume" };
+  }
+  if (state.base !== keys.base) {
+    // The whole walk was recorded against a diff. A different base is a different
+    // diff, so replayed steps and live steps would be reasoning about different
+    // changes — a wrong result rather than a refusal.
+    return { ok: false, reason: `the base ref changed since the walk was saved ('${state.base}' → '${keys.base}')` };
+  }
   if (state.policyMode !== keys.policyMode) {
     return {
       ok: false,
@@ -214,6 +233,16 @@ export function validateWalkState(state: WalkState | undefined, keys: WalkStateK
     };
   }
   return { ok: true, state };
+}
+
+/** Sum two grant maps; used to carry a resume's new grant into the saved state. */
+export function mergeGrants(
+  a: Record<string, number> | undefined,
+  b: Record<string, number> | undefined,
+): Record<string, number> {
+  const out: Record<string, number> = { ...(a ?? {}) };
+  for (const [k, v] of Object.entries(b ?? {})) out[k] = (out[k] ?? 0) + v;
+  return out;
 }
 
 /**

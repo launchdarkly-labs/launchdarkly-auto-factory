@@ -837,6 +837,46 @@ describe("walkGraph — resume (event-log replay)", () => {
     assert.deepEqual(resumed.runs.map((r) => r.configKey), ["metrics", "metrics", "mid", "gated"]);
   });
 
+  it("8c. grants ITERATE: a second grant round replays the first one's traversals", async () => {
+    // Grants must be journalled, because the walk branches on them. Without
+    // `priorExtraVisits`, round 3 replays a traversal the round-2 grant paid for,
+    // budget-blocks it, ends mid-journal, and reports divergence — blaming "the
+    // graph changed" and capping grant-and-feedback at exactly one round.
+    const g = () => graphFrom(reworkGraphValue(1));
+    const rejecting = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "false" } } };
+    const EDGE = "review→flag";
+
+    // Round 1: budget spent, exhausted.
+    const r1 = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" });
+    assert.equal(r1.loopExhausted?.reason, "budget");
+    assert.equal(countOf(r1, "flag"), 2);
+
+    // Round 2: grant one more pass; still rejected, so exhausted again.
+    const r2 = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" }, {
+      resume: { journal: r1.runs, extraVisits: { [EDGE]: 1 }, humanFeedback: "first attempt" },
+    });
+    assert.equal(r2.replayDiverged, undefined);
+    assert.equal(r2.loopExhausted?.reason, "budget", "the granted pass also failed");
+    assert.equal(countOf(r2, "flag"), 3);
+
+    // Round 3: the caller carries round 2's grant forward as PRIOR and adds a new
+    // one. Replay must reproduce round 2 exactly, then the new grant fires live.
+    const r3 = await walkGraph(g(), new ScriptedRunner({
+      flag: { tags: { flag_ready: "true" } },
+      review: { tags: { review_approved: "true" } }, // this time it converges
+    }), { PR_NUMBER: "1" }, {
+      resume: {
+        journal: r2.runs,
+        priorExtraVisits: { [EDGE]: 1 },
+        extraVisits: { [EDGE]: 1 },
+        humanFeedback: "second attempt",
+      },
+    });
+    assert.equal(r3.replayDiverged, undefined, "round 2's granted traversal must replay, not diverge");
+    assert.equal(r3.loopExhausted, undefined, "the second grant let it converge");
+    assert.equal(countOf(r3, "flag"), 4, "3 replayed + 1 live rework");
+  });
+
   it("8. an extraVisits grant cannot exceed the hard cap", async () => {
     // A grant raises a ceiling; it can never remove one.
     const g = () => graphFrom(reworkGraphValue(2));
