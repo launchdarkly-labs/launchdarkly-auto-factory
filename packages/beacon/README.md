@@ -24,6 +24,8 @@ Flat `src/`:
 | `src/notify.ts` | The `auto-factory-notify` bin — a post-deploy hook services run to POST the deployed SHA |
 | `src/discovery.ts` | Diff `.release-flags/` (current vs. previous SHA) to find newly-added flags |
 | `src/state.ts` | Deploy-state store: last-seen SHA per service/environment (file-backed default) |
+| `src/pending.ts` | Re-evaluation ledger: unfinished releases, re-checked on any later deploy |
+| `src/notifyReport.ts` | What the Notifier tells the operator (a 200 can still carry stranded flags) |
 | `src/railway.ts` | Railway webhook payload → generic deploy notification |
 | `src/scope.ts` | Route by scope — frontend / backend / fullstack |
 | `src/fullstack.ts` | Fullstack cross-service SHA check (stateless, re-derived per notification) |
@@ -83,6 +85,8 @@ Read from the repo `config/` dir + env:
   - LD connection: `LD_API_KEY`, `LD_PROJECT_KEY` (the **app** project),
     `LD_BASE_URL` (optional), `LD_ENVIRONMENT_KEY` (default `production`).
   - `BEACON_STATE_FILE` (default `beacon-state.json`).
+  - `BEACON_PENDING_FILE` (default `beacon-pending.json`) — the re-evaluation ledger.
+    Persist it alongside the state file; losing it strands in-flight releases.
   - `BEACON_MONITOR` (`false` disables), `BEACON_MONITOR_POLL_MS` (default
     10000), `BEACON_MONITOR_TIMEOUT_MS` (default 24h).
 
@@ -106,12 +110,17 @@ currently-deployed SHA already contains the same `.release-flags/` file. If yes,
 both services have the code and the release triggers; if no, it waits for the
 other service's deploy notification to re-evaluate.
 
-> **No retry queue (prototype).** A "waiting" flag is released only when the OTHER
-> service's deploy notification arrives and re-evaluates. Beacon logs each waiting
-> outcome (`[beacon] WAITING: …`) with the flag, file, and service so a lost
-> notification is visible. **Manual re-trigger:** once both services are deployed,
-> re-POST `/flag-releases` for the service (same `sha`/`service`) to re-run discovery
-> and release the now-ready flag — the state store re-resolves the same diff range.
+> A "waiting" flag normally releases when the OTHER service's deploy notification
+> arrives. If that notification is lost, the **ledger** (below) re-checks it on any later
+> deploy. Beacon logs each waiting outcome (`[beacon] WAITING: …`) with the flag, file, and
+> service. **Manual re-trigger** is still faster: re-POST `/flag-releases` for the service
+> once both are deployed.
+>
+> A counterpart whose `statusUrl` Beacon cannot reach (a private-network address) must be
+> marked `privateNetwork: true` in `services.yaml`. The readiness check is tri-state, so an
+> *unreadable* counterpart answers "unverified" rather than "not deployed" — without the
+> marker, a permanently-unreachable service would turn every ordinary wait into a reported
+> error.
 
 > **Unfinished releases are re-checked on the next deploy (the ledger).** `pending.ts`
 > persists an entry per non-final outcome (`held`/`waiting`/`error`) and re-evaluates it on
@@ -134,9 +143,9 @@ other service's deploy notification to re-evaluate.
 > `error` all arrive inside a successful response. A deploy log line reading "HTTP 200"
 > is not evidence that the flags released.
 >
-> Until the re-evaluation ledger exists, a log alert matching that marker is the cheapest
-> way to notice a stranded release. A clean deploy prints only to stdout and never uses
-> the marker, so it does not cry wolf.
+> A log alert matching that marker is the cheapest way to notice a release that needs a
+> human — including the cases the ledger deliberately will not retry. A clean deploy prints
+> only to stdout and never uses the marker, so it does not cry wolf.
 >
 > When re-POSTing, pass `previousSha` explicitly — the original notification already
 > advanced Beacon's recorded SHA, so a bare re-POST diffs the wrong range and discovers
