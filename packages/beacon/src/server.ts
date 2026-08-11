@@ -559,61 +559,33 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       ...targetOf(flag.targetVariation),
     });
 
+    /** How a ledger entry is named in a log: the manifest, then what it last knew about itself. */
+    const ledgerTag = (entry: PendingEntry): string =>
+      `${entry.sourceFile} (last named ${entry.flagKey}, pending since ${entry.firstSeenSha.slice(0, 8)}, attempt ${entry.attempts + 1})`;
+
     /**
-     * Re-evaluate one LEDGER entry: a flag whose release was left unfinished by an earlier
-     * deploy. Discovery cannot surface it (its manifest exists at both SHAs), so this is the
-     * only path that reaches it.
+     * Re-evaluate one LEDGER entry: a manifest whose release was left unfinished by an earlier
+     * deploy. Discovery cannot surface it (its file exists at both SHAs), so this is the only path
+     * that reaches it. `parsed` is that manifest AS IT READS NOW, at this notification's sha — read
+     * by the pass below, which needs the fresh target to order the entries.
+     *
+     * NOTE WHAT IS NOT HERE: a `entry.needsHuman` short-circuit. It used to be the first thing this
+     * function did, which made the field a LATCH rather than a conclusion — it preceded the manifest
+     * re-read and was not sha-gated, so nothing on any code path could clear it and the entry
+     * reported `ACTION REQUIRED` on every deploy until someone hand-edited the ledger file.
+     *
+     * That became reachable for manifests that WROTE NOTHING once `already_running` stopped being
+     * final: `config/services.yaml` puts four `side: backend` services on one repo, so one merge
+     * produces four notifications that discover the same manifest — one releases, three answer
+     * `already_running` and are kept, and one revert then stamps `needsHuman` on all three.
+     *
+     * So the entry takes the normal path and concludes `needsHuman` AGAIN if the flag is still
+     * terminal-not-completed. Same report, DERIVED FROM CURRENT STATE, so it clears by itself when
+     * a human completes the release, starts a new one, or the flag moves on. The stored field stays
+     * reporting metadata (last known) and is never control flow again.
      */
-    const reEvaluate = async (entry: PendingEntry): Promise<FlagOutcome> => {
-      const tag = `${entry.sourceFile} (last named ${entry.flagKey}, pending since ${entry.firstSeenSha.slice(0, 8)}, attempt ${entry.attempts + 1})`;
-
-      // NOTE WHAT IS NOT HERE: a `entry.needsHuman` short-circuit. It used to be the first thing
-      // this function did, which made the field a LATCH rather than a conclusion — it preceded the
-      // manifest re-read and was not sha-gated, so nothing on any code path could clear it and the
-      // entry reported `ACTION REQUIRED` on every deploy until someone hand-edited the ledger file.
-      //
-      // That became reachable for manifests that WROTE NOTHING once `already_running` stopped being
-      // final: `config/services.yaml` puts four `side: backend` services on one repo, so one merge
-      // produces four notifications that discover the same manifest — one releases, three answer
-      // `already_running` and are kept, and one revert then stamps `needsHuman` on all three.
-      //
-      // So the entry takes the normal path: re-read the manifest, consult `findLatestRelease`, and
-      // conclude `needsHuman` AGAIN if the flag is still terminal-not-completed. Same report, but
-      // DERIVED FROM CURRENT STATE, so it clears by itself when a human completes the release,
-      // starts a new one, or the flag moves on. The stored field stays as reporting metadata (last
-      // known) and is never control flow again.
-
-      // Re-read the manifest AT THE CURRENT SHA. This is the property that makes a human's
-      // fix take effect — editing a bad `releaseIntent` used to be a no-op, because the file
-      // existed at both SHAs and discovery never looked at it again.
-      let parsed: ReleaseFlagFile | null;
-      try {
-        parsed = await gh.getFileJson<ReleaseFlagFile>(service.repo, entry.sourceFile, n.sha);
-      } catch (e) {
-        return {
-          flag: entry.flagKey,
-          sourceFile: entry.sourceFile,
-          ...targetOf(entry.targetVariation),
-          scope: "ledger",
-          action: "error",
-          viaLedger: true,
-          detail: `could not re-read ${entry.sourceFile} at ${n.sha} — still pending: ${String(e)}`,
-        };
-      }
-      if (!parsed?.flagKey) {
-        // The manifest is gone (or no longer a release manifest): the release was withdrawn,
-        // so stop tracking it. `skipped` is final, so recordOutcome clears the entry.
-        console.log(`[beacon] ledger: ${tag} — manifest absent at ${n.sha}, no longer pending`);
-        return {
-          flag: entry.flagKey,
-          sourceFile: entry.sourceFile,
-          ...targetOf(entry.targetVariation),
-          scope: "ledger",
-          action: "skipped",
-          viaLedger: true,
-          detail: `manifest ${entry.sourceFile} is absent at ${n.sha} — release withdrawn, dropped from the ledger`,
-        };
-      }
+    const reEvaluate = async (entry: PendingEntry, parsed: ReleaseFlagFile): Promise<FlagOutcome> => {
+      const tag = ledgerTag(entry);
 
       // THE GUARD THAT MAKES THIS SAFE TO AUTOMATE. Re-evaluation is a write path, and
       // `findActiveRelease` (inside processFlag) excludes TERMINAL statuses — so on its own it
@@ -735,24 +707,76 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     // same-manifest duplicate slipped through whenever the flagKey had been corrected.
     // Same-flag collisions are handled by `actedOnFlag` above, which is the right axis for it.
     const handledThisRound = new Set(discovered.map((f) => f.sourceFile));
-    const pendingEntries = highestTargetFirst(
-      pending.list(n.service, n.environment).filter((e) => !handledThisRound.has(e.sourceFile)),
-      // The REMEMBERED target, which is only an ordering hint: `reEvaluate` re-reads the manifest
-      // before acting, so a stale value costs at most a suboptimal order, never a wrong decision.
-      (e) => e.targetVariation,
-    );
-    if (pendingEntries.length > 0) {
+    const candidates = pending.list(n.service, n.environment).filter((e) => !handledThisRound.has(e.sourceFile));
+
+    // READ FIRST, ORDER SECOND, ACT THIRD.
+    //
+    // The ordering key has to be the target each manifest asks for NOW, because the order decides
+    // which manifest takes the flag's single action slot — i.e. what production gets. Ordering on
+    // the REMEMBERED target hands the slot to the wrong manifest whenever a human has edited one:
+    // an entry moved from v1 to v3 still ranks as v1 and loses to a sibling's v2, so this deploy
+    // releases v2 and v3 waits for the next one.
+    //
+    // Same number of GitHub reads as before, just moved ahead of the sort — and it leaves the stored
+    // `targetVariation` with no job but reporting, which is what `pending.ts` documents it as.
+    const acting: Array<{ entry: PendingEntry; parsed: ReleaseFlagFile }> = [];
+    for (const entry of candidates) {
+      // RE-READ THE MANIFEST AT THE CURRENT SHA. This is the property that makes a human's fix take
+      // effect — editing a bad `releaseIntent` used to be a no-op, because the file existed at both
+      // SHAs and discovery never looked at it again.
+      let parsed: ReleaseFlagFile | null;
+      try {
+        parsed = await gh.getFileJson<ReleaseFlagFile>(service.repo, entry.sourceFile, n.sha);
+      } catch (e) {
+        // KEPT, REPORTED, AND LEFT OUT OF THE ORDERING: with no fresh manifest there is no current
+        // target to rank it by, and ranking it on the stored one is the staleness this pass exists
+        // to avoid. `error` is non-final, so the entry stays and the next deploy re-reads it.
+        outcomes.push({
+          flag: entry.flagKey,
+          sourceFile: entry.sourceFile,
+          ...targetOf(entry.targetVariation),
+          scope: "ledger",
+          action: "error",
+          viaLedger: true,
+          detail: `could not re-read ${entry.sourceFile} at ${n.sha} — still pending: ${String(e)}`,
+        });
+        continue;
+      }
+      if (!parsed?.flagKey) {
+        // The manifest is gone (or is no longer a release manifest): the release was withdrawn, so
+        // stop tracking it. `skipped` is final, so recordOutcome clears the entry.
+        console.log(`[beacon] ledger: ${ledgerTag(entry)} — manifest absent at ${n.sha}, no longer pending`);
+        outcomes.push({
+          flag: entry.flagKey,
+          sourceFile: entry.sourceFile,
+          ...targetOf(entry.targetVariation),
+          scope: "ledger",
+          action: "skipped",
+          viaLedger: true,
+          detail: `manifest ${entry.sourceFile} is absent at ${n.sha} — release withdrawn, dropped from the ledger`,
+        });
+        continue;
+      }
+      acting.push({ entry, parsed });
+    }
+    const ordered = highestTargetFirst(acting, (a) => a.parsed.targetVariation);
+    if (ordered.length > 0) {
       console.log(
-        `[beacon] ledger: ${pendingEntries.length} unfinished manifest(s) from earlier deploys → ` +
-          // The MANIFEST, then the flag and the variation it wants. Naming only the flag rendered
-          // four manifests for one flag as four identical entries.
-          pendingEntries
-            .map((e) => `${e.sourceFile} [${e.flagKey}→${e.targetVariation ?? "tip"}]=${e.lastAction}`)
+        `[beacon] ledger: ${ordered.length} unfinished manifest(s) from earlier deploys → ` +
+          // The MANIFEST, then the flag and variation it asks for AS READ NOW (so a human's edit
+          // shows up here), then the action last recorded. Naming only the flag rendered four
+          // manifests for one flag as four identical entries. Entries whose manifest could not be
+          // read, or has been withdrawn, were answered above and are not in this list.
+          ordered
+            .map(
+              ({ entry, parsed }) =>
+                `${entry.sourceFile} [${parsed.flagKey}→${parsed.targetVariation ?? "tip"}]=${entry.lastAction}`,
+            )
             .join(", "),
       );
     }
-    for (const entry of pendingEntries) {
-      outcomes.push(await reEvaluate(entry));
+    for (const { entry, parsed } of ordered) {
+      outcomes.push(await reEvaluate(entry, parsed));
     }
 
     // Fold every outcome back into the ledger: remember what is unfinished, forget what is

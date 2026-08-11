@@ -430,6 +430,31 @@ describe("highest target variation acts first", () => {
     assert.match(String(outcomeFor(r.json, 40).detail), /deferred/);
   });
 
+  it("orders the PENDING pass on the FRESHLY READ target, not the remembered one", async () => {
+    // PREVENTS ordering on the stored `targetVariation`. A human retargets pr-41 from v1 to v2 —
+    // the documented iteration edit, and exactly the fix a pending entry invites. The ledger still
+    // remembers v1, so on the stored values both entries rank equally, the (stable) sort keeps
+    // insertion order, pr-40 takes the flag's single action slot, and production gets v1 while the
+    // manifest that now asks for v2 waits for another deploy.
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
+      mvState(),
+    );
+    h.seed(40, "v1");
+    h.seed(41, "v1"); // as last recorded, BEFORE the edit
+
+    const r = await h.post("sha1", "sha0");
+    assert.equal(r.json.discovered, 0, "the ledger is the only path that could act here");
+    assert.equal(h.starts().length, 1);
+    assert.equal(
+      h.starts()[0]?.targetVariationId,
+      "id-v2",
+      "THE DISCRIMINATOR: ordered by what the manifests ask for NOW",
+    );
+    assert.equal(outcomeFor(r.json, 41).action, "released");
+    assert.match(String(outcomeFor(r.json, 40).detail), /deferred/);
+  });
+
   it("orders the PENDING list too, and v1 never releases", async () => {
     // Two manifests already in the ledger, nothing served yet. They are seeded v1-FIRST, which
     // is Map insertion order — the order the ledger would otherwise hand back.
