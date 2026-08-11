@@ -406,6 +406,60 @@ const WRITE_MANIFEST_TOOL: AnthropicToolDef = {
   },
 };
 
+/** LaunchDarkly's cap on a GUARDED release's stage allocation, in basis points (50%). */
+const GUARDED_MAX_ALLOCATION = 50_000;
+/** Full traffic, in basis points. */
+const FULL_ALLOCATION = 100_000;
+
+/**
+ * What is wrong with a `releasePlan.stages` value, or undefined when nothing is.
+ *
+ * WHY THIS IS CHECKED AT AUTHORING TIME. `stages` is a MACHINE field that reaches LaunchDarkly
+ * unvalidated: `trigger.ts` passes it straight into the `startAutomatedRelease` instruction, and LD
+ * answers a bad stage set with a 400. Beacon now RECOVERS from that (it reports `held` and leaves
+ * the flag's action slot free for a sibling instead of treating the rejection as a lost write), but
+ * a refused manifest is still a release that did not happen and a human who has to work out why —
+ * so the agent path must not write one silently. Defence in depth, not a substitute: the file is
+ * hand-editable in git, which is why both ends exist.
+ *
+ * The guarded cap is a LIVE constraint, quoted in `trigger.ts`: "stage allocation must not exceed
+ * 50%", because the metric comparison needs a control group at least as large as the treatment. The
+ * release completes to 100% after the final monitored stage passes, so a 100% guarded stage is not
+ * merely rejected — it is asking for something the release does by itself.
+ *
+ * `guarded` is decided from the MANIFEST alone, mirroring `trigger.ts`'s precedence as far as a
+ * manifest can see it: an explicit `releaseMethod`, else metrics imply `guarded`. The flag's release
+ * policy can still override the method at deploy time, so the message names the explicit
+ * `releaseMethod: "progressive"` escape rather than pretending this is the last word.
+ */
+function stageSetProblem(stages: unknown, guarded: boolean): string | undefined {
+  if (!Array.isArray(stages)) return "must be an array of {allocation, durationMillis}";
+  if (stages.length === 0) return "must not be empty (omit the field instead)";
+  let previous = 0;
+  for (let i = 0; i < stages.length; i++) {
+    const s = stages[i];
+    if (!s || typeof s !== "object" || Array.isArray(s)) return `stage ${i} must be an object`;
+    const { allocation, durationMillis } = s as { allocation?: unknown; durationMillis?: unknown };
+    if (typeof allocation !== "number" || !Number.isFinite(allocation)) {
+      return `stage ${i} has no numeric allocation`;
+    }
+    if (allocation <= 0 || allocation > FULL_ALLOCATION) {
+      return `stage ${i} allocation ${allocation} is outside 1–${FULL_ALLOCATION}`;
+    }
+    if (typeof durationMillis !== "number" || !Number.isFinite(durationMillis) || durationMillis <= 0) {
+      return `stage ${i} has no positive durationMillis`;
+    }
+    if (allocation <= previous) {
+      return `stage ${i} allocation ${allocation} does not exceed the previous stage's ${previous}`;
+    }
+    if (guarded && allocation > GUARDED_MAX_ALLOCATION) {
+      return `stage ${i} allocation ${allocation} exceeds the guarded cap of ${GUARDED_MAX_ALLOCATION} (50%)`;
+    }
+    previous = allocation;
+  }
+  return undefined;
+}
+
 /**
  * Every sandbox tool definition, keyed by name — the built-in DEFAULTS for the
  * model-facing interface (description + schema), and the registry the
@@ -1144,6 +1198,34 @@ export class SandboxToolExecutor {
           "Omit it for fresh flags and boolean legacy flags (whole-flag release).",
         isError: true,
       };
+    }
+
+    // releasePlan.stages: see stageSetProblem. The rollout shape LaunchDarkly will be asked for,
+    // checked here so the agent path cannot commit a manifest that is a permanent 400.
+    if (mergedPlan.stages !== undefined) {
+      const guarded =
+        mergedPlan.releaseMethod === "guarded" ||
+        (mergedPlan.releaseMethod === undefined &&
+          ((Array.isArray(mergedPlan.metricKeys) && mergedPlan.metricKeys.length > 0) ||
+            (Array.isArray(mergedPlan.metricGroupKeys) && mergedPlan.metricGroupKeys.length > 0)));
+      const problem = stageSetProblem(mergedPlan.stages, guarded);
+      if (problem) {
+        return {
+          content:
+            `write_manifest: releasePlan.stages ${problem}. allocation is BASIS POINTS ` +
+            `(20000 = 20%, ${FULL_ALLOCATION} = 100%), durationMillis is that stage's monitoring window ` +
+            `in milliseconds, and allocations must ASCEND. ` +
+            (guarded
+              ? `This is a GUARDED release (releaseMethod: "guarded", or metricKeys with no explicit ` +
+                `releaseMethod), and LaunchDarkly caps a guarded stage at ${GUARDED_MAX_ALLOCATION} (50%) — ` +
+                `it needs a control group at least as large as the treatment, and the release completes to ` +
+                `100% by itself after the final monitored stage passes. Set releaseMethod "progressive" if ` +
+                `a 100% stage is genuinely wanted. `
+              : "") +
+            `Omit stages entirely to use the flag's configured release policy.`,
+          isError: true,
+        };
+      }
     }
 
     // releaseIntent: create-if-absent for agents; steward grade may update it.

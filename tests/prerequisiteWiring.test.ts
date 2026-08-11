@@ -291,3 +291,117 @@ describe("write_manifest: releasePlan.prerequisites is a machine field", () => {
     assert.equal(alsoBad.isError, true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// releasePlan.stages reaches LaunchDarkly UNVALIDATED: `trigger.ts` passes it straight into the
+// startAutomatedRelease instruction. LaunchDarkly caps a GUARDED stage at 50% (the metric
+// comparison needs a control group at least as large as the treatment — `trigger.ts` quotes the
+// live rejection, "stage allocation must not exceed 50%"), so a 100% guarded stage is a permanent
+// 400 on that one manifest.
+//
+// Beacon now RECOVERS from that: the rejection is reported `held` and the flag's action slot is
+// left free for a sibling. This is the other end — authoring-time defence in depth, so the agent
+// path cannot commit the manifest that needs recovering. Both ends exist because
+// `.release-flags/` is hand-editable in git.
+// ---------------------------------------------------------------------------
+describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be asked for", () => {
+  const root = mkdtempSync(join(tmpdir(), "af-manifest-stages-"));
+  after(() => rmSync(root, { recursive: true, force: true }));
+  const executor = () =>
+    new SandboxToolExecutor(root, undefined, false, undefined, undefined, "workingTree", true);
+  let n = 0;
+  const write = (releasePlan: Record<string, unknown>) =>
+    executor().execute("write_manifest", {
+      path: `.release-flags/pr-s${++n}.json`,
+      manifest: { flagKey: "enable-x", releasePlan },
+    });
+
+  it("accepts the guarded default shape (20% → 50%, ascending, within the cap)", async () => {
+    const r = await write({
+      releaseMethod: "guarded",
+      metricKeys: ["latency"],
+      stages: [
+        { allocation: 20000, durationMillis: 300000 },
+        { allocation: 50000, durationMillis: 300000 },
+      ],
+    });
+    assert.notEqual(r.isError, true, r.content);
+  });
+
+  it("rejects a 100% GUARDED stage — the permanent 400 that starved a sibling", async () => {
+    // PREVENTS writing the manifest LaunchDarkly refuses forever. The message has to state the unit,
+    // because 50 / 5000 / 50000 are all plausible-looking guesses for "50%".
+    const r = await write({
+      releaseMethod: "guarded",
+      stages: [{ allocation: 20000, durationMillis: 300000 }, { allocation: 100000, durationMillis: 300000 }],
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.content, /guarded cap of 50000/);
+    assert.match(r.content, /BASIS POINTS/, "the unit is the thing an author gets wrong");
+    assert.match(r.content, /progressive/, "and the escape is named, since the flag's policy may override the method");
+  });
+
+  it("infers GUARDED from metrics when no releaseMethod is set — as trigger.ts does", async () => {
+    // PREVENTS a gap between the check and the code it protects: `trigger.ts` resolves the method as
+    // `releaseMethod ?? policy ?? (hasMetrics ? "guarded" : "progressive")`, so metrics with no
+    // explicit method mean guarded, and a 100% stage is still a 400.
+    const r = await write({ metricKeys: ["checkout-latency"], stages: [{ allocation: 100000, durationMillis: 300000 }] });
+    assert.equal(r.isError, true);
+    assert.match(r.content, /guarded cap/);
+  });
+
+  it("allows a 100% stage for a PROGRESSIVE release — the cap is guarded-only", async () => {
+    // The control arm. A progressive rollout has no metric comparison and no control group to
+    // preserve, and the demo defaults themselves end at 100%.
+    const r = await write({
+      releaseMethod: "progressive",
+      stages: [
+        { allocation: 20000, durationMillis: 300000 },
+        { allocation: 50000, durationMillis: 300000 },
+        { allocation: 100000, durationMillis: 300000 },
+      ],
+    });
+    assert.notEqual(r.isError, true, r.content);
+  });
+
+  it("rejects allocations that do not ascend, and ones outside 1–100000", async () => {
+    // Descending stages are a rollout that pulls traffic BACK mid-release; a percentage (50) or a
+    // fraction (0.5) written where basis points are expected is a 0.05%/0.0005% stage that looks
+    // fine in the file. Neither is what the author meant, and both reach production.
+    const descending = await write({
+      releaseMethod: "progressive",
+      stages: [{ allocation: 50000, durationMillis: 300000 }, { allocation: 20000, durationMillis: 300000 }],
+    });
+    assert.equal(descending.isError, true);
+    assert.match(descending.content, /does not exceed the previous/);
+
+    const tooBig = await write({ releaseMethod: "progressive", stages: [{ allocation: 200000, durationMillis: 1 }] });
+    assert.equal(tooBig.isError, true);
+    assert.match(tooBig.content, /outside 1–100000/);
+
+    const zero = await write({ releaseMethod: "progressive", stages: [{ allocation: 0, durationMillis: 1 }] });
+    assert.equal(zero.isError, true, "a 0% stage releases to nobody and never finishes");
+  });
+
+  it("rejects a malformed stage set rather than letting it reach LaunchDarkly", async () => {
+    const empty = await write({ releaseMethod: "progressive", stages: [] });
+    assert.equal(empty.isError, true);
+    assert.match(empty.content, /must not be empty/);
+
+    const notArray = await write({ releaseMethod: "progressive", stages: { allocation: 20000 } });
+    assert.equal(notArray.isError, true);
+    assert.match(notArray.content, /must be an array/);
+
+    const noDuration = await write({ releaseMethod: "progressive", stages: [{ allocation: 20000 }] });
+    assert.equal(noDuration.isError, true, "durationMillis is required by the release instruction");
+    assert.match(noDuration.content, /durationMillis/);
+  });
+
+  it("leaves a manifest with no stages alone — omitting them defers to the flag's policy", async () => {
+    // The precedence `trigger.ts` implements is manifest > policy > demo defaults, so an absent
+    // `stages` is meaningful rather than incomplete. Validating it into existence would override a
+    // configured policy.
+    const r = await write({ metricKeys: ["latency"] });
+    assert.notEqual(r.isError, true, r.content);
+  });
+});
