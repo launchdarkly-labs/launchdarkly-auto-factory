@@ -876,37 +876,45 @@ describe("a release that completed unwatched still repoints its children", () =>
 // own idempotency read. This caller had no such precondition and fired BEFORE
 // `findActiveRelease` was ever reached.
 //
-// The shape below is the one that needs no eventual consistency to reach: the flag is ON serving
-// `control`, its newest automated release is `completed`, a child is pinned to `v1`, and the
-// flag's one ledger entry is held by its own intent. `trigger.ts` itself recommends this state
-// ("revert the release, or serve the variation directly"), and serving a variation directly
-// leaves `findLatestRelease` still reporting `completed`.
+// THE FIXTURE THIS BLOCK IS WRITTEN ON, and why it is not the rollback shape. It used to be:
+// flag serving `control` with a child pinned to `v1`, i.e. a repoint that moves the child
+// BACKWARDS. `repoint.ts` now refuses that outright (see the next block), so on that fixture
+// nothing repoints under ANY gate and the activeness gate would be undiscriminated — the control
+// arm would pass with the gate deleted. It also asserted `id-control` as the expected
+// destination, a value its own comment called known-wrong.
+//
+// So the shape here is a FORWARD repoint the new lineage guard permits — child pinned to
+// `control`, parent serving `v2` — with a release still listed `in_progress`. That is reachable
+// without any eventual consistency: a progressive release's last stage puts the treatment at the
+// heaviest weight, so the fallthrough already resolves to `v2` while the release is still
+// running and can still be REVERTED to `control`. Repointing then satisfies the child's
+// prerequisite off a value LaunchDarkly may take back.
 // ---------------------------------------------------------------------------
 describe("the ledger repoints only once the release has stopped moving", () => {
-  /** Rollback shape: on, serving `control`, newest release `completed`, child pinned to v1. */
-  const rolledBack = (releases: Array<{ id: string; status: string }>): MvState =>
+  /** Mid-rollout FORWARD shape: on, already serving `v2`, child still pinned to `control`. */
+  const midRollout = (releases: Array<{ id: string; status: string }>): MvState =>
     mvState({
       on: true,
-      served: "control",
+      served: "v2",
       releases,
-      children: { "enable-child": { pinned: "v1" } },
+      children: { "enable-child": { pinned: "control" } },
     });
 
   const heldByIntent = () =>
     ghWith([`pr-41.json`], { [path(41)]: manifest("v2", { releaseIntent: { action: "hold" } }) });
 
   it("does NOT repoint while a release is still running on that flag", async () => {
-    // PREVENTS: repointing `enable-child` from `v1` to `control` on a read of the fallthrough that
-    // the running release is still moving. The child is DARK while pinned to a variation the parent
-    // does not serve, so this repoint takes it live for 100% of traffic — and aims it at the
-    // variation the release in flight is ramping away from.
+    // PREVENTS: repointing `enable-child` from `control` to `v2` off a fallthrough the running
+    // release is still moving. The child is DARK while pinned to a variation the parent does not
+    // serve, so this repoint takes it live for 100% of traffic with no rollout — and if the release
+    // then reverts, the child is left pinned to a variation production no longer serves.
     //
     // Note the listing shape: newest-first, so the completed release is `items[0]` (what
     // `findLatestRelease` returns, limit=1) while an older one is still active — the case
     // `findActiveRelease`'s "no limit=1" comment exists for.
     const h = await harness(
       heldByIntent(),
-      rolledBack([{ id: "rel-1", status: "completed" }, { id: "rel-2", status: "in_progress" }]),
+      midRollout([{ id: "rel-1", status: "completed" }, { id: "rel-2", status: "in_progress" }]),
     );
     h.seed(41, "v2");
 
@@ -931,18 +939,19 @@ describe("the ledger repoints only once the release has stopped moving", () => {
   });
 
   it("still repoints when NOTHING is running — the gate is exactly `!active`", async () => {
-    // The control arm, and the reason it is written on the rollback shape rather than a healthy
-    // one: with nothing running this repoint DOES fire, and it still aims at the live fallthrough
-    // (`control`). That residual gate-vs-destination mismatch is the PRE-EXISTING family —
-    // `monitor.ts` shares it — and is deliberately not closed here. What is pinned is that the new
-    // gate narrows the repoint by ACTIVENESS ONLY, so removing it or widening it both fail a test.
-    const h = await harness(heldByIntent(), rolledBack([{ id: "rel-1", status: "completed" }]));
+    // The control arm. Same fixture, one release removed, so ACTIVENESS is the only thing that
+    // varies between this test and the one above — which is what makes the gate discriminated:
+    // delete it and the test above fails, widen it and this one does.
+    //
+    // The destination is now a legitimate one (`control` → `v2`, forward), so this also pins that
+    // the new lineage guard does not block the ordinary case.
+    const h = await harness(heldByIntent(), midRollout([{ id: "rel-1", status: "completed" }]));
     h.seed(41, "v2");
 
     const r = await h.post("sha1", "sha0");
     const childPatch = h.patches.find((p) => p.flagKey === "enable-child");
     assert.ok(childPatch, "THE DISCRIMINATOR: an unwatched completion still reaches its children");
-    assert.equal(childPatch.instructions[1]?.variationId, "id-control");
+    assert.equal(childPatch.instructions[1]?.variationId, "id-v2", "and it is aimed at what the flag serves");
     assert.equal(outcomeFor(r.json, 41).action, "held", "its own intent still holds it — repointing is not releasing");
   });
 
@@ -951,7 +960,7 @@ describe("the ledger repoints only once the release has stopped moving", () => {
     // code repointed; only the "is anything running?" read fails. An unreadable listing does not
     // establish that the fallthrough has stopped moving, and the repoint is a WRITE — so it is
     // skipped, which costs a repoint the next deploy performs.
-    const state = rolledBack([{ id: "rel-1", status: "completed" }]);
+    const state = midRollout([{ id: "rel-1", status: "completed" }]);
     state.activeListingThrows = true;
     const h = await harness(heldByIntent(), state);
     h.seed(41, "v2");
@@ -966,6 +975,94 @@ describe("the ledger repoints only once the release has stopped moving", () => {
       h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
       [path(41)],
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A REPOINT MUST NEVER MOVE A CHILD BACKWARDS ALONG THE LINEAGE.
+//
+// `repoint.ts` computes the destination from the parent's LIVE serving variation, and "live"
+// includes states a human deliberately put the flag into. `trigger.ts` explicitly advises serving
+// an earlier variation directly as the way to roll back, and doing so leaves
+// `findLatestRelease` still reporting the old release as `completed` — so every repoint caller's
+// gate is satisfied and the destination is now `control`.
+//
+// The consequence is a WRITE CAUSED BY A ROLLBACK: a child pinned behind an unmet prerequisite is
+// dark, and repointing it to what the parent now serves MEETS that prerequisite, so the child
+// serves its treatment to 100% of traffic with no rollout and no monitoring.
+//
+// The fix is a strict narrowing, and it covers all three callers at once — `monitor.ts`, the
+// `noop`/`immediate` repoint in `server.ts`, and the ledger's — because it lives inside
+// `repoint.ts` rather than in any gate.
+// ---------------------------------------------------------------------------
+describe("a repoint never moves a child backwards along the lineage", () => {
+  const heldByIntent = (target: string) =>
+    ghWith([`pr-41.json`], { [path(41)]: manifest(target, { releaseIntent: { action: "hold" } }) });
+
+  it("refuses to move a child from v1 to control when a human rolled the parent back", async () => {
+    // PREVENTS the rollback-triggered un-dark. Nothing is running, the newest release is
+    // `completed`, and the parent serves `control` — exactly the state `trigger.ts` recommends for
+    // a deliberate rollback — so every gate on the repoint passes and only the lineage comparison
+    // stands between the rollback and a child flag going live at 100%.
+    const h = await harness(
+      heldByIntent("v2"),
+      mvState({
+        on: true,
+        served: "control",
+        releases: [{ id: "rel-1", status: "completed" }],
+        children: { "enable-child": { pinned: "v1" } },
+      }),
+    );
+    h.seed(41, "v2");
+
+    const r = await h.post("sha1", "sha0");
+    assert.equal(r.json.discovered, 0, "only the ledger can reach this manifest");
+    assert.deepEqual(h.patches, [], "THE DISCRIMINATOR: no child patch — the rollback wrote nothing");
+    assert.equal(outcomeFor(r.json, 41).action, "held", "and the manifest's own verdict is untouched");
+  });
+
+  it("still repoints control → v1: a first release is forward, and pinned has no lineage index", async () => {
+    // The forward control arm that a too-broad guard would break. `control` has no vN index at all,
+    // so "is the destination behind what is pinned?" has no answer — and the answer must be ALLOW,
+    // because this is the first release of every flag the factory creates.
+    const h = await harness(
+      heldByIntent("v1"),
+      mvState({
+        values: ["control", "v1"],
+        on: true,
+        served: "v1",
+        releases: [{ id: "rel-1", status: "completed" }],
+        children: { "enable-child": { pinned: "control" } },
+      }),
+    );
+    h.seed(41, "v1");
+
+    const r = await h.post("sha1", "sha0");
+    const childPatch = h.patches.find((p) => p.flagKey === "enable-child");
+    assert.ok(childPatch, "THE DISCRIMINATOR: the ordinary first release still reaches its children");
+    assert.equal(childPatch.instructions[1]?.variationId, "id-v1");
+    assert.equal(outcomeFor(r.json, 41).action, "held");
+  });
+
+  it("still repoints v1 → v2: both are lineage-indexed and the destination is ahead", async () => {
+    // The other forward arm — the iteration case, where BOTH values have a lineage index. A guard
+    // written as "refuse whenever pinned has an index" would pass the test above and break this one,
+    // which is the whole point of having both.
+    const h = await harness(
+      heldByIntent("v2"),
+      mvState({
+        on: true,
+        served: "v2",
+        releases: [{ id: "rel-1", status: "completed" }],
+        children: { "enable-child": { pinned: "v1" } },
+      }),
+    );
+    h.seed(41, "v2");
+
+    const r = await h.post("sha1", "sha0");
+    const childPatch = h.patches.find((p) => p.flagKey === "enable-child");
+    assert.ok(childPatch, "THE DISCRIMINATOR: an iteration still carries its children forward");
+    assert.equal(childPatch.instructions[1]?.variationId, "id-v2");
   });
 });
 

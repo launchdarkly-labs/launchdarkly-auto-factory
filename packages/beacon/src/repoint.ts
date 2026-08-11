@@ -11,12 +11,15 @@
  * Scope guards: only children tagged `auto-factory` (we never rewrite a
  * human's hand-built dependency), only the released environment, and only
  * prerequisites on THIS flag. Boolean parents never need re-pointing (their
- * "on" variation id never changes), so callers may skip them. By contract this
- * NEVER throws — like release monitoring, a re-point failure is loudly logged,
- * not fatal.
+ * "on" variation id never changes), so callers may skip them. And never
+ * BACKWARDS: a child pinned to `vN` is left alone when the parent now serves
+ * something earlier, or something off the lineage entirely — see the guard
+ * below, which is what makes a human's rollback safe. By contract this NEVER
+ * throws — like release monitoring, a re-point failure is loudly logged, not
+ * fatal.
  */
 
-import type { LdClient } from "@auto-factory/shared";
+import { variationLineageIndex, type LdClient } from "@auto-factory/shared";
 
 interface ParentFlag {
   variations?: Array<{ _id: string; value: unknown }>;
@@ -76,6 +79,48 @@ export async function repointDependentPrerequisites(
         const pinned = at(prereq.variation);
         if (pinned?._id === serving._id) {
           outcomes.push({ childKey, action: "skipped", detail: `already pinned to '${String(serving.value)}'` });
+          continue;
+        }
+        // NEVER REPOINT A CHILD BACKWARDS ALONG THE LINEAGE.
+        //
+        // The destination is the parent's LIVE serving variation, and "live" includes states a
+        // human deliberately put the flag into. `trigger.ts` explicitly advises serving `control`
+        // directly as the way to roll back ("a deliberate rollback is LaunchDarkly's job — revert
+        // the release, or serve the variation directly"), and `findLatestRelease` still reports the
+        // old release as `completed` afterwards, so every repoint caller's gate is satisfied.
+        //
+        // What that did: a child pinned to `v1` was repointed to `control`. A child pinned behind
+        // an unmet prerequisite is DARK; repointing it to what the parent now serves MEETS the
+        // prerequisite, so the child immediately serves its treatment to 100% of traffic with no
+        // rollout and no monitoring — caused BY a rollback. That is the most destructive write in
+        // this module and it had no guard.
+        //
+        // The comparison is deliberately asymmetric, and this is a STRICT NARROWING of a write:
+        //  - `pinned` has no lineage index (`control`, a hand-named value) ⇒ ALLOW. This is the
+        //    first release, control → v1, the normal forward case.
+        //  - `pinned` is vN and `serving` is vM with M >= N ⇒ ALLOW (v1 → v2, the iteration case).
+        //  - `pinned` is vN and `serving` is vM with M < N ⇒ REFUSE.
+        //  - `pinned` is vN and `serving` has no lineage index at all ⇒ REFUSE. This is the rollback
+        //    case above: we cannot tell whether leaving the lineage is forward or backward, and
+        //    `trigger.ts` makes the same call for the same reason (its "NOT IN THE LINEAGE" hold).
+        //
+        // It does NOT need the parent's target variation, which is why it is fixable here while the
+        // forward mid-rollout hazard (repointing to the arm a running release is ramping away from)
+        // is not: `AutomatedRelease` carries no target variation, but `pinned` and `serving` are
+        // both already in hand.
+        const pinnedIndex = variationLineageIndex(pinned?.value);
+        const servingIndex = variationLineageIndex(serving.value);
+        if (pinnedIndex !== undefined && (servingIndex === undefined || servingIndex < pinnedIndex)) {
+          outcomes.push({
+            childKey,
+            action: "skipped",
+            detail:
+              `pinned to '${String(pinned?.value)}' but '${flagKey}' now serves '${String(serving.value)}' — ` +
+              `repointing would move this child BACKWARDS along the lineage, so it is refused. This is what a ` +
+              `deliberate rollback looks like (a human serving an earlier variation directly); satisfying the ` +
+              `prerequisite here would take the child live at 100% with no rollout. Repoint it by hand if that ` +
+              `is really what is wanted.`,
+          });
           continue;
         }
         if (!(child.tags ?? []).includes("auto-factory")) {
