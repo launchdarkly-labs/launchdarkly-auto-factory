@@ -15,6 +15,23 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-11 (`create_metric` description over LD's 1024-byte cap)
+
+### ✅ Tool: `create_metric` description trimmed to fit
+- **Why:** LaunchDarkly rejects AI tool descriptions over **1024 bytes** (counted
+  as bytes, not characters), and the `create_metric` description had grown to
+  1114 bytes — bootstrap failed to create the tool and two dependent
+  tool-attachments cascaded. Multibyte punctuation (em dashes, ellipses, `↔`)
+  made the byte count exceed the visible character count.
+- **Config:** `tools/create_metric.json` description condensed to 1020 bytes —
+  wording tightened, multibyte punctuation converted to ASCII; no semantic
+  changes to the backing rules (event vs. trace) or the schema.
+- **Credit:** fix contributed by Matt Laster (external PR); already-provisioned
+  LD projects need a re-bootstrap / `bridge upgrade` to pick up the new
+  description.
+
+---
+
 ## 2026-07-29 (Sentry path → `sentry` variation; review patch)
 
 ### ✅ Metrics author: Sentry moved to a dedicated variation
