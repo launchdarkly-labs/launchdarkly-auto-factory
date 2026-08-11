@@ -7,7 +7,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { JudgeCompletion } from "../judges.js";
-import { anthropicModelId } from "./anthropicAgentRunner.js";
+import { type AnthropicMessagesClient, anthropicModelId } from "./anthropicAgentRunner.js";
 
 // Generous on purpose: the output is one {score, reasoning} tool call, but the
 // reasoning is written against a large evidence diff. At 1024 a verbose judge
@@ -16,10 +16,21 @@ import { anthropicModelId } from "./anthropicAgentRunner.js";
 const MAX_TOKENS = 4096;
 
 export function createAnthropicJudgeCompletion(apiKey?: string): JudgeCompletion {
-  const client = new Anthropic(apiKey ? { apiKey } : {});
+  return createForcedToolJudgeCompletion(new Anthropic(apiKey ? { apiKey } : {}), anthropicModelId);
+}
+
+/**
+ * The client-agnostic core: any Anthropic-Messages-compatible client (direct
+ * API or Bedrock Mantle) with the matching model-id mapper. Exported so the
+ * Bedrock provider gets the exact same forced-tool judge behavior.
+ */
+export function createForcedToolJudgeCompletion(
+  client: AnthropicMessagesClient,
+  modelId: (name: string | undefined) => string,
+): JudgeCompletion {
   return async (req) => {
     const resp = await client.messages.create({
-      model: anthropicModelId(req.model),
+      model: modelId(req.model),
       max_tokens: MAX_TOKENS,
       system: req.system,
       messages: [{ role: "user", content: req.input }],

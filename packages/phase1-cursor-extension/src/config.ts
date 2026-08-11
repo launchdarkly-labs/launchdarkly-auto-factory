@@ -89,7 +89,13 @@ export async function applyConfig(
   }
 
   const missing: string[] = [];
-  if (!process.env.ANTHROPIC_API_KEY) missing.push(SECRET_LABELS.anthropicApiKey);
+  // The provider flag is only evaluated at run time (runChain), so accept an
+  // AWS credential signal in place of an Anthropic key here: on the 'bedrock'
+  // provider the runner authenticates via the AWS chain instead.
+  const hasAwsCreds = Boolean(
+    process.env.AWS_ACCESS_KEY_ID || process.env.AWS_PROFILE || process.env.AWS_BEARER_TOKEN_BEDROCK,
+  );
+  if (!process.env.ANTHROPIC_API_KEY && !hasAwsCreds) missing.push(SECRET_LABELS.anthropicApiKey);
   if (!process.env.LD_SDK_KEY) missing.push(SECRET_LABELS.ldSdkKey);
   if (flagCreation && !process.env.LD_API_KEY) missing.push(SECRET_LABELS.ldApiKey);
 

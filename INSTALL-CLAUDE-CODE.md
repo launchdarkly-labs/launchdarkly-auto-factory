@@ -50,8 +50,9 @@ Bootstrap builds the workspace, runs preflight checks (Node version, LaunchDarkl
 reachability, key authorization), and provisions the agent AI configs, judges,
 agent graph, and operational flags into your factory project. It's idempotent —
 existing resources are never overwritten. When it prompts for a provider, accept
-the default (**anthropic** — the Claude Code path always runs on the Anthropic
-runner). The "Next steps" it prints are for the GitHub Action front end; for
+the default (**anthropic** — the Claude Code path runs on the sandboxed runners:
+Anthropic, or Bedrock if the provider flag serves `bedrock` and AWS credentials
+are set). The "Next steps" it prints are for the GitHub Action front end; for
 Claude Code, continue below instead.
 
 ## 2. Install the skill (your app repo)

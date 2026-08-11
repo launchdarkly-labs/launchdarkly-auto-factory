@@ -29,7 +29,7 @@ LD_SDK_KEY=            # factory project server SDK key
 LD_API_KEY=            # api- token that writes flags/metrics in the app project
 LD_PROJECT_KEY=        # factory project
 LD_APP_PROJECT_KEY=    # app project
-ANTHROPIC_API_KEY=     # the CLI always executes on the Anthropic runner (see Fidelity notes)
+ANTHROPIC_API_KEY=     # default 'anthropic' provider; on 'bedrock' use AWS_REGION + AWS creds instead (see Fidelity notes)
 ```
 
 Build once (`npm install && npm run build` at the repo root), then either run
@@ -64,15 +64,16 @@ the flag control plane — leave them unset.
   (`createWorkingTreeEvidence`) rather than the commit-scoped one the Action
   uses. Same ground-truth property: the judge sees what changed, not what the
   agent claimed.
-- **Provider**: the CLI always executes on the **Anthropic** runner, whatever
-  the `auto-factory-ai-provider` flag serves. `vega` runs agents server-side
-  and can't edit a local tree. `cursor` runs locally but a Cursor local agent
-  carries its own native shell/git alongside our sandbox tools — in a live run
-  it committed each step and pushed the branch, bypassing `commit_and_push`
-  (the only place the working-tree mode is enforced), and the SDK has no
-  tool-restriction API to prevent that. Only the Anthropic runner is
-  structurally confined to the sandbox tools, which the "nothing is committed
-  or pushed" contract requires. Both selections fall back with a note; use the
+- **Provider**: the CLI executes on the **sandboxed** runners only — `anthropic`
+  (default) or `bedrock` (the same tool loop on Claude via Amazon Bedrock;
+  needs `AWS_REGION` + AWS credentials instead of `ANTHROPIC_API_KEY`). `vega`
+  runs agents server-side and can't edit a local tree. `cursor` runs locally
+  but a Cursor local agent carries its own native shell/git alongside our
+  sandbox tools — in a live run it committed each step and pushed the branch,
+  bypassing `commit_and_push` (the only place the working-tree mode is
+  enforced), and the SDK has no tool-restriction API to prevent that. Only the
+  sandbox-confined runners satisfy the "nothing is committed or pushed"
+  contract. Vega/Cursor selections fall back to Anthropic with a note; use the
   GitHub Action for Cursor/Vega runs.
 - **Config drift**: the `[cfg:…]` stamp check runs when the CLI executes from a
   checkout of this repo (it hashes `config/agentcontrol/` three levels up).

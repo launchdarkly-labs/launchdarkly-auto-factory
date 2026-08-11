@@ -13,6 +13,7 @@
 
 import {
   AnthropicAgentRunner,
+  BedrockAgentRunner,
   LdClient,
   LdResourceWriter,
   appConnection,
@@ -62,16 +63,19 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
   const { ldClient, aiClient } = await getLdSdk();
   let ldContext = pipelineContext();
 
-  // The extension executes the chain locally, so it always uses the Anthropic
-  // runner. We still read the provider flag for parity and surface a note if a
-  // hosted provider (Vega) is selected, since that path can't edit your tree.
-  const provider = await resolveAiProvider(ldClient, ldContext);
-  if (provider !== "anthropic") {
-    reporter.log(`Provider flag selects '${provider}', but the editor extension runs locally on Anthropic. Using Anthropic.`);
+  // The extension executes the chain locally, so it runs on the sandboxed
+  // runners only (Anthropic, or Bedrock — the same tool loop over the Bedrock
+  // transport). We still read the provider flag for parity and surface a note
+  // if a non-local provider (Vega, Cursor) is selected, since those paths
+  // can't safely edit your tree.
+  let provider = await resolveAiProvider(ldClient, ldContext);
+  if (provider !== "anthropic" && provider !== "bedrock") {
+    reporter.log(`Provider flag selects '${provider}', but the editor extension runs locally on the sandboxed runner. Using Anthropic.`);
+    provider = "anthropic";
   }
-  // Stamp the EFFECTIVE provider (always anthropic here) on the run context so
-  // AI config targeting serves only models this runner can execute.
-  ldContext = withProvider(ldContext, "anthropic");
+  // Stamp the EFFECTIVE provider (anthropic or bedrock here) on the run
+  // context so AI config targeting serves only models this runner can execute.
+  ldContext = withProvider(ldContext, provider);
 
   const variables = buildContextVariables(opts.context, opts.appProjectKey);
   const graphDef = await aiClient.agentGraph(opts.graphKey, ldContext, variables);
@@ -84,15 +88,24 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
   reporter.log(`Flag/metric creation: ${writer ? `enabled → '${writer.projectKey}'` : "disabled (read-only)"}.`);
   reporter.log(`Code changes: ${opts.codeChanges ? "enabled (edits land in your working tree)" : "disabled"}.`);
 
-  const runner = new AnthropicAgentRunner({
+  const runnerOpts = {
     sandboxRoot: opts.workspaceRoot,
     codeChangesEnabled: opts.codeChanges,
-    gitMode: "workingTree",
-    ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
+    gitMode: "workingTree" as const,
     ...(writer ? { writer } : {}),
     ...(opts.context.PR_BRANCH ? { prBranch: String(opts.context.PR_BRANCH) } : {}),
     ...(process.env.PR_BASE_REF ? { prBaseRef: process.env.PR_BASE_REF } : {}),
-  });
+  };
+  const runner =
+    provider === "bedrock"
+      ? new BedrockAgentRunner({
+          ...runnerOpts,
+          ...(process.env.AWS_REGION ? { awsRegion: process.env.AWS_REGION } : {}),
+        })
+      : new AnthropicAgentRunner({
+          ...runnerOpts,
+          ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
+        });
 
   // The approval policy (mode/threshold/gates flags) compiles into
   // pre-execution gates; the extension answers each gate with an interactive

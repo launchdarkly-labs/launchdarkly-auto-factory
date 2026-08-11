@@ -56,10 +56,10 @@ same release manifest — they differ only in trigger, output, and which models 
 
 | Front end | Trigger | Output | Models | Status |
 |-----------|---------|--------|--------|--------|
-| **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Vega / Cursor (flag-selected; model per agent from the AI config) | primary, verified path |
-| **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API (Cursor can't expose its models to extensions) | working |
+| **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Bedrock / Vega / Cursor (flag-selected; model per agent from the AI config) | primary, verified path (Bedrock path not yet exercised live) |
+| **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API or Bedrock (Cursor can't expose its models to extensions) | working |
 | **Native Cursor automation** — [`bootstrap/cursor-automation`](bootstrap/cursor-automation/) | the `/autofactory` command in Cursor | edits left in your working tree | Cursor's own models (no API key) | local prototype; cloud (auto, PR-based) is a later phase |
-| **Headless CLI / Claude Code** — [`packages/phase1-cli`](packages/phase1-cli/), skill in [`bootstrap/claude-code/`](bootstrap/claude-code/) | `autofactory run` in a terminal, or `/autofactory` in Claude Code | edits left in your working tree | Anthropic API only (model per agent from the AI config; the working-tree ceiling requires the sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
+| **Headless CLI / Claude Code** — [`packages/phase1-cli`](packages/phase1-cli/), skill in [`bootstrap/claude-code/`](bootstrap/claude-code/) | `autofactory run` in a terminal, or `/autofactory` in Claude Code | edits left in your working tree | Anthropic API or Bedrock (model per agent from the AI config; the working-tree ceiling requires the sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
 
 Setup for the GitHub Action is below; the extension, the automation, and the CLI each have their
 own README. For the Claude Code path there is a standalone install guide:
@@ -75,7 +75,7 @@ own README. For the Claude Code path there is a standalone install guide:
   - an **app** project, where the agents create flags and metrics (the pipeline writes to it)
 - A LaunchDarkly server SDK key for the factory project's environment, and an API access
   token with write access to both projects
-- An Anthropic API key (the default agent execution backend), or a Cursor API key to run on the Cursor provider
+- An Anthropic API key (the default agent execution backend), AWS credentials with Bedrock model access to run on the Bedrock provider, or a Cursor API key to run on the Cursor provider
 - A GitHub repository for your application
 
 ### 1. Provision the agent configs, graph, and operational flags
@@ -84,7 +84,7 @@ own README. For the Claude Code path there is a standalone install guide:
 git clone <this repo> && cd launchdarkly-auto-factory
 npm install
 cp .env.example .env    # fill in LD_SDK_KEY, LD_API_KEY, LD_PROJECT_KEY, LD_APP_PROJECT_KEY, ANTHROPIC_API_KEY
-npm run bootstrap       # prompts for the execution provider (anthropic or cursor)
+npm run bootstrap       # prompts for the execution provider (anthropic, bedrock, or cursor)
 ```
 
 Bootstrap runs preflight checks, then creates, in your factory project from the committed
@@ -170,6 +170,15 @@ stays off; the dependency binds at release — same-project flags only, see
 secret (and pass it through the workflow env) for private sibling repos. No
 registry, no tool — and failures degrade to warnings, never failed runs.
 
+To run on the **Bedrock** provider instead (the same agents on Claude via Amazon Bedrock —
+AWS auth and billing), keep the drop-in workflow, serve `bedrock` from the provider flag
+(below), and supply AWS credentials with Bedrock model access in place of
+`ANTHROPIC_API_KEY`: either the action's `aws_region` / `aws_access_key_id` /
+`aws_secret_access_key` inputs, or an `aws-actions/configure-aws-credentials` OIDC step
+before the action. The agents' LD-configured model names map to Bedrock ids automatically
+(`claude-…` → `anthropic.claude-…`); the AWS account must have those models enabled in the
+chosen region. *This path is code-complete but not yet exercised against a live AWS account.*
+
 To run on the **Cursor** provider instead, copy `bootstrap/github-action-template/auto-factory-cursor.yml`
 (it checks the tool out and `npm ci`s it, because the Cursor SDK can't run via the bare
 `uses:` form), set a `CURSOR_API_KEY` secret in place of `ANTHROPIC_API_KEY`, and serve
@@ -202,8 +211,8 @@ config changes) short-circuit after the first agent.
 | `graph_key` | `gha-auto-factory` | which agent graph to walk |
 
 The `auto-factory-ai-provider` flag (factory project, string variations
-`anthropic`/`vega`/`cursor`) selects the execution backend per run. Bootstrap provisions it
-**off** (serves `anthropic`); flip it to serve `vega` or `cursor`. (If the flag is ever
+`anthropic`/`bedrock`/`vega`/`cursor`) selects the execution backend per run. Bootstrap provisions it
+**off** (serves `anthropic`); flip it to serve `bedrock`, `vega`, or `cursor`. (If the flag is ever
 absent, the runtime defaults to `anthropic`.) The graph, instructions, and per-agent model are
 the same across providers — only the model brain changes. The model for each agent is read
 from its AI config, so reasoning agents (research, review) and coding agents can run different
@@ -226,8 +235,8 @@ flag-implementer and metrics-author variations score each run 0..1 (with reasoni
 **verified evidence** — the node-scoped git diff of what the agent actually committed, gathered
 by the pipeline rather than claimed by the agent. Scores record per-variation under the judge's
 `$ld:ai:judge:…` metric (each config's Monitoring tab, or Metrics → Judge metrics), which is
-what makes the per-agent model A/B a cost-vs-quality comparison. Judges run on the Anthropic
-and Cursor providers; Vega skips them.
+what makes the per-agent model A/B a cost-vs-quality comparison. Judges run on the Anthropic,
+Bedrock, and Cursor providers; Vega skips them.
 
 ### Approvals: three flags, compiled into pre-execution gates
 

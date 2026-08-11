@@ -15,6 +15,50 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-07 (Bedrock provider)
+
+### ✅ `auto-factory-ai-provider`: new `bedrock` variation
+
+- Added a fourth variation `bedrock` ("Bedrock") to the committed flag definition
+  (`flags/auto-factory-ai-provider.json`), appended after the existing three so
+  the provisioned defaults (off→`anthropic`, on→`vega`) are untouched. Serving
+  `bedrock` runs the SAME agents/tool loop as `anthropic` over Claude on Amazon
+  Bedrock (the Bedrock Mantle Messages endpoint) — auth via the AWS credential
+  chain (AWS_REGION + keys/OIDC role), billing on AWS.
+- No AI-config changes needed: the runner maps the configs' Anthropic model
+  names to Bedrock ids automatically (`claude-…` → `anthropic.claude-…`), so the
+  per-agent model variations work unchanged on both providers.
+- LIVE flag updated the same day: the `bedrock` variation was PATCHed onto
+  `auto-factory-prototype`'s live flag (v2→v3, additive — the production 50/50
+  anthropic/cursor rollout and off-variation are unchanged). Other existing
+  projects need the same manual PATCH/UI edit — `bridge upgrade` deliberately
+  never edits existing flag variations; new bootstraps get it from the
+  committed file.
+- Runtime NOT yet validated live (no AWS credentials at build time). Before
+  serving `bedrock`, confirm the target AWS account has the mapped Claude
+  models enabled in the chosen region.
+
+---
+
+## 2026-07-31 (greenfield-repo harness scaffolding)
+
+### ✅ `autofactory-flag-testing`: scaffold the test harness when the repo has none
+- **What**: extended the "Test conventions" section: on a repo with no test
+  suite the agent must also SCAFFOLD the harness so `run_tests` can invoke it —
+  for Node that means adding the package.json `"test"` script (run_tests runs
+  `npm test`); a `run_tests` "no test harness" response is an instruction to
+  build it, not a reason to skip.
+- **Why**: external bug report (2026-07-30, SE run against a minimal Express
+  app with no tests): `run_tests` treated npm's default "no test specified"
+  stub as a RED run, so every upstream node handed off `tests_last_run=fail`
+  and the `tests-green-at-handoff` shim killed the chain before flag-testing —
+  the node whose job is to create the missing suite. The runtime side of the
+  fix (in code, not config): `run_tests` now classifies "no harness present"
+  (missing/stub npm test script, pytest exit 5) as inconclusive — it no longer
+  sets `tests_last_run`, so the shim only gates on real test executions.
+- **Deploy**: committed file updated; live projects pick it up via
+  `bridge upgrade`.
+
 ## 2026-07-20 (provider-aware model routing)
 
 ### ✅ run.provider context attribute + provider-aware A/B rules

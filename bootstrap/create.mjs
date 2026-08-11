@@ -16,7 +16,7 @@ import { stdin, stdout } from "node:process";
 
 /**
  * Pick the Phase 1 execution provider. Non-interactive override:
- * `--provider cursor` / `--provider=cursor` or AUTOFACTORY_PROVIDER=cursor.
+ * `--provider cursor` / `--provider=bedrock` or AUTOFACTORY_PROVIDER=cursor.
  * Interactive (TTY): prompt. Default: anthropic.
  */
 async function chooseProvider() {
@@ -25,20 +25,26 @@ async function chooseProvider() {
     process.argv.find((a) => a.startsWith("--provider="))?.split("=")[1] ??
     (i !== -1 ? process.argv[i + 1] : undefined);
   const want = (fromArg ?? process.env.AUTOFACTORY_PROVIDER ?? "").trim().toLowerCase();
-  if (want === "anthropic" || want === "cursor") return want;
+  if (want === "anthropic" || want === "cursor" || want === "bedrock") return want;
   if (!stdin.isTTY) return "anthropic"; // non-interactive default
   const { createInterface } = await import("node:readline/promises");
   const rl = createInterface({ input: stdin, output: stdout });
-  const ans = (await rl.question("Phase 1 execution provider — [a]nthropic direct (default) or [c]ursor? "))
+  const ans = (await rl.question("Phase 1 execution provider — [a]nthropic direct (default), [b]edrock, or [c]ursor? "))
     .trim()
     .toLowerCase();
   rl.close();
-  return ans.startsWith("c") ? "cursor" : "anthropic";
+  return ans.startsWith("c") ? "cursor" : ans.startsWith("b") ? "bedrock" : "anthropic";
 }
+
+const PROVIDER_LABELS = {
+  anthropic: " (direct Anthropic API)",
+  bedrock: " (Claude via Amazon Bedrock)",
+  cursor: " (Cursor agents via @cursor/sdk)",
+};
 
 console.log("LaunchDarkly Auto-Factory bootstrap\n");
 const provider = await chooseProvider();
-console.log(`Provider: ${provider}${provider === "anthropic" ? " (direct Anthropic API)" : " (Cursor agents via @cursor/sdk)"}\n`);
+console.log(`Provider: ${provider}${PROVIDER_LABELS[provider] ?? ""}\n`);
 
 // 1. Ensure build output exists before importing built packages.
 if (!existsSync("packages/config-bridge/dist/cli.js") || !existsSync("packages/shared/dist/index.js")) {
@@ -78,8 +84,25 @@ if (hasSource) {
 }
 
 // 4. Remaining manual steps (tailored to the chosen provider).
+const bedrockSteps = `
+Next steps (provider: bedrock):
+  1. Copy bootstrap/github-action-template/auto-factory.yml → .github/workflows/ in your app repo
+     (set <owner> to the repo hosting this action). The drop-in form works for Bedrock.
+  2. Serve 'bedrock' from the auto-factory-ai-provider flag in your factory project.
+  3. Add repo secrets:    LD_SDK_KEY, LD_API_KEY, and AWS credentials with Bedrock model access
+     (either AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY passed via the aws_* action inputs,
+      or an OIDC role via aws-actions/configure-aws-credentials — then no key secrets needed).
+     Add repo variable:   LD_APP_PROJECT_KEY  (e.g. autofactory-demo)
+     Set the region:      aws_region input (or AWS_REGION env), e.g. us-east-1
+     (GITHUB_TOKEN is provided automatically. For Phase 2, also add BEACON_WEBHOOK_SECRET.)
+  4. Open a PR. Phase 1 runs automatically (LLM Observability is on — DISABLE_LD_OBSERVABILITY to opt out).
+  NOTE: the agents' LD-configured Anthropic model names map to Bedrock ids automatically
+  (claude-… → anthropic.claude-…); make sure those models are enabled for your AWS account/region.`;
+
 const steps =
-  provider === "cursor"
+  provider === "bedrock"
+    ? bedrockSteps
+    : provider === "cursor"
     ? `
 Next steps (provider: cursor):
   1. Copy bootstrap/github-action-template/auto-factory-cursor.yml → .github/workflows/ in your
