@@ -343,18 +343,42 @@ describe("triggerRelease — boolean noop guard", () => {
 // Every other guard misses it. The noop guard needs served === target. findActiveRelease
 // only sees running releases. findLatestRelease sees NOTHING when v2 arrived via an
 // `immediate` or `prerequisites` release, which create no AutomatedRelease record.
+//
+// The two backwards moves get DIFFERENT answers, which is the correction round eleven made:
+// behind-the-lineage is MOOT (final `noop` — the work already happened and then some, so the
+// ledger must stop tracking it), while leaving-the-lineage is a REFUSAL (`held` — a human has
+// to decide). Answering `held` for the moot case is what starved newer manifests forever: a
+// held entry never clears, and it used to claim the flag's only per-notification action slot.
 // ---------------------------------------------------------------------------
 describe("triggerRelease — lineage regression guard", () => {
   const servingV2 = () =>
     mvFlag(["control", "v1", "v2"], { on: true, offVariation: 0, fallthrough: { variation: 2 } });
 
-  it("HOLDS instead of rolling production back from v2 to v1", async () => {
+  it("a target BEHIND what is served is MOOT: final noop, not a hold", async () => {
+    // `held` would be the wrong shape twice over: it is not "release this later" (it must never
+    // release), and non-final means the ledger re-checks it on every deploy forever.
     const { ld, patches } = fakeLd({ "enable-x": servingV2() });
     const r = await triggerRelease(ld, discovered({ targetVariation: "v1" }), "production");
-    assert.equal(r.method, "held");
+    assert.equal(r.method, "noop", "final, so recordOutcome clears the ledger entry");
     assert.match(String(r.note), /BACKWARDS/);
-    assert.match(String(r.note), /superseded/);
+    assert.match(String(r.note), /SUPERSEDED/);
     assert.deepEqual(patches, [], "THE DISCRIMINATOR: no startAutomatedRelease at all");
+  });
+
+  it("HOLDS a target that would LEAVE the lineage — an automated un-release", async () => {
+    // The only backwards move that was unguarded, and the most destructive: served v2, manifest
+    // asks for `control`, so a progressive rollout ramps production back to the original
+    // behaviour and reports it as a release. `control` has no lineage index, so the
+    // behind-the-lineage comparison above cannot see it.
+    //
+    // `held`, not `noop`: unlike a superseded manifest this request is not already satisfied. It
+    // is one we refuse, and a deliberate rollback is LaunchDarkly's job.
+    const { ld, patches } = fakeLd({ "enable-x": servingV2() });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "control" }), "production");
+    assert.equal(r.method, "held", "a refusal needs a human, so it must NOT be final");
+    assert.match(String(r.note), /NOT IN THE LINEAGE/);
+    assert.match(String(r.note), /LaunchDarkly's job/);
+    assert.deepEqual(patches, [], "THE DISCRIMINATOR: no rollout from v2 back to control");
   });
 
   it("still releases FORWARD along the lineage", async () => {
@@ -373,14 +397,26 @@ describe("triggerRelease — lineage regression guard", () => {
     assert.equal(r.method, "noop", "equal is noop, not a regression");
   });
 
-  it("does not apply to non-lineage variations", async () => {
-    // control → v1 is forward; a hand-named variation has no lineage index at all, so the
-    // guard must stay out of the way rather than guessing an order.
+  it("releases normally out of a non-lineage SERVED variation", async () => {
+    // control → v1 is the first release of every flag, and `control` has no lineage index — so
+    // the guard keys off the SERVED side being in the lineage. When it isn't, there is no
+    // backwards to refuse and nothing to guess an order about.
     const { ld, patches } = fakeLd({
       "enable-x": mvFlag(["control", "v1"], { on: true, offVariation: 0, fallthrough: { variation: 0 } }),
     });
     const r = await triggerRelease(ld, discovered({ targetVariation: "v1" }), "production");
     assert.notEqual(r.method, "held");
     assert.ok(patches.length > 0);
+  });
+
+  it("holds a hand-named target out of a lineage-served flag, rather than guessing its order", async () => {
+    // Same refusal as `control`: from v1, "experiment-a" is neither forward nor backward, and
+    // guessing is how an environment gets moved off the released lineage unattended.
+    const { ld, patches } = fakeLd({
+      "enable-x": mvFlag(["control", "v1", "experiment-a"], { on: true, offVariation: 0, fallthrough: { variation: 1 } }),
+    });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "experiment-a" }), "production");
+    assert.equal(r.method, "held");
+    assert.deepEqual(patches, []);
   });
 });

@@ -69,12 +69,14 @@ interface FlagVariations {
 export interface TriggerResult {
   flagKey: string;
   /**
-   * The release method used, or an intent outcome: "held" (releaseIntent said
-   * hold/manual, a future notBefore, a not-yet-executable ask like segments, or
-   * an unintelligible intent — fail-closed) / "prerequisites" (flag turned on
-   * behind LD prerequisites; it releases when its parents do) / "noop" (the
-   * target variation is already what the environment serves — e.g. a re-deploy
-   * after the release completed).
+   * The release method used, or an intent outcome:
+   *  - "held" — NOT FINAL, so the ledger keeps re-checking it: releaseIntent said hold/manual,
+   *    a future notBefore, a not-yet-executable ask like segments, an unintelligible intent
+   *    (fail-closed), or a target that would leave the vN lineage altogether.
+   *  - "prerequisites" — flag turned on behind LD prerequisites; it releases when its parents do.
+   *  - "noop" — FINAL: there is nothing left for this manifest to release. Either the target is
+   *    already what the environment serves (a re-deploy after the release completed), or a NEWER
+   *    variation of the same lineage superseded it.
    */
   method: ReleaseKind | "held" | "prerequisites" | "noop";
   note?: string;
@@ -221,17 +223,42 @@ export async function triggerRelease(
     // older manifest's intent from `hold` to `auto` — the documented way to release held work
     // — and without this guard Beacon starts a progressive rollout from v2 back to v1 and
     // reports it as a successful release.
+    //
+    // The two backwards moves are NOT the same answer, and calling them both `held` was the
+    // defect this replaced:
+    //
+    //  - BEHIND the lineage (target vN, served vM, N < M) is MOOT. Its work has already
+    //    happened and then some, so it is FINAL (`noop`): `recordOutcome` clears the ledger
+    //    entry and the manifest stops being re-checked. As `held` it stayed pending forever
+    //    AND — because a non-writing return used to claim the per-notification action slot —
+    //    starved every newer, releasable manifest for the same flag. Deadlock, zero releases.
+    //  - LEAVING the lineage (served vM, target has no lineage index at all — `control`, or a
+    //    hand-named variation) is a REFUSAL, so it stays `held` and needs a human. This is the
+    //    most destructive backwards move and until now the only unguarded one: it starts a
+    //    rollout from v2 to `control`, i.e. an automated un-release, reported as success.
     const servedIndex = variationLineageIndex(originalVar.value);
     const targetIndex = variationLineageIndex(targetVar.value);
     if (servedIndex !== undefined && targetIndex !== undefined && targetIndex < servedIndex) {
       return {
         flagKey: flag.flagKey,
+        method: "noop",
+        note:
+          `'${environmentKey}' already serves '${String(originalVar.value)}' and this manifest asks for ` +
+          `'${String(targetVar.value)}' — releasing would move users BACKWARDS along the lineage. A NEWER ` +
+          `VARIATION SUPERSEDED this manifest, so its work is moot and nothing is left to release: dropped ` +
+          `rather than held, because holding it would wait for a release that must never happen.`,
+      };
+    }
+    if (servedIndex !== undefined && targetIndex === undefined) {
+      return {
+        flagKey: flag.flagKey,
         method: "held",
         note:
           `'${environmentKey}' already serves '${String(originalVar.value)}' and this manifest asks for ` +
-          `'${String(targetVar.value)}' — releasing would move users BACKWARDS along the lineage. Held, not ` +
-          `released: a newer variation superseded this manifest. Delete or update it, or release the newer ` +
-          `one; nothing here can decide that.`,
+          `'${String(targetVar.value)}', which is NOT IN THE LINEAGE — releasing would move users OFF the ` +
+          `released lineage with no way to tell whether that is forward or backward. Held for a human: a ` +
+          `deliberate rollback is LaunchDarkly's job (revert the release, or serve the variation directly), ` +
+          `not a deploy notification's.`,
       };
     }
     if (originalVar._id === targetVar._id) {
