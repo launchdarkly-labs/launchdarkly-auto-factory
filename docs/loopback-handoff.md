@@ -1,14 +1,22 @@
 # `loopback-support` — working notes for whoever picks this up
 
-**Status as of 2026-08-11 (round 6):** 84 commits ahead of `main`, 78 files, +15709/−449.
-**687/687 tests**, and `npm run typecheck`, `npm run check:configs` and `npm run check:public` all
-clean. HEAD is `36b6282`, and **the branch is fully pushed** (`origin/loopback-support` == HEAD, 0
-ahead / 0 behind). **No PR exists yet**, and the graph is still not provisioned — both remain the
-owner's call.
+**Status as of 2026-08-11:** the editorial pass after round 6 is the tip, and **the branch is fully
+pushed**. **No PR exists yet**, and the graph is still not provisioned — both remain the owner's call.
 
-This header was stale for two rounds (it claimed `3324b40`, 674 tests and "46 commits unpushed"
-after two rounds had been committed and pushed), which is worth more than the numbers: a reader
-checking whether the working notes are current starts here.
+Measure the rest rather than reading it here, because every number this header used to carry went
+stale, twice:
+
+```
+git rev-list --left-right --count origin/loopback-support...HEAD   # pushed?  → 0 0
+git rev-list --count main..HEAD ; git diff --shortstat main..HEAD  # size
+npm test ; npm run typecheck ; npm run check:configs ; npm run check:public
+gh pr list --head loopback-support --state all                    # PR?     → empty
+```
+
+The header first claimed `3324b40`, 674 tests and "46 commits unpushed" after two rounds had been
+committed and pushed; the fix for that then pinned its own parent's hash and commit count in a commit
+that added another commit, 187 insertions and a test — stale before it was written. A reader checking
+whether these notes are current starts here, so this section names rounds, never hashes or counts.
 
 This file exists because the git log and `docs/loop-seam.md` carry the architecture and the
 reasoning, but three things live nowhere durable: **the open findings**, **the decisions and why
@@ -223,7 +231,8 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
 
 §4.1–§4.6 are done and the branch is pushed, so what is left is review and release:
 
-1. **Regenerate the PR body from the git log** (84 commits). The old draft is gone; do not hunt for it.
+1. **Regenerate the PR body from `git log main..HEAD`** — from the log itself, not from any count
+   written down here, for the reason in the header. The old draft is gone; do not hunt for it.
 2. **Open the PR and get human review.** This is the owner's call, not an agent's.
 3. **Then** provision the graph (`npm run bridge -- upgrade`) — still held until after approval, for
    the reason in §2: the walker executes the graph LaunchDarkly serves, which has neither loop edge

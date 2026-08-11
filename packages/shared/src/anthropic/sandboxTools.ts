@@ -417,7 +417,10 @@ const FULL_ALLOCATION = 100_000;
  * WHY THIS IS CHECKED AT AUTHORING TIME. `stages` is a MACHINE field that reaches LaunchDarkly
  * unvalidated: `trigger.ts` passes it straight into the `startAutomatedRelease` instruction, and LD
  * answers a bad stage set with a 400. Beacon now RECOVERS from that (it reports `held` and leaves
- * the flag's action slot free for a sibling instead of treating the rejection as a lost write), but
+ * the flag's action slot free for a sibling instead of treating the rejection as a lost write —
+ * true of THIS refusal because a `stages` 400 can only reach the release-start patch, whose body
+ * carries manifest content; `PATCH_SITES` in `trigger.ts` has the one patch where a `held` refusal
+ * claims the slot instead), but
  * a refused manifest is still a release that did not happen and a human who has to work out why —
  * so the agent path must not write one silently. Defence in depth, not a substitute: the file is
  * hand-editable in git, which is why both ends exist.

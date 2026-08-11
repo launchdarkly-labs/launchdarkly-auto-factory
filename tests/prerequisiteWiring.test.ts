@@ -299,11 +299,13 @@ describe("write_manifest: releasePlan.prerequisites is a machine field", () => {
 // live rejection, "stage allocation must not exceed 50%"), so a 100% guarded stage is a permanent
 // 400 on that one manifest.
 //
-// Beacon now RECOVERS from that: the rejection is reported `held` and the flag's action slot is
-// left free (see `PATCH_FAILURE_TAXONOMY` in `packages/beacon/src/trigger.ts` for which rejections
-// qualify and why). This is the other end — authoring-time defence in depth, so the agent path
-// cannot commit the manifest that needs recovering. Both ends exist because `.release-flags/` is
-// hand-editable in git.
+// Beacon now RECOVERS from that: the rejection is reported `held` and the flag's action slot is left
+// free — which holds for a `stages` 400 because it can only reach the release-start patch, whose body
+// carries manifest content. `PATCH_FAILURE_TAXONOMY` in `packages/beacon/src/trigger.ts` says which
+// rejections are `held`; `PATCH_SITES` beside it says which patch is the exception where a `held`
+// refusal claims the slot anyway. This is the other end — authoring-time defence in depth, so the
+// agent path cannot commit the manifest that needs recovering. Both ends exist because
+// `.release-flags/` is hand-editable in git.
 // ---------------------------------------------------------------------------
 describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be asked for", () => {
   const root = mkdtempSync(join(tmpdir(), "af-manifest-stages-"));

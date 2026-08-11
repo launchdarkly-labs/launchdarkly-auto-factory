@@ -76,13 +76,14 @@ const manifest = (targetVariation?: string, extra: Record<string, unknown> = {})
 function ghWith(files: string[], manifests: Record<string, unknown>): GitHubClient {
   return {
     /**
-     * The SAME listing at every sha, which is the shape discovery can never re-surface — and the
-     * reason a test that wants to exercise the LEDGER has to silence it. Discovery diffs this listing
-     * between two shas, so a fixed listing means "nothing added", except on the first-ever deploy
-     * where there is no previous sha and everything counts as new. A second `post()` on the same
-     * harness therefore still runs the DISCOVERED pass over both manifests, which let one test claim
-     * it was proving something about a held ledger entry when the discovered pass produced the same
-     * outcomes on its own. Use `ghAt` when that distinction matters.
+     * The SAME listing at every sha, which is the shape discovery can never re-surface. Discovery
+     * diffs this listing between two shas, so a fixed listing means "nothing added", except on the
+     * first-ever deploy where there is no previous sha and everything counts as new. So a second
+     * `post()` on the SAME harness discovers nothing and reaches only the pending pass — `ghWith` is
+     * already ledger-only from the second deploy on. What proved nothing was an earlier version of
+     * that test which built a FRESH harness for the second deploy: there `previousSha` is undefined,
+     * everything counts as new again, and the discovered pass reproduced the outcomes on its own.
+     * `ghAt` makes the distinction explicit rather than resting on the store's previous sha.
      */
     async listDir(): Promise<string[]> {
       return files;
@@ -764,12 +765,13 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
       [path(50), path(51)],
     );
 
-    // THE SAME HARNESS, AND A SHA THAT DISCOVERS NOTHING. Two earlier versions of this continuation
-    // proved nothing: the first built a fresh harness with an empty ledger, and the second reused this
-    // harness but kept `ghWith`'s fixed listing, so the DISCOVERED pass re-processed both manifests and
-    // produced these same outcomes without the ledger contributing anything. A reviewer showed that by
-    // reverting the arm and watching all three assertions still pass. With `sha2`'s listing empty, the
-    // pending pass is the only path that can produce them.
+    // THE SAME HARNESS, AND A SHA THAT DISCOVERS NOTHING. One earlier version of this continuation
+    // proved nothing: it built a FRESH harness for the second deploy, where `previousSha` is undefined,
+    // so everything counted as new and the DISCOVERED pass reproduced these outcomes without the ledger
+    // contributing anything — a reviewer showed that by reverting the arm and watching all three
+    // assertions still pass. Reusing this harness is what fixes it, because the store's `sha1` makes the
+    // second deploy discover nothing; `sha2`'s empty listing states that in the fixture instead of
+    // leaving it resting on the store, which is the same reason the taxonomy became data.
     state.patchRejects = undefined;
     const r2 = await h.post("sha2");
     assert.equal(outcomeFor(r2.json, 50).action, "released", "the held entry re-evaluates and pr-50 releases");
