@@ -122,9 +122,24 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     store.record(n.service, n.environment, n.sha);
 
     const outcomes: FlagOutcome[] = [];
-    // Set ONLY when the idempotency check could not be verified. That is the one case
-    // that answers retriably (503 → the provider redelivers), because it is the one case
-    // where we know nothing was started.
+    // Set ONLY when the idempotency check could not be verified: the one case where we
+    // know nothing was started, so answering 503 cannot cause a duplicate release.
+    //
+    // READ THIS BEFORE RELYING ON THE 503. It is a REFUSAL, not a retry. Nothing in the
+    // shipped configuration redelivers it:
+    //
+    //  - the Notifier (`auto-factory-notify`, notify.ts) is non-blocking BY CONTRACT so it
+    //    can never fail a deploy: a non-2xx becomes one `console.warn` and `exit 0`. No
+    //    retry, and the status reaches no operator.
+    //  - Railway's own webhooks document no retry policy, backoff, or delivery guarantee
+    //    (docs.railway.com/observability/webhooks), so that path must not be relied on
+    //    either.
+    //
+    // The 503 is still correct — it refuses to guess "no active release" and write, which
+    // is what caused a double-start — and it works for any CD system that does retry, which
+    // the provider-agnostic /flag-releases contract invites. But recovery today is a HUMAN
+    // re-POST, and the re-evaluation ledger (docs/loop-seam.md) is the only thing that would
+    // make it automatic.
     //
     // Deliberately NOT set by the other two unfinished outcomes — an incomplete fullstack
     // readiness check, and a trigger that threw. Both were briefly made retriable and then
@@ -209,13 +224,15 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         } catch (e) {
           guardUnverifiable = true;
           console.warn(
-            `[beacon] idempotency check failed for '${flag.flagKey}' — release NOT started (retriable): ${String(e)}`,
+            `[beacon] idempotency check failed for '${flag.flagKey}' — release NOT started. Answering 503, but ` +
+              `NOTHING RETRIES THAT AUTOMATICALLY (the Notifier logs and exits 0; Railway documents no retry): ` +
+              `re-POST /flag-releases for this service to retry. Cause: ${String(e)}`,
           );
           outcomes.push({
             flag: flag.flagKey,
             scope,
             action: "error",
-            detail: `idempotency check failed — release NOT started; redeliver this notification to retry: ${String(e)}`,
+            detail: `idempotency check failed — release NOT started (answered 503; nothing retries this automatically, re-POST to retry): ${String(e)}`,
           });
           continue;
         }
@@ -285,10 +302,12 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     }
 
     return {
-      // 503 ONLY when an idempotency check could not be verified — nothing was started,
-      // so redelivery is safe and is how it gets retried. Every other unfinished outcome
-      // acks 200 and strands (see guardUnverifiable above): a redelivery can re-release a
-      // flag LaunchDarkly already reverted, which is worse than a strand a human can fix.
+      // 503 ONLY when an idempotency check could not be verified — the one case where
+      // nothing was started, so a retry (whoever performs it) cannot duplicate a release.
+      // It is an honest status, not a working retry: see guardUnverifiable above for why
+      // nothing in the shipped configuration redelivers it. Every other unfinished outcome
+      // acks 200 and strands, because a redelivery can re-release a flag LaunchDarkly
+      // already reverted, which is worse than a strand a human can fix.
       status: guardUnverifiable ? 503 : 200,
       body: {
         service: n.service,

@@ -98,7 +98,7 @@ that moment never gets another.
 |---|---|---|
 | `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | manual re-POST |
 | `waiting` | the fullstack counterpart **definitively** hasn't deployed — the readiness check is tri-state, so this is now a real verdict rather than a shrug | the other side's deploy notification re-evaluates; if lost, manual re-POST |
-| `error`, idempotency guard unverifiable | the read that would prove no release is running failed | **503 → provider redelivery** (automatic — the one case where we know nothing was started) |
+| `error`, idempotency guard unverifiable | the read that would prove no release is running failed | 503 — but see below: **no automatic retry exists**, so manual re-POST |
 | `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | manual re-POST — but it is now *diagnosed* as unverified instead of reported as "not deployed" |
 | `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | manual re-POST |
 | paused release resumed late | monitoring stopped at the deadline | manual re-POST → `noop` → children repointed |
@@ -118,9 +118,29 @@ is a filename diff, so a file present at both SHAs is never rediscovered, and tw
 indefinitely. The gap is that this requires a human who knows to do it, and the two 200-acked
 paths above mean nobody is told that they should.
 
-Two retriable paths exist, both deliberate and both narrow: the idempotency-guard **503**, and a
-**502 on discovery failure** which does not record the SHA so the next notification re-diffs the
-same range (`server.ts:103-107`). The ledger generalises what those two do case-by-case.
+### There is no automatic retry anywhere in Phase 2
+
+This was checked, and it is the single most important fact on this page. Two paths *answer*
+retriably — the idempotency-guard **503**, and a **502 on discovery failure** which does not
+record the SHA so a later notification re-diffs the same range. Neither is retried by anything:
+
+- **The Notifier** (`auto-factory-notify`, `notify.ts`) is the demo's delivery path, run as a
+  post-deploy step. It is **non-blocking by contract** so it can never fail a deploy: a
+  non-2xx becomes one `console.warn` and `exit 0`. That property is correct — flag automation
+  must not break deploys — but it means the status code reaches no operator, no alert, and no
+  dashboard.
+- **Railway's webhooks** (the other path) document no retry policy, no backoff, and no
+  delivery guarantee. Undocumented retry is no retry.
+
+So a 5xx from Beacon is an honest **refusal**, not a recovery mechanism. It remains the right
+answer — it cannot duplicate a release, and it works for any CD system that does retry, which
+the provider-agnostic `/flag-releases` contract invites — but recovery today is a human
+re-POST, by a human who was never told.
+
+This re-ranks everything below. The ledger is not an improvement on provider redelivery; **it
+is the only recovery mechanism Phase 2 would have.** And the case for making the Notifier
+distinguish a 5xx from a lost deploy — logging loudly, or surfacing somewhere an operator
+looks — is now independent of it.
 
 **Why the other unfinished outcomes are NOT retriable — the decision worth knowing.** Round
 seven made the readiness check and a trigger throw answer 503 as well. Round eight falsified the
@@ -140,12 +160,11 @@ readiness check is now *diagnosed* as unverified rather than misreported as "the
 hasn't deployed", and every stranding log states the recovery action. What it costs is that
 nobody is *told* automatically, which is the ledger's job.
 
-Two further reasons redelivery is a weak foundation here, both worth checking before anyone
-revisits this: a 503'd SHA **is still recorded** (`server.ts` records before evaluating
-outcomes), so one intervening deploy makes the redelivery diff a range where the manifest exists
-at both ends — it discovers nothing and acks 200; and **Railway, the only adapter in the repo,
-is not known to redeliver on failure at all**, which would make every "retriable" answer here
-aspirational for the deployed provider. Verify that before relying on it.
+One further reason redelivery is a weak foundation, and it would bite even a CD system that
+*does* retry: a 5xx'd SHA **is still recorded** (`server.ts` records before evaluating
+outcomes), so one intervening deploy makes the retry diff a range where the manifest exists at
+both ends — it discovers nothing and acks 200. The retry mechanism defeats itself on the second
+deploy.
 
 **This is the gap that is already causing harm**, and it is the only silent one. It is also
 the one this branch made worse, correctly: refusing free-form dates puts more manifests into

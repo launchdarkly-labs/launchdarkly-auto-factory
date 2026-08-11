@@ -360,22 +360,32 @@ describe("beacon: fullstack readiness check failure", () => {
 // The idempotency guard must FAIL CLOSED. It used to be `.catch(() => null)`, which
 // answered "does this flag already have an active release?" with "no" whenever the read
 // failed — and then performed a write. Read failures cluster during rate limiting and
-// outages, which is exactly when providers redeliver.
+// outages, so the wrong answer arrived exactly when it did the most damage.
+//
+// The 503 is a REFUSAL, not a working retry: the Notifier logs a non-2xx and exits 0, and
+// Railway documents no webhook retry, so recovery is a human re-POST. The status is still
+// right — it cannot duplicate a release, and it works for a CD system that does retry —
+// but the outcome must not promise an automatic one.
 // ---------------------------------------------------------------------------
 describe("beacon: idempotency guard failure", () => {
   const harnesses: Harness[] = [];
   after(() => harnesses.forEach((h) => h.close()));
 
-  it("starts NOTHING and answers retriably when the guard read fails", async () => {
+  it("starts NOTHING and answers 503 when the guard read fails", async () => {
     const h = await startHarness({}, { releasesListThrows: true });
     harnesses.push(h);
     const res = await h.post("/flag-releases", { service: "demo-backend", sha: "sha1", environment: "production" });
-    // 503, not 200: the work is unfinished, and redelivery is how it gets retried.
+    // 503, not 200: the work is unfinished and nothing was started.
     assert.equal(res.status, 503);
     const outcome = res.json.outcomes[0];
     assert.equal(outcome.action, "error");
     assert.match(String(outcome.detail), /NOT started/);
-    assert.match(String(outcome.detail), /redeliver/);
+    assert.match(String(outcome.detail), /re-POST/, "the recovery action must be stated, not implied");
+    assert.doesNotMatch(
+      String(outcome.detail),
+      /redeliver this notification to retry/,
+      "must not promise a redelivery that nothing performs",
+    );
     // THE DISCRIMINATOR: no write happened. Under `.catch(() => null)` triggerRelease runs
     // and records a startAutomatedRelease patch, and the status is 200.
     assert.deepEqual(h.patches, []);
