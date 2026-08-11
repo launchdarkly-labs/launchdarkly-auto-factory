@@ -188,6 +188,42 @@ describe("repointDependentPrerequisites", () => {
     assert.equal(patches.length, 0);
   });
 
+  it("an UNTAGGED child pinned to vN gets the BACKWARDS message, not the re-point-it-manually one", async () => {
+    // PINS THE ORDER OF TWO SKIP GUARDS, which no other test does — the backwards check sits ahead of
+    // the `auto-factory` tag check, and moving it below failed NO test before this one.
+    //
+    // Both orders skip the write, so nothing detectable changes about behaviour; what changes is what
+    // the operator is TOLD. The parent serves `control` with a child pinned to `v1`, which is a
+    // human's deliberate rollback (`trigger.ts` recommends serving an earlier variation directly, and
+    // `findLatestRelease` still reports the old release `completed`, so every caller's gate passes).
+    //
+    //  - current order: "repointing would move this child BACKWARDS ... satisfying the prerequisite
+    //    here would take the child live at 100% with no rollout. Repoint it by hand if that is really
+    //    what is wanted." — a warning, with the consequence named.
+    //  - flipped: "not auto-factory-tagged — re-point it manually if it should follow 'control'",
+    //    which is ADVICE TO DO THE DESTRUCTIVE THING. Following it un-darks the child at 100% of
+    //    traffic, as a consequence of a rollback.
+    //
+    // So a refactor that reorders these guards cannot silently invert the advice.
+    const { ld, patches } = fakeLd(
+      {
+        "enable-x": mvFlag(["control", "v1", "v2"], { on: true, offVariation: 0, fallthrough: { variation: 0 } }),
+        "child-human": child(1, ["hand-built"]),
+      },
+      { dependents: ["child-human"] },
+    );
+    const outcomes = await repointDependentPrerequisites(ld, "enable-x", "production");
+    assert.deepEqual(outcomes.map((o) => o.action), ["skipped"]);
+    assert.match(outcomes[0]!.detail, /BACKWARDS/, "THE DISCRIMINATOR: the backwards guard answered first");
+    assert.match(outcomes[0]!.detail, /100% with no rollout/, "so the consequence is named");
+    assert.doesNotMatch(
+      outcomes[0]!.detail,
+      /re-point it manually if it should follow/,
+      "and the operator is NOT advised to make the child follow a rolled-back parent by hand",
+    );
+    assert.equal(patches.length, 0, "either way nothing is written — the message is the whole difference");
+  });
+
   it("boolean parents and off parents are no-ops", async () => {
     const boolParent = {
       variations: [{ _id: "t", value: true }, { _id: "f", value: false }],

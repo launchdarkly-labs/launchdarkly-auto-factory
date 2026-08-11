@@ -146,13 +146,20 @@ export function describeNotifyResult(input: {
     // release, which is what `terminalHistoryRefusal`'s own detail asks for.
     const refused = stranded.filter((o) => o.needsHuman === true);
     if (refused.length > 0) {
+      // AGREES WITH ITS OWN COUNT. This read "N of those is marked needsHuman ... re-trigger it",
+      // which is wrong for every N > 1 — and N > 1 is the ordinary case, not the edge one:
+      // `config/services.yaml` puts four `side: backend` services on one repo, so one merge produces
+      // four notifications discovering the same manifest, and a later revert marks every kept entry.
+      const one = refused.length === 1;
       lines.push(
-        `  ${refused.length} of those is marked needsHuman: Beacon will NOT re-trigger it while the ` +
-          `flag's newest release is terminal without having completed (reverted / monitoring_stopped), ` +
-          `because re-releasing would undo a guardrail's rollback. That is re-decided on every deploy, ` +
-          `so it clears by itself as soon as the flag's newest release is no longer in that state — ` +
-          `deploy the fix as a new commit to start a fresh release, or resume a monitoring_stopped one. ` +
-          `A REVERTED release never becomes 'completed', so waiting for completion is not a way out.`,
+        `  ${refused.length} of those ${one ? "is" : "are"} marked needsHuman: Beacon will NOT ` +
+          `re-trigger ${one ? "it" : "them"} while ${one ? "the flag's" : "each flag's"} newest release ` +
+          `is terminal without having completed (reverted / monitoring_stopped), because re-releasing ` +
+          `would undo a guardrail's rollback. That is re-decided on every deploy, so ` +
+          `${one ? "it clears by itself" : "each clears by itself"} as soon as that flag's newest ` +
+          `release is no longer in that state — deploy the fix as a new commit to start a fresh ` +
+          `release, or resume a monitoring_stopped one. A REVERTED release never becomes 'completed', ` +
+          `so waiting for completion is not a way out.`,
       );
     }
     for (const o of stranded) {

@@ -1121,8 +1121,11 @@ describe("the ledger repoints only once the release has stopped moving", () => {
 
   it("still repoints when NOTHING is running — the gate is exactly `!active`", async () => {
     // The control arm. Same fixture, one release removed, so ACTIVENESS is the only thing that
-    // varies between this test and the one above — which is what makes the gate discriminated:
-    // delete it and the test above fails, widen it and this one does.
+    // varies between this test and the one above — which is what makes the gate discriminated in
+    // both directions: DELETE OR WIDEN the gate (repoint even while a release is running) and the
+    // test above fails; NARROW it (never repoint) and this one does. Stated backwards before —
+    // "widen it and this one does" — which named the wrong arm for the wrong direction, and would
+    // have sent anyone using this comment to check the harmless failure.
     //
     // The destination is now a legitimate one (`control` → `v2`, forward), so this also pins that
     // the new lineage guard does not block the ordinary case.

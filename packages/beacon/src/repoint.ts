@@ -108,6 +108,16 @@ export async function repointDependentPrerequisites(
         // forward mid-rollout hazard (repointing to the arm a running release is ramping away from)
         // is not: `AutomatedRelease` carries no target variation, but `pinned` and `serving` are
         // both already in hand.
+        //
+        // IT MUST STAY ABOVE THE `auto-factory` TAG CHECK, and that ordering is load-bearing for the
+        // MESSAGE rather than for the write — which is why nothing caught it until a test did (see
+        // "an UNTAGGED child pinned to vN gets the BACKWARDS message" in triggerMultivariate.test.ts).
+        // Either order skips the patch, so an untagged child pinned to `vN` under a rolled-back parent
+        // is safe either way. But below the tag check it is told "not auto-factory-tagged — re-point it
+        // manually if it should follow 'control'", which is ADVICE TO DO THE DESTRUCTIVE THING: a human
+        // following it satisfies the prerequisite and takes a dark child live at 100% with no rollout,
+        // as a consequence of a rollback. The backwards refusal has to be the answer whenever it
+        // applies, because it is the one that names the consequence.
         const pinnedIndex = variationLineageIndex(pinned?.value);
         const servingIndex = variationLineageIndex(serving.value);
         if (pinnedIndex !== undefined && (servingIndex === undefined || servingIndex < pinnedIndex)) {

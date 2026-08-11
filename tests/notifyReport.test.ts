@@ -113,6 +113,29 @@ describe("describeNotifyResult", () => {
     );
   });
 
+  it("the needsHuman paragraph agrees with its own count when more than one is refused", () => {
+    // PREVENTS "3 of those IS marked needsHuman ... will NOT re-trigger IT". Not a pedantic point:
+    // N > 1 is the ORDINARY case. `config/services.yaml` registers four `side: backend` services on
+    // one repo, so one merge produces four notifications that discover the same manifest — one
+    // releases, three are kept — and a later revert marks every kept entry. The singular text then
+    // read as though a single flag were affected, understating the blast radius on the exact deploy
+    // where an operator is counting what broke.
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "a", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "rel-1 'reverted'", needsHuman: true },
+        { flag: "b", sourceFile: ".release-flags/pr-2.json", action: "error", detail: "rel-2 'reverted'", needsHuman: true },
+        { flag: "c", sourceFile: ".release-flags/pr-3.json", action: "error", detail: "rel-3 'reverted'", needsHuman: true },
+      ]),
+    });
+    const text = r.lines.join("\n");
+    assert.match(text, /3 of those are marked needsHuman/, "THE DISCRIMINATOR: plural subject");
+    assert.match(text, /re-trigger them/, "and a plural object, since three flags are refused");
+    assert.doesNotMatch(text, /of those is marked/, "no singular verb on a plural count");
+    assert.doesNotMatch(text, /re-trigger it while/, "and no singular pronoun either");
+  });
+
   it("does not tell an operator to wait for a REVERTED release to complete", () => {
     // PREVENTS advising a wait that can never end. The paragraph named three clearing paths —
     // "completed, replaced, or the flag moves on" — and for the commonest cause the first is
