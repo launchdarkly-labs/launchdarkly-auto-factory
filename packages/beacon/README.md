@@ -132,9 +132,11 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
   holds for these multi-instruction patches because LD documents that *"semantic patches are not
   applied partially"*. The sibling can still release in this same notification.
   Classified on `LdApiError.status`, never on message text, and the classifier is an
-  **allowlist** — `{400}`, the content rejection LD documents on
-  `PATCH /api/v2/flags/{proj}/{flag}`. It was a *denylist* ("any 4xx except 401/403/408/429"),
-  which mislabelled three of the six responses LD documents there (400, 401, 404, 405, 409, 429):
+  **allowlist** — `{400, 422}`. It was a *denylist* ("any 4xx except 401/403/408/429"), which
+  mislabelled three statuses; the first allowlist then **under**-claimed, because it was derived by
+  asking "what does this ENDPOINT document?" (six statuses) when LaunchDarkly's error table is **API-WIDE**, not per-endpoint, and the row that describes a patch body is **422** ("the update description can not be understood… Ensure that the request body is correct for the type of patch you are using, either JSON patch or semantic patch"). So the allowlist is `{400, 422}`. The mistake was
+  in the question, not the answer — the right one is "what does LaunchDarkly document for a malformed
+  semantic patch?". The three the denylist got wrong:
   - **409** "Status conflict" is transient (LD's own remediation is *"Retry your request"*), and
     misclassifying it **changed production behaviour** — `held` leaves the flag's action slot
     open, so a sibling wanting an *earlier* variation rolled out spuriously.

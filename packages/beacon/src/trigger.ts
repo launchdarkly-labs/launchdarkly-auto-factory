@@ -51,9 +51,26 @@ const DEFAULT_RANDOMIZATION_UNIT = "user";
  * manifest — is the honest answer.
  *
  * AN ALLOWLIST, AND IT USED TO BE A DENYLIST ("any 4xx except {401, 403, 408, 429}"). That
- * over-claimed, because LaunchDarkly documents exactly six responses on
- * `PATCH /api/v2/flags/{projectKey}/{featureFlagKey}` — **400, 401, 404, 405, 409, 429** — and
- * three of them are not about content at all:
+ * over-claimed. But the first allowlist then UNDER-claimed, for a reason worth recording because
+ * the mistake was in the QUESTION rather than the answer.
+ *
+ * It was derived by asking "what does this ENDPOINT document?", and answered with six statuses.
+ * LaunchDarkly's error table is **API-WIDE**, not per-endpoint, and it has eight rows — the two
+ * extra being 403 (immaterial; excluded either way) and **422, the one row whose description is
+ * specifically about a patch body**:
+ *
+ *   422 Unprocessable entity — "The API request can not be completed because the update
+ *   description can not be understood." Solution: "Ensure that the request body is correct for
+ *   the type of patch you are using, either JSON patch or semantic patch."
+ *
+ * That is precisely what `patchFlagSemantic` sends, so 422 is THE canonical content rejection
+ * here — and excluding it starved a releasable sibling permanently, the very defect the allowlist
+ * was written to fix, in the opposite direction. The right question is "what does LaunchDarkly
+ * document for a malformed SEMANTIC PATCH?", and the answer is 400 (invalid JSON syntax) and 422
+ * (a body the update description cannot understand).
+ *
+ * Of the statuses that remain excluded, three are documented on this endpoint and are not about
+ * content at all:
  *
  *  - **409 "Status conflict"**, which LaunchDarkly's own API overview describes as "The API request
  *    can not be completed because it conflicts with a concurrent API request" and answers with
@@ -104,7 +121,7 @@ const DEFAULT_RANDOMIZATION_UNIT = "user";
  *    no separate role action for a guarded versus a progressive release, so two manifests for one
  *    flag always request the same actions and one cannot be refused while the other succeeds.
  */
-const CONTENT_REJECTION_STATUSES: ReadonlySet<number> = new Set([400]);
+const CONTENT_REJECTION_STATUSES: ReadonlySet<number> = new Set([400, 422]);
 
 /**
  * Did LaunchDarkly REFUSE this patch on the CONTENT we sent (as opposed to failing to answer about

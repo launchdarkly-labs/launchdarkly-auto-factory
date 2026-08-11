@@ -1239,13 +1239,16 @@ export class SandboxToolExecutor {
                 (guardedByInference
                   ? `NOTE this may be a FALSE rejection: at deploy time the flag's LaunchDarkly release ` +
                     `policy beats the metrics inference, so if that policy is a progressive release these ` +
-                    `stages would have been accepted. `
+                    `stages would have been accepted. IF THAT IS THE CASE, OMIT stages (see below) rather ` +
+                    `than capping them — capping caps the ROLLOUT, and a progressive release is expected ` +
+                    `to reach 100%. `
                   : "") +
                 `Setting releaseMethod "progressive" is the escape if a 100% stage is genuinely wanted, ` +
                 `BUT KNOW WHAT IT COSTS: an explicit releaseMethod outranks the flag's release policy ` +
                 `permanently for this manifest, and metrics are only sent when the method is guarded — so ` +
                 `this manifest's metricKeys/metricGroupKeys become DEAD, and the rollout is guarded by ` +
-                `nothing. Prefer capping the final stage at ${GUARDED_MAX_ALLOCATION} and keeping the metrics. `
+                `nothing. When the release really is guarded, prefer capping the final stage at ` +
+                `${GUARDED_MAX_ALLOCATION} and keeping the metrics. `
               : "") +
             `Omit stages entirely to use the flag's configured release policy.`,
           isError: true,

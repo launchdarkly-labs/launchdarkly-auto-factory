@@ -396,14 +396,17 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           // which time the lineage guard can see what actually got served.
           console.warn(
             `[beacon] DEFERRED: '${flag.sourceFile}' also targets '${flag.flagKey}', which another manifest ` +
-              `already released in this notification. Left pending for the next deploy.`,
+              `already wrote or MAY HAVE WRITTEN in this notification. Left pending for the next deploy.`,
           );
           return {
             flag: flag.flagKey,
             sourceFile: flag.sourceFile,
             scope,
             action: "held",
-            detail: `deferred — another manifest released '${flag.flagKey}' in this notification; still pending`,
+            // "wrote or may have written", not "released". The slot is claimed by the three-state
+            // rule above, and the third state is a THROW — so on that path no release happened, and
+            // telling the innocent sibling one did points a human at the wrong manifest.
+            detail: `deferred — another manifest wrote or may have written '${flag.flagKey}' in this notification; still pending`,
           };
         }
         // Idempotency: a re-delivered notification must not double-trigger.
@@ -594,7 +597,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // LaunchDarkly.
         //
         // SO THE RESIDUAL IS: whatever LaunchDarkly rejects with a NON-client error (transient, and
-        // it may have written), plus any 4xx it does not document on this endpoint — neither of which
+        // it may have written), plus any 4xx outside the allowlist `{400, 422}` — neither of which
         // is asserted to be manifest content. If a new pre-write, manifest-specific refusal is added,
         // it belongs in `trigger.ts` too.
         //

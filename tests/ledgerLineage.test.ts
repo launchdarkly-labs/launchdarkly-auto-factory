@@ -605,12 +605,19 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     // manifest at the current sha. This is what makes the refusal actionable rather than merely
     // honest, and it is the property a `noop` (final) classification would have destroyed.
     //
-    // 400, not 422: the classifier is an ALLOWLIST of the statuses LaunchDarkly documents on
-    // `PATCH /api/v2/flags/{proj}/{flag}` (400, 401, 404, 405, 409, 429), and a 422 is not among
-    // them — so it is an unknown 4xx and keeps throwing. A bad randomizationUnit is a 400
-    // ("Invalid request") like any other refusal of the instruction body.
+    // 422, DELIBERATELY. A bad randomizationUnit is a body LaunchDarkly cannot understand, and
+    // 422 is the row in its API-wide error table that says exactly that: "the update description
+    // can not be understood… Ensure that the request body is correct for the type of patch you
+    // are using, either JSON patch or semantic patch."
+    //
+    // This test previously used 422 and was moved to 400 on the false premise that 422 was an
+    // undocumented status. It is the canonical one. The move made the suite green while the
+    // classifier starved a releasable sibling on every 422 — the canary was edited instead of
+    // the code. Restored. The other allowlisted status, 400, is covered by "a 400 on pr-41's
+    // stages does not starve pr-40" above, so both are pinned per-status: a status silently
+    // dropped from the allowlist stops being `held` and starts starving siblings.
     const state = mvState({
-      patchRejects: rejectV2Start(400, "randomizationUnit 'organisation' is not configured"),
+      patchRejects: rejectV2Start(422, "randomizationUnit 'organisation' is not configured"),
     });
     const h = await harness(ghWith([`pr-41.json`], { [path(41)]: manifest("v2") }), state);
 
@@ -630,6 +637,7 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     assert.equal(h.starts().length, 1);
     assert.deepEqual(h.pending.list("demo-backend", "production"), [], "released ⇒ no longer pending");
   });
+
 });
 
 // ---------------------------------------------------------------------------
