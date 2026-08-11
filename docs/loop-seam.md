@@ -48,12 +48,14 @@ Everything Phase 1 (the graph walk) hands to Phase 2 (Beacon) is one file. Verif
 │        ▼                                                                      │
 │   read release policy → union metrics · inherit rollback choice                │
 │        ▼                                                                      │
-│   triggerRelease → released │ noop │ skipped │ already_running   ← final       │
-│                  → held │ waiting │ error                       ← NOT final    │
+│   triggerRelease → released │ noop │ skipped      ← done; nobody is told      │
+│                  → already_running    ← nobody to tell, but NOT this          │
+│                                         manifest's work finished              │
+│                  → held │ waiting │ error   ← needs a human, and re-checked   │
 │        ▼                                                                      │
 │   monitorRelease (24h) → completed │ reverted │ ⟨paused?⟩                      │
 │                                                                               │
-│   ✔ LEDGER (pending.ts): unfinished flags re-checked on ANY later deploy        │
+│   ✔ LEDGER (pending.ts): unfinished MANIFESTS re-checked on ANY later deploy    │
 │     — webhook-gated, so nothing happens until some deploy arrives               │
 └───────────────────────────────────────────────────────────────────────────────┘
 
@@ -103,7 +105,8 @@ deploy, independently of discovery.
 | `error`, idempotency guard unverifiable | the read that would prove no release is running failed | 503 (a refusal, not a retry — nothing redelivers it) **plus a ledger entry**, so the next deploy re-checks |
 | `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | **ledger**, and it is *diagnosed* as unverified rather than reported as "not deployed" |
 | `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **ledger**, guarded by the terminal-status check below |
-| release completed while unwatched (paused-then-resumed, or after the 24h window) | monitoring stopped at its deadline | **ledger notices the `completed` status and repoints the children** — previously reachable only by a re-POST inside the two-deep window |
+| `already_running` | a release is under way for **some** variation of this flag, which does not mean THIS manifest's variation released | **not** in the Notifier's attention set (a redelivery mid-rollout needs nobody) but **kept in the ledger**, so the manifest gets another look once that release ends. It used to be final, which cleared the entry and reported the discarded work as success |
+| release completed while unwatched (paused-then-resumed, or after the 24h window) | monitoring stopped at its deadline | **the ledger re-evaluates the manifest, `triggerRelease` sees served == target, answers a final `noop`, and the children are repointed** — previously reachable only by a re-POST inside the two-deep window. The ledger no longer decides this itself: "some release of this flag completed" is not "this manifest is done" |
 | newest release was **reverted** | a guardrail rolled it back | **never re-tried**, on either path. Marked `needsHuman`, reported on every deploy. A re-POST of an already-processed sha is refused for the same reason; a NEW sha still releases, because fix-and-redeploy is the way out of a revert |
 
 **What is still not closed:** the ledger is webhook-gated, so a `notBefore` date passing does
@@ -170,9 +173,9 @@ the one this branch made worse, correctly: refusing free-form dates puts more ma
 needs redelivery. Every fail-closed improvement adds to a pile that recovers badly.
 
 **SHIPPED** (`packages/beacon/src/pending.ts`): a persisted re-evaluation ledger. An entry per
-non-final outcome keyed by `(service, environment, sourceFile)` — the manifest's ADDRESS, not
-its content, so a corrected `flagKey` cannot leave the safety guard inspecting a different flag
-from the one being triggered — re-evaluated on any webhook
+outcome that left work outstanding, keyed by `(service, environment, sourceFile)` — the
+manifest's ADDRESS, not its content, so a corrected `flagKey` cannot leave the safety guard
+inspecting a different flag from the one being triggered — re-evaluated on any webhook
 *independently of discovery*, cleared on a final outcome. What it buys is not the retry
 mechanism — re-POST already was one — but that **no human has to know to invoke it.**
 
@@ -187,9 +190,10 @@ Two properties matter more than the retry:
 The guard that makes it safe to automate: re-evaluation is a WRITE path, and
 `findActiveRelease` excludes terminal statuses, so on its own it would read "nothing running"
 for a release LaunchDarkly already REVERTED and start a second rollout of the variation the
-guardrail just rolled back. So re-evaluation consults `findLatestRelease` first: `completed`
-→ repoint children and clear; `reverted`/`monitoring_stopped` → mark `needsHuman`, report on
-every deploy, never re-trigger; unreadable history → fail closed and stay pending.
+guardrail just rolled back. So re-evaluation consults `findLatestRelease` first:
+`reverted`/`monitoring_stopped` → mark `needsHuman`, report on every deploy, never re-trigger;
+unreadable history → fail closed and stay pending. `completed` deliberately does **nothing**
+here — see the next section for why that branch was deleted.
 
 **Still WEBHOOK-GATED, deliberately.** Nothing fires on a timer, so a `notBefore` date passing
 causes nothing until some deploy arrives. Closing that would make Beacon a scheduler, against
@@ -205,6 +209,55 @@ Since fixed: a re-evaluation arriving after a release reached a terminal status 
 start a second one (both the ledger and a repeat-SHA re-POST consult `findLatestRelease` first),
 and re-recording the prior SHA is a no-op so an intervening deploy no longer makes the next
 deploy re-diff a processed range.
+
+### The axis address-keying exposed: several manifests, ONE flag
+
+Keying the ledger on the manifest's address was right, and it made a second problem visible
+rather than causing it. Manifests are one per PR and **never deleted**, and an iteration PR
+targets a **new variation of an existing flag** — the documented steady state. So one flag
+routinely has several manifests, each wanting a different `targetVariation`, while only one
+variation of a flag can be releasing at a time.
+
+The ledger remembered a MANIFEST; every "is this done?" decision was being made about its FLAG.
+Three consequences, each of which reported success while losing work:
+
+- **`reEvaluate`'s `completed` branch** treated "some release of this flag finished" as "this
+  entry's work is done" and returned a final `noop`, so a manifest asking for v2 was discarded
+  because v1's release had completed. **Deleted.** `triggerRelease` answers the same question
+  per manifest from what the environment serves now, and the useful side effect survives — a
+  `noop` result still repoints dependent prerequisites. What it narrows: an entry still held by
+  its own `releaseIntent` no longer repoints on the way past. That coverage was accidental (it
+  needed an unrelated manifest for the same flag to happen to be pending), and the reliable
+  paths are release monitoring and the `noop` result.
+- **`already_running` was final**, so an entry cleared while a release for a *different*
+  variation ran. Now kept by the ledger and still absent from the Notifier's attention set —
+  two lists answering two different questions, which is the one place they must disagree.
+- **The lineage guard answered `held` for a target BEHIND what is served.** `held` is not final,
+  so the entry lived forever, and a non-writing return used to claim the flag's per-notification
+  action slot — so an already-superseded manifest deferred the releasable one on **every**
+  deploy. Permanent deadlock, zero releases. It is now a final `noop` ("superseded"), and the
+  slot is claimed only by a method that actually patched LaunchDarkly.
+
+Two rules fall out, both in `server.ts`: **highest target variation first** in both passes (an
+absent `targetVariation` means the lineage tip, so it sorts highest — ranking it last inverts
+the fix), and **only a write claims the slot**. And one refusal was added: a manifest whose
+target is not in the lineage at all (`control`, a hand-named variation) is `held` for a human,
+because releasing it ramps production *off* the released lineage. That was the only backwards
+move with no guard at all, and the most destructive — an automated un-release reported as a
+release.
+
+**Still open, and deliberately not fixed here: mutual exclusion is per-notification.** The
+action slot is a set inside one request. `config/services.yaml` registers **four
+`side: backend` services on one repo** (`togglemart-gateway`, `-catalog`, `-orders`, `-users`),
+so one merge produces four concurrent notifications, each with its own set and no visibility
+into the others — in-process mutual exclusion cannot cover them. The residual window is a
+**concurrent double-start during a rollout**: `findActiveRelease` catches it as soon as the
+releases listing is consistent (it is eventually consistent right after a start — `monitor.ts`
+retries five times for exactly that), so the exposure is that first moment only. Closing it
+properly means either a **persisted per-flag lease** (the ledger's file is the obvious home, but
+a lease needs an owner, a TTL, and a crash story) or **designating which service owns a flag's
+releases** (cheaper and clearer, but it is a product decision about how the registry models a
+multi-service repo). Deferred pending that decision rather than half-built.
 
 **Still open, and known.** `discovery.ts` classifies a transient non-JSON response as a
 permanently malformed manifest, because `SyntaxError` is thrown both by `JSON.parse` on file

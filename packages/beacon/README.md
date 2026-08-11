@@ -72,6 +72,47 @@ runs server-side in LaunchDarkly regardless). Re-delivered notifications are
 idempotent: a flag whose release is already running reports `already_running`
 and re-attaches monitoring instead of double-triggering.
 
+`already_running` needs **nobody** (it is not in the Notifier's attention set — a
+redelivery mid-rollout is the normal shape of a deploy) but the manifest **stays in
+the ledger**. Those are different questions: only one variation of a flag can be
+releasing at a time, so a manifest asking for v2 hits `already_running` on v1's
+rollout, and treating that as "done" discarded the v2 release and called it a success.
+
+## Several manifests, one flag
+
+Manifests are one per PR (`.release-flags/pr-<N>.json`) and are **never deleted**, and
+an iteration PR targets a **new variation of an existing flag**. So one flag routinely
+has several manifests, each wanting a different `targetVariation`, while only one
+variation of a flag can be releasing at a time. Beacon's rules for that:
+
+- **The manifest is the unit of work** (`service`, `environment`, `sourceFile`); the
+  flag is the unit of *action* (`flagKey`, `environment`).
+- **Highest target variation acts first**, in both the discovered and the pending pass.
+  An absent `targetVariation` means the lineage tip, so it sorts highest. Filename order
+  and ledger insertion order both mean "oldest first", which for a lineage is backwards.
+- **Only a write claims the flag's action slot.** A `held` or `noop` manifest wrote
+  nothing and must not defer one that can release; a second manifest that does reach the
+  trigger is deferred **non-finally**, so the ledger re-checks it.
+- **A manifest whose target is BEHIND what the environment serves is moot**, not held: a
+  newer variation superseded it, so it resolves as a final `noop` and stops being tracked.
+  Holding it would wait forever for a release that must never happen.
+- **A manifest whose target is not in the lineage at all** (`control`, a hand-named
+  variation) is **held for a human**. Releasing it would ramp production off the released
+  lineage — a deliberate rollback is LaunchDarkly's job, not a deploy notification's.
+
+> **Known limitation: mutual exclusion is per-notification, not per-flag.** The slot
+> above is a set inside one request. `config/services.yaml` registers **four
+> `side: backend` services on one repo** (`togglemart-gateway`, `-catalog`, `-orders`,
+> `-users`), so one merge produces four concurrent notifications, each with its own set —
+> and they cannot see each other. Two of them can therefore reach `triggerRelease` for the
+> same flag at the same moment. The residual window is a **concurrent double-start during
+> a rollout**: `findActiveRelease` catches it as soon as the releases listing is
+> consistent (it is eventually consistent right after a start — see `monitor.ts`, which
+> retries five times for exactly that), so the exposure is that first moment only.
+> Closing it properly needs either a **persisted per-flag lease** or a decision that one
+> service **owns** a flag's releases; both are deferred pending that product decision
+> (`docs/loop-seam.md`).
+
 ## Config surface
 
 Read from the repo `config/` dir + env:
@@ -123,14 +164,19 @@ other service's deploy notification to re-evaluate.
 > error.
 
 > **Unfinished releases are re-checked on the next deploy (the ledger).** `pending.ts`
-> persists an entry per non-final outcome (`held`/`waiting`/`error`) and re-evaluates it on
-> any later deploy notification, independently of discovery — which cannot re-surface a
-> manifest that exists at both SHAs. Re-evaluation re-reads the manifest at the CURRENT sha,
-> so fixing a bad `releaseIntent` and deploying again is enough.
+> persists an entry per outcome that left work outstanding (`held`/`waiting`/`error`/
+> `already_running`) and re-evaluates it on any later deploy notification, independently of
+> discovery — which cannot re-surface a manifest that exists at both SHAs. Re-evaluation
+> re-reads the manifest at the CURRENT sha, so fixing a bad `releaseIntent` and deploying
+> again is enough. An entry is keyed by the manifest's **address**, and the variation it
+> wants is recorded alongside for reporting only — never as an identity or a guard input,
+> because served-vs-target is recomputed from LaunchDarkly at every decision.
 >
 > It is **webhook-gated**: nothing fires on a timer, so a `notBefore` date passing does
 > nothing until some deploy arrives. A release LaunchDarkly **reverted** is marked
 > `needsHuman` and never re-triggered — re-releasing would undo the guardrail's rollback.
+> That refusal is **flag-level and deliberately broad**: a guardrail rejecting one variation
+> blocks re-triggering *any* manifest for that flag until a human decides.
 > `BEACON_PENDING_FILE` sets the ledger path (default `beacon-pending.json`).
 >
 > **The notification itself is never redelivered**, so alert on `notify: ACTION REQUIRED`.
