@@ -40,6 +40,19 @@ describe("the taxonomy has exactly one home", () => {
     for (const status of CONTENT_REJECTION_STATUSES) {
       const row = PATCH_FAILURE_TAXONOMY.get(status);
       assert.equal(row?.wrote, "no", `a held status must PROVE nothing was written (${status})`);
+      // AND A HELD ROW'S BLAST RADIUS MUST BE `unknown`, which nothing checked until one of them
+      // drifted. The classifier is status-only, so the SAME status can arrive at any of the three
+      // patches `triggerRelease` sends — and `PATCH_SITES` asserts that one of those bodies contains
+      // no manifest values at all. A per-status radius therefore cannot be stated for a held row: the
+      // honest answer depends on the site, which the site property already records. One row said
+      // `per-manifest` for a whole round after the row above it had been corrected for exactly this,
+      // because the invariant below reads `blastRadius` only on `throws` rows.
+      assert.equal(
+        row?.blastRadius,
+        "unknown",
+        `${status} is held, so it can arrive at any patch — including the one whose body carries no ` +
+          `manifest values. Its blast radius is a property of the SITE, not of the status.`,
+      );
     }
   });
 
@@ -187,15 +200,41 @@ describe("the taxonomy has exactly one home", () => {
   /**
    * Is this paragraph talking about LaunchDarkly's refusals at all?
    *
-   * REQUIRED BEFORE TIER A FIRES, because `per-manifest` and `starves` are NOT the taxonomy's
-   * private vocabulary — they are the vocabulary of §6's first invariant, the one that says the
-   * ledger's unit of work is a manifest's address while the unit of action is a flag. A commit on
-   * this branch is literally titled "the ledger's questions are per-manifest, the slot is not". So
-   * `// the ledger key is per-manifest by design; a per-flag key starves nothing` is accurate,
-   * innocent prose that the first version of Tier A failed — telling the maintainer to move a
-   * comment about ledger keys into a table about HTTP statuses. That is how a lint gets deleted.
+   * REQUIRED FOR THE AMBIGUOUS TERMS ONLY, and the "only" is the round-5 correction. It exists because
+   * `per-manifest` and `starves` are NOT the taxonomy's private vocabulary — they are the vocabulary
+   * of §6's first invariant, the one that says the ledger's unit of work is a manifest's address while
+   * the unit of action is a flag. A commit on this branch is literally titled "the ledger's questions
+   * are per-manifest, the slot is not". So `// the ledger key is per-manifest by design; a per-flag
+   * key starves nothing` is accurate, innocent prose that an ungated Tier A failed, telling the
+   * maintainer to move a comment about ledger keys into a table about HTTP statuses. That is how a
+   * lint gets deleted.
+   *
+   * BUT APPLYING IT TO EVERY TERM RE-OPENED THE HOLE IT WAS ADDED TO CLOSE. Four lines pasted into
+   * `monitor.ts` restating the whole argument — `starve` and `applied partially` intact — passed,
+   * because the paragraph happened to mention neither a status nor LaunchDarkly by name. That is the
+   * REALISTIC path, not the adversarial one: an edited paraphrase loses its numerals long before it
+   * loses its vocabulary, and this test's own claim above is that it catches pastes and edits. So the
+   * gate now applies only where a term has some other honest use.
    */
   const TAXONOMY_SIGNAL = /\b(400|401|403|404|405|408|409|422|429)\b|launchdarkly|\bLD\b|refus/i;
+
+  it("the slot claim has exactly ONE writer, so 'never chosen by a caller' stays true", () => {
+    // `TriggerResult.claimsSlotWithoutWriting` says the claim is "DERIVED from the patch site, never
+    // chosen by a caller". That was true of `heldOnContentRefusal`'s signature and enforced by nothing
+    // else: the field is a public optional `string`, so any other return site in `triggerRelease` — or
+    // a hand-built `TriggerResult` anywhere — could set it and quietly acquire the §6 exception.
+    //
+    // So the claim is now a countable property. One literal key in the home, in the one builder that
+    // derives it. The declaration itself is `claimsSlotWithoutWriting?:`, which this pattern does not
+    // match, so a second writer is the only way to raise the count.
+    const home = readFileSync(resolve(repoRoot, HOME), "utf8");
+    assert.equal(
+      (home.match(/claimsSlotWithoutWriting:/g) ?? []).length,
+      1,
+      "THE DISCRIMINATOR: exactly one place sets the slot claim. A second writer means a return site " +
+        "took the §6 exception without going through the patch-site property that justifies it.",
+    );
+  });
 
   it("TIER A: no file but the home states any part of the argument", () => {
     // THE EXEMPTIONS, both deliberate:
@@ -205,14 +244,19 @@ describe("the taxonomy has exactly one home", () => {
     //    happen rather than a rule.
     //  - this file, for the reason at the top.
     const EXEMPT = new Set([HOME, "docs/loopback-handoff.md", "tests/taxonomyHome.test.ts"]);
-    const terms: Array<[RegExp, string]> = [
-      [/per-manifest/i, "how wide a refusal is — a `blastRadius` value"],
-      [/starv/i, "what a permanent slot claim costs — the `blastRadius` consequence"],
-      [/applied partially/i, "LaunchDarkly's semantic-patch atomicity guarantee"],
-      [/patch[- ]sites?\b/i, "the inventory of the patches `triggerRelease` sends"],
-      [/role action/i, "which LaunchDarkly role action governs which instruction"],
-      [/pending scheduled change/i, "what an allowlisted refusal does not prove"],
-      [/guarded vers(us|.) progressive|guarded vs\.? progressive/i, "the retired 403 proof"],
+    // `gated: true` means the paragraph must ALSO look like it is about LaunchDarkly's refusals
+    // before the term counts — for terms this repo uses honestly elsewhere. `gated: false` is for
+    // vocabulary with no other use here at all; those fire wherever they appear, which is what makes a
+    // paste detectable after its numerals have been edited away. Checked across every file in scope:
+    // none of the four ungated phrases occurs outside the home.
+    const terms: Array<{ term: RegExp; what: string; gated: boolean }> = [
+      { term: /per-manifest/i, what: "how wide a refusal is — a `blastRadius` value", gated: true },
+      { term: /starv/i, what: "what a permanent slot claim costs — the `blastRadius` consequence", gated: true },
+      { term: /pending scheduled change/i, what: "what an allowlisted refusal does not prove", gated: true },
+      { term: /applied partially/i, what: "LaunchDarkly's semantic-patch atomicity guarantee", gated: false },
+      { term: /patch[- ]sites?\b/i, what: "the inventory of the patches `triggerRelease` sends", gated: false },
+      { term: /role action/i, what: "which LaunchDarkly role action governs which instruction", gated: false },
+      { term: /guarded vers(us|.) progressive|guarded vs\.? progressive/i, what: "the retired 403 proof", gated: false },
     ];
     assert.ok(existsSync(resolve(repoRoot, HOME)), `the home itself (${HOME}) is missing — nothing below means anything`);
     const dir = (d: string, ext: string): string[] =>
@@ -221,23 +265,31 @@ describe("the taxonomy has exactly one home", () => {
       "packages/beacon/README.md",
       ...dir("docs", ".md"),
       ...dir("packages/beacon/src", ".ts"),
+      // `packages/shared/src` was outside this list until round 5, which left the two places the
+      // taxonomy is ABOUT unscanned: `startRelease` builds the patch site 3 sends, and `LdApiError`
+      // carries the status the classifier reads. No taxonomy vocabulary lives there today; scanning it
+      // is what keeps that true.
+      ...dir("packages/shared/src", ".ts"),
       ...dir("tests", ".test.ts"),
     ].filter((f) => !EXEMPT.has(f));
-    // 72 at the time of writing, across four directories. The floor only catches a moved or renamed
-    // directory — an ordinary new source or test file grows the list, which is the safe direction.
-    assert.ok(files.length >= 60, `scope collapsed to ${files.length} files — a rename or a moved dir`);
+    // 95 at the time of writing, across five directories (1 README + 7 docs + 15 beacon + 23 shared +
+    // 52 tests, less the three exemptions). The floor only catches a moved or renamed directory — an
+    // ordinary new source or test file grows the list, which is the safe direction.
+    assert.ok(files.length >= 75, `scope collapsed to ${files.length} files — a rename or a moved dir`);
 
     for (const rel of files) {
       for (const unit of proseUnits(rel, readFileSync(resolve(repoRoot, rel), "utf8"))) {
-        if (!TAXONOMY_SIGNAL.test(unit)) continue;
-        for (const [term, what] of terms) {
+        const aboutRefusals = TAXONOMY_SIGNAL.test(unit);
+        for (const { term, what, gated } of terms) {
+          if (gated && !aboutRefusals) continue;
           const found = term.exec(unit);
           assert.equal(
             found,
             null,
-            `${rel} states part of the taxonomy's argument ('${found?.[0]}' — ${what}) in a paragraph ` +
-              `that is about LaunchDarkly's refusals: "${unit.trim().replace(/\s+/g, " ").slice(0, 140)}". ` +
-              `It belongs in PATCH_FAILURE_TAXONOMY (${HOME}) and nowhere else; point at it instead.`,
+            `${rel} states part of the taxonomy's argument ('${found?.[0]}' — ${what})` +
+              `${gated ? ", in a paragraph that is about LaunchDarkly's refusals" : ""}: ` +
+              `"${unit.trim().replace(/\s+/g, " ").slice(0, 140)}". It belongs in ` +
+              `PATCH_FAILURE_TAXONOMY (${HOME}) and nowhere else; point at it instead.`,
           );
         }
       }
@@ -249,8 +301,14 @@ describe("the taxonomy has exactly one home", () => {
     // Every name LaunchDarkly's error table gives these statuses, because a name is a restatement as
     // much as a numeral is. The first version listed only the descriptive phrases and omitted the
     // canonical HTTP reason phrases entirely.
+    // `not found` WAS HERE AND IS NOT ANY MORE. It is ordinary English, and it fired on
+    // "if the manifest file is not found in the repo at that sha, its content is dropped from the
+    // ledger and nothing is held open for it" — accurate, innocent prose about discovery, accused of
+    // restating LaunchDarkly's taxonomy. That is precisely the misfire this test warns about two
+    // paragraphs up, so the term is gone; the same status's descriptive name
+    // (`invalid resource identifier`) still covers it, and `method not allowed` covers its neighbour.
     const NAMES =
-      /rate[- ]limit|too many requests|status conflict|concurrent[- ](api )?request|approval is required|approvals?[- ]required|required approvals|method not allowed|invalid resource identifier|not found|forbidden|invalid access token|unauthori[sz]ed|unprocessable|request timeout|invalid request body|bad request/i;
+      /rate[- ]limit|too many requests|status conflict|concurrent[- ](api )?request|approval is required|approvals?[- ]required|required approvals|method not allowed|invalid resource identifier|forbidden|invalid access token|unauthori[sz]ed|unprocessable|request timeout|invalid request body|bad request/i;
     // A status NAME is only a taxonomy claim when it is being CLASSIFIED. "GitHub rate limit" in the
     // readiness check and "rate limiting and outages" in the idempotency guard are neither, so this
     // asks whether a name and a verdict about it are NEAR EACH OTHER.
@@ -262,6 +320,14 @@ describe("the taxonomy has exactly one home", () => {
     // whole paragraph, and an innocent "GitHub rate limit" 170 characters away from the word
     // "classifier" was reported as a taxonomy claim. A window is what "being classified" actually
     // means.
+    //
+    // AND THE WINDOW HAS ITS OWN RESIDUAL, which the previous version of this comment documented only
+    // in the direction the window fixed. A restatement that puts its verdict FURTHER than the window
+    // passes: "a body the endpoint calls unprocessable … [230 characters of anything] … it is
+    // therefore always held for a human" is a genuine second copy and this check does not see it.
+    // Widening the window trades that for the false positives above, and there is no setting that
+    // avoids both — a paragraph-scoped rule was tried and misfired. Recorded rather than tuned: the
+    // window catches the compact restatement, and a spread-out one is review's job.
     const WINDOW = 120;
     const VERDICT = /\b(held|content|transient|deterministic|per-flag|slot|reject\w*|classif\w*|throw\w*|refusals?)\b/i;
     // `non-404` is the fullstack readiness check's own vocabulary (a GitHub error that is not a 404),

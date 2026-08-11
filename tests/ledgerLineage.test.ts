@@ -619,12 +619,20 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     assert.equal(fifty.action, "held", "THE DISCRIMINATOR: held, as for the other two patches");
     const note = String(fifty.detail.note);
     assert.match(note, /flag is archived/, "carrying LaunchDarkly's own message");
-    // AND THE NOTE DOES NOT ACCUSE THE MANIFEST, because nothing in this patch came from it: the
-    // variation id is one LaunchDarkly reported. That is what made "classifying it would produce a
-    // certainly-wrong report" sound convincing — but `whereToLook` is a parameter, so the note can
-    // say what is true of this patch instead.
-    assert.match(note, /look at the FLAG and the ENVIRONMENT/, "and pointing away from the manifest's fields");
-    assert.doesNotMatch(note, /releasePlan|releaseIntent/, "no field of this file is blamed");
+    // AND THE NOTE POINTS AT THE RIGHT TWO THINGS, in the right order. None of the VALUES in this
+    // patch came from the manifest — the variation id is one LaunchDarkly reported — so the flag and
+    // the environment come first. But one field of this file DID choose this instruction, and an
+    // earlier version of this note said to look "rather than at any field of this file", which left an
+    // author with a refusal they could actually act on and no way to know it: `releaseMethod:
+    // "immediate"` is what asks for a direct fallthrough change instead of a staged release, and
+    // dropping it is the remedy `sandboxTools` already teaches.
+    assert.match(note, /look at the FLAG and the ENVIRONMENT first/, "the flag and environment come first");
+    assert.match(note, /releaseMethod "immediate" is what asks for a direct/, "THE DISCRIMINATOR: the routing field is named");
+    assert.doesNotMatch(
+      note,
+      /stages|metricKeys|metricGroupKeys|randomizationUnit|releaseIntent/,
+      "and no VALUE of this file is blamed, because none of them is in this patch",
+    );
     assert.deepEqual(
       h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
       [path(50)],
@@ -649,12 +657,13 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     //
     // The targets are DIVERGENT on purpose. With both manifests on v2 this test passed either way:
     // one release happened and it was v2's, whichever manifest produced it.
+    const state = mvState({ patchRejects: rejectImmediate(400, "flag is archived") });
     const h = await harness(
       ghWith([`pr-50.json`, `pr-51.json`], {
         [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }),
         [path(51)]: manifest("v1"),
       }),
-      mvState({ patchRejects: rejectImmediate(400, "flag is archived") }),
+      state,
     );
 
     const r = await h.post("sha1");
@@ -671,7 +680,7 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     // AND THE CLAIM IS AUDITABLE IN THE OUTCOME, not just in the log: a slot taken by something other
     // than a write is indistinguishable from a bug in `performedAWrite` unless it says why.
     const claim = String(outcomeFor(r.json, 50).detail.claimsSlotWithoutWriting);
-    assert.match(claim, /carries no manifest content/, "the reason is the property the narrowing turns on");
+    assert.match(claim, /cannot tell one 'immediate' manifest from another/, "the reason is the property the narrowing turns on");
     assert.match(claim, /NARROWS handoff §6/, "and it names what it is narrowing");
 
     // Both non-final, so the next deploy re-evaluates: the sibling loses a deploy, not its release.
@@ -680,20 +689,70 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
       [path(50), path(51)],
     );
 
-    // The refusal clears, and now v2 releases — the NEWER variation, which is the outcome the slot
-    // claim preserved.
-    h.pending.list("demo-backend", "production");
-    const second = await harness(
+    // THE SAME HARNESS, CONTINUED — not a new one. The first version of this arm built a fresh harness
+    // with an EMPTY ledger, so it re-discovered both manifests as new and proved nothing about the held
+    // entry: v1 was then withheld by an ordinary write claim, not by anything this test is about. The
+    // point is that the DEFERRED sibling and the HELD entry both survive into the next deploy, so
+    // mutate the refusal on the live state and post again.
+    state.patchRejects = undefined;
+    const r2 = await h.post("sha2");
+    assert.equal(outcomeFor(r2.json, 50).action, "released", "the held entry re-evaluates and pr-50 releases");
+    assert.equal(h.starts().length, 0, "an immediate release starts no automated release");
+    assert.match(String(outcomeFor(r2.json, 51).detail), /deferred/, "and v1 still never rolls out");
+  });
+
+  it("KNOWN GAP: an equal-target sibling by another method defers for as long as the refusal stands", async () => {
+    // NOT A PREVENTION TEST. This one PINS A GAP the owner chose to record rather than close, on the
+    // precedent of the 403 gap in `PATCH_FAILURE_TAXONOMY` — which is also a case where neither
+    // available answer is right and the wrong one was previously asserted to be impossible. In the
+    // owner's words: "a sibling targeting the same or a later variation by a different method would
+    // have succeeded, and defers while the refusal stands."
+    //
+    // The setup is exactly what §6 was written to prevent, with nothing gained, and the earlier slot claim
+    // said it could not happen ("every sibling would be refused identically"). It can. pr-50 asks for
+    // v2 by `immediate`; pr-51 asks for THE SAME v2 by the default staged method, so it sends
+    // `turnFlagOn` + `startAutomatedRelease` and no fallthrough instruction at all — the refusal below
+    // does not match its patch and never would. Equal `targetRank`, stable order, pr-50 first every
+    // time. So pr-51 never gets a chance, on this deploy or any later one, while the refusal stands.
+    //
+    // It is accepted because the alternative on the table was a rollout BACKWARDS (the test above),
+    // which no later deploy undoes, whereas this costs deploys and is recovered the moment a human
+    // fixes the flag. What must not happen is the gap being asserted away again, so this test fails if
+    // pr-51 ever releases — which would mean the slot was freed — AND checks that the claim Beacon
+    // reports names the residual out loud.
+    const h = await harness(
       ghWith([`pr-50.json`, `pr-51.json`], {
         [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }),
-        [path(51)]: manifest("v1"),
+        [path(51)]: manifest("v2"),
       }),
-      mvState(),
+      mvState({ patchRejects: rejectImmediate(400, "flag is archived") }),
     );
-    const r2 = await second.post("sha2");
-    assert.equal(outcomeFor(r2.json, 50).action, "released", "pr-50's immediate release goes through");
-    assert.equal(second.starts().length, 0, "an immediate release starts no automated release");
-    assert.match(String(outcomeFor(r2.json, 51).detail), /deferred/, "and v1 still never rolls out");
+
+    for (const sha of ["sha1", "sha2", "sha3"]) {
+      const r = await h.post(sha);
+      assert.equal(outcomeFor(r.json, 50).action, "held", `${sha}: pr-50 still refused`);
+      assert.match(String(outcomeFor(r.json, 51).detail), /deferred/, `${sha}: and pr-51 still defers`);
+    }
+    assert.equal(
+      h.starts().length,
+      0,
+      "THE GAP: pr-51 wanted the same variation by a method that was never refused, and never ran",
+    );
+
+    // AND BEACON SAYS SO. The claim used to assert this case away; now it records it, in the note an
+    // operator reads and in the ledger entry, so nobody has to rediscover it from the code.
+    const claim = String(outcomeFor(await h.post("sha4").then((r) => r.json), 50).detail.claimsSlotWithoutWriting);
+    assert.match(claim, /KNOWN RESIDUAL/, "the residual is stated, not implied");
+    assert.match(
+      claim,
+      /same or a later variation by a different method would have succeeded/,
+      "in the owner's own words, so a reviewer can match it to the decision",
+    );
+    assert.doesNotMatch(
+      claim,
+      /refused identically|no reachable loss/,
+      "and the two false clauses that used to assert this gap away are gone",
+    );
   });
 
   it("an UNDOCUMENTED 4xx keeps throwing rather than being asserted to be a content defect", async () => {

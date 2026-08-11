@@ -90,12 +90,16 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
 - **Highest target variation acts first**, in both the discovered and the pending pass.
   An absent `targetVariation` means the lineage tip, so it sorts highest. Filename order
   and ledger insertion order both mean "oldest first", which for a lineage is backwards.
-- **Only a write claims the flag's action slot — plus a write we cannot rule out.** A `held`
-  or `noop` manifest wrote nothing and must not defer one that can release; a second manifest
-  that does reach the trigger is deferred **non-finally**, so the ledger re-checks it. A
-  trigger that **threw** claims the slot as well, because there are three states and not two:
-  `startRelease` awaits the response *after* LaunchDarkly applied the patch, so a lost response
-  is "we do not know".
+- **Only a write claims the flag's action slot — plus a write we cannot rule out, plus one
+  narrow exception.** A `held` or `noop` manifest wrote nothing and generally must not defer one
+  that can release; a second manifest that does reach the trigger is deferred **non-finally**, so
+  the ledger re-checks it. A trigger that **threw** claims the slot as well, because there are
+  three states and not two: `startRelease` awaits the response *after* LaunchDarkly applied the
+  patch, so a lost response is "we do not know". **And one non-writing outcome claims it too**, by
+  an explicit narrowing of the rule: where a refusal cannot be specific to one manifest, no sibling
+  may act either. That is a decision with a recorded cost, and both live in `trigger.ts`
+  (`PatchSite`, `TriggerResult.claimsSlotWithoutWriting`) rather than being restated here — this
+  file has already said "only a write claims the slot" while the code said otherwise.
 - **Whether that claim costs the sibling a delay or its release depends on the SHAPE of what
   throws**, not on pre-write vs post-write — and the shapes are enumerated status by status in
   `PATCH_FAILURE_TAXONOMY` (see below), which is the only place this repo states them. Two
@@ -120,11 +124,13 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
   one. `write_manifest` checks `targetVariation` against `/^v\d+$/` but never against the flag's
   real variations.
 - **A patch LaunchDarkly REFUSES with an allowlisted status is held for a human**, named with
-  LaunchDarkly's own message, and the sibling can still release in this same notification because
-  nothing was written. Not "on content grounds", which this bullet used to say and which is false
-  twice over: one allowlisted status has a second cause that is nothing to do with the manifest, and
-  one of the patches carries no manifest content at all. Which refusals qualify, what each does and
-  does not prove, and why, are in the taxonomy — not here.
+  LaunchDarkly's own message. Nothing was written — but whether a sibling may therefore act depends
+  on which patch was refused, and at one of them it may not (see above). This bullet used to say the
+  sibling "can still release in this same notification", unconditionally, in the same breath as
+  admitting that one patch carries no manifest content; the runtime note for that patch now says the
+  opposite, which is how a document ends up contradicting the software it describes. Not "on content
+  grounds" either, which is false for the same reason plus one status's second cause. Which refusals
+  qualify, what each does and does not prove, and why, are in the taxonomy — not here.
 
 > **Known limitation: mutual exclusion is per-notification, not per-flag.** The slot
 > above is a set inside one request. `config/services.yaml` registers **four

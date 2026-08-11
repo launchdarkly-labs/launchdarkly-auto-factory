@@ -167,6 +167,32 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
   deleted rather than patched. Do not add a second answer.
 - **A manifest that writes nothing must not take the flag's action slot**, or it starves a sibling.
   Three write states — wrote, did not write, **don't know** — and "don't know" fails closed.
+  **NARROWED by the repo owner (round 4), and this is the only amendment made to this list:**
+
+  > …except where the refusal cannot be specific to one manifest, in which case no sibling may act
+  > either.
+
+  It applies to exactly one place — the `immediate` patch, whose body contains no manifest values at
+  all (`turnFlagOn` plus a variation id LaunchDarkly itself reported), so no refusal of it can tell
+  one such manifest from another. Freeing the slot there was demonstrated to roll an **older**
+  variation out to production behind a refused newer one, which no later deploy undoes. The
+  condition is a value, not a comment — `PatchSite.carriesManifestContent` in
+  `packages/beacon/src/trigger.ts`, which `heldOnContentRefusal` reads and
+  `TriggerResult.claimsSlotWithoutWriting` carries into the outcome — and
+  `tests/taxonomyHome.test.ts` pins that exactly one patch is in each state, so the exception cannot
+  spread without a test failing.
+
+  **Its accepted cost, in the owner's words, recorded as a known gap rather than closed** (the same
+  treatment as the 403 gap in `PATCH_FAILURE_TAXONOMY`, and pinned the same way by
+  `tests/ledgerLineage.test.ts`):
+
+  > a sibling targeting the same or a later variation by a different method would have succeeded,
+  > and defers while the refusal stands.
+
+  Two arguments once offered for the narrowing were false and are withdrawn: that every sibling
+  would be refused identically, and that there was no reachable loss on the sibling's side. The
+  narrowing rests only on the asymmetry of the two failures — a deferred sibling recovers on the
+  next deploy, a rollout backwards does not recover at all.
 - **Never move a lineage backwards**, and never repoint a child onto a variation behind what it is
   pinned to.
 - **`held` is non-final; `noop` is final.** A superseded manifest is *moot*, not held — that is what

@@ -205,7 +205,14 @@ export const PATCH_FAILURE_TAXONOMY: ReadonlyMap<number, PatchFailureClass> = ne
     {
       outcome: "held",
       recurs: "deterministic",
-      blastRadius: "per-manifest",
+      // UNKNOWN, for the same reason the 400 row is — and this row was falsified by a change made one
+      // row above it, in the same diff, which is this branch's signature defect arriving from a new
+      // direction. It said `per-manifest`. But this status can arrive at ANY of the three patches, and
+      // `PATCH_SITES.immediate.carriesManifestContent === false` asserts that no refusal of that body
+      // can be about one manifest rather than another. A blast radius stated per STATUS cannot be right
+      // when the same status means different things at different patches; the honest per-status answer
+      // is that it depends on the site, which the site property already records.
+      blastRadius: "unknown",
       wrote: "no",
       why:
         'Unprocessable entity — "The API request can not be completed because the update ' +
@@ -432,9 +439,12 @@ export interface PatchSite {
    * releasable sibling loses its release on every deploy — the defect §6 was written for.
    *
    * `false` for the `immediate` patch: `turnFlagOn` is a constant and the variation id was read back
-   * from LaunchDarkly itself. No refusal there can be about one manifest rather than another, so the
-   * loss §6 protects against is unreachable — and the loss that freeing the slot DOES permit is
-   * reachable and worse. See `PATCH_SITES.immediate`.
+   * from LaunchDarkly itself. No refusal of THAT BODY can tell one `immediate` manifest from another —
+   * which is a narrower licence than it first appears, and the difference matters. It does NOT say
+   * every sibling would be refused identically: a sibling using the default staged method sends
+   * `turnFlagOn` + `startAutomatedRelease` and no fallthrough instruction at all, so a refusal aimed at
+   * a direct fallthrough change does not touch it. See `PATCH_SITES.immediate` for what that costs and
+   * for the residual the owner accepted.
    */
   readonly carriesManifestContent: boolean;
 }
@@ -448,9 +458,25 @@ export interface PatchSite {
  * v1 — the OLDER variation — is rolled out to production while the newer manifest is merely held.
  * That is the direction `server.ts` calls unrecoverable: no later deploy undoes a rollout backwards.
  *
- * Against that, freeing the slot buys nothing here, because there is no sibling that could have been
- * refused while this one succeeded. So: `held` (non-final, re-checked next deploy, operator told to
- * look at the flag and the environment) AND the slot claimed.
+ * WHAT THE SLOT CLAIM COSTS — A KNOWN GAP, RECORDED RATHER THAN CLOSED, by owner decision, on the
+ * precedent of the 403 gap in `PATCH_FAILURE_TAXONOMY`. The owner's words:
+ *
+ *   "a sibling targeting the same or a later variation by a different method would have succeeded,
+ *    and defers while the refusal stands"
+ *
+ * Reachable, and pinned by a test as a gap: pr-50 wants v2 by `immediate` and is refused; pr-51 wants
+ * THE SAME v2 by the default staged method. Equal `targetRank`, stable order, pr-50 first every time —
+ * so pr-51 defers on every deploy for as long as the refusal stands, and its own patch was never
+ * refused. That is §6 starvation with nothing gained, and it is accepted because the alternative on the
+ * table was a rollout backwards, which is not recoverable at all.
+ *
+ * TWO CLAIMS THAT USED TO BE HERE AND WERE FALSE, both about other patches' bodies rather than this
+ * one's: "every sibling would be refused identically" (a staged sibling sends no fallthrough
+ * instruction, so a refusal of a direct fallthrough change need not reach it) and "no reachable loss on
+ * the sibling's side" (the paragraph above is that loss). The narrowing survives them; the reasoning
+ * for it is now the asymmetry of the two failures, not the absence of one.
+ *
+ * So: `held` (non-final, re-checked next deploy, operator told where to look) AND the slot claimed.
  */
 export const PATCH_SITES: Readonly<Record<"prerequisites" | "immediate" | "releaseStart", PatchSite>> = {
   prerequisites: { id: "prerequisites", carriesManifestContent: true },
@@ -498,11 +524,14 @@ function heldOnContentRefusal(
   // DERIVED, never passed in. See `PatchSite` for the narrowing this implements and whose it is.
   const claim = site.carriesManifestContent
     ? undefined
-    : `the '${site.id}' patch carries no manifest content, so this refusal cannot be about one ` +
-      `manifest rather than another and every sibling for '${flagKey}' would be refused identically. ` +
-      `By owner decision this NARROWS handoff §6 ("a manifest that writes nothing must not take the ` +
-      `flag's action slot"): with no reachable loss on the sibling's side, the slot is claimed so that ` +
-      `no sibling rolls out a DIFFERENT variation behind a refusal we cannot explain.`;
+    : `no part of the '${site.id}' patch came from any manifest, so this refusal cannot tell one ` +
+      `'${site.id}' manifest from another. A sibling asking for a DIFFERENT method sends a different ` +
+      `body and might well succeed — which is exactly why the slot is claimed: it would be releasing a ` +
+      `different variation of '${flagKey}' behind a refusal we cannot explain, and a rollout backwards ` +
+      `is not undone by any later deploy. By owner decision this NARROWS handoff §6 ("a manifest that ` +
+      `writes nothing must not take the flag's action slot"). KNOWN RESIDUAL: a sibling targeting the ` +
+      `same or a later variation by a different method would have succeeded, and defers while the ` +
+      `refusal stands.`;
   return {
     flagKey,
     method: "held",
@@ -948,9 +977,13 @@ export async function triggerRelease(
         flag.flagKey,
         PATCH_SITES.immediate,
         "this manifest's immediate release instruction",
-        `nothing in that instruction came from the manifest — it turns '${flag.flagKey}' on in ` +
-          `'${environmentKey}' and points its fallthrough at a variation id LaunchDarkly itself ` +
-          `reported. So look at the FLAG and the ENVIRONMENT rather than at any field of this file.`,
+        `none of the VALUES in that instruction came from the manifest — it turns '${flag.flagKey}' on ` +
+          `in '${environmentKey}' and points its fallthrough at a variation id LaunchDarkly itself ` +
+          `reported — so look at the FLAG and the ENVIRONMENT first. But ONE field of this file chose ` +
+          `this instruction: releasePlan.releaseMethod "immediate" is what asks for a direct ` +
+          `fallthrough change instead of a staged release. If LaunchDarkly is refusing that shape of ` +
+          `change specifically, dropping "immediate" so the release goes out as a staged rollout is the ` +
+          `fix, and it is the one this file's author controls.`,
       );
     }
     return { flagKey: flag.flagKey, method, ...(policyNote ? { note: policyNote } : {}) };

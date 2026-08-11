@@ -431,6 +431,44 @@ describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be
     assert.match(inferred.content, /INFERRED from whether this manifest\s+carries metrics/, "and the fallback is named");
   });
 
+  it("tells an IMMEDIATE manifest its stages are ignored, not inherited", async () => {
+    // PREVENTS ADVICE ABOUT A MECHANISM THIS MANIFEST NEVER REACHES, and this branch shipped unpinned:
+    // a grep for `IGNORES stages` across tests/ found nothing, while the branch is plainly reachable —
+    // `stageSetProblem` rejects a non-guarded stage set too (descending allocations, bad durations).
+    //
+    // `trigger.ts` returns from its immediate branch BEFORE `stages` is resolved, so for this manifest
+    // the stages are not capped, not defaulted and not inherited from the flag's policy: they are read
+    // by nothing. Telling this author about inheritance would describe a path their release does not
+    // take.
+    const r = await write({
+      releaseMethod: "immediate",
+      stages: [{ allocation: 100000, durationMillis: 300000 }, { allocation: 50000, durationMillis: 300000 }],
+    });
+    assert.equal(r.isError, true, r.content);
+    assert.match(r.content, /IGNORES stages entirely/, "THE DISCRIMINATOR: ignored, not inherited");
+    assert.match(r.content, /never reads a stage set/, "and why");
+    assert.doesNotMatch(r.content, /inherits the policy/, "so no inheritance is promised");
+    assert.doesNotMatch(r.content, /guarded cap/, "and no cap is claimed for a method that has none");
+  });
+
+  it("does not quote back a releaseMethod it does not recognise", async () => {
+    // PREVENTS PRESENTING GARBAGE AS A DECISION. `write_manifest` does not validate `releaseMethod`
+    // (noted for the owner, deliberately not changed here), so an unrecognised value reaches this
+    // message — and interpolating it as `releaseMethod "<whatever>"` reads as though Beacon accepted it
+    // and will act on it. This branch was also unpinned: nothing in tests/ matched it.
+    const r = await write({
+      releaseMethod: "instant",
+      stages: [{ allocation: 50000, durationMillis: 300000 }, { allocation: 20000, durationMillis: 300000 }],
+    });
+    assert.equal(r.isError, true, r.content);
+    assert.match(
+      r.content,
+      /not one of "guarded", "progressive" or "immediate", and nothing here validates it/,
+      "THE DISCRIMINATOR: the value is described, not quoted back as a method",
+    );
+    assert.doesNotMatch(r.content, /releaseMethod "instant"/, "so it is never echoed as if it were valid");
+  });
+
   it("allows a 100% stage for a PROGRESSIVE release — the cap is guarded-only", async () => {
     // The control arm. A progressive rollout has no metric comparison and no control group to
     // preserve, and the demo defaults themselves end at 100%.
