@@ -29,12 +29,36 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
+/**
+ * Bumped whenever the ledger's shape or KEYING changes. The file is persisted state, and
+ * `FilePendingStore` throws only on an unreadable file — so without a version, a file written
+ * under the old keying would load with wrong keys SILENTLY, which is how a stale entry would
+ * outlive the fix that re-keyed it.
+ *
+ * v1: keyed by sourceFile. (An unreleased pre-v1 shape keyed by flagKey; see the note on
+ * `sourceFile` below for why that was wrong.)
+ */
+export const PENDING_LEDGER_VERSION = 1;
+
 export interface PendingEntry {
   service: string;
   environment: string;
-  flagKey: string;
-  /** Path of the manifest, re-read at the CURRENT sha on each re-evaluation. */
+  /**
+   * THE IDENTITY of a unit of release work, together with service+environment.
+   *
+   * The manifest's ADDRESS, not its content. An earlier revision keyed on `flagKey` and
+   * merely remembered this — which was backwards, and produced the worst defect on the
+   * branch: `flagKey` is manifest content, so a human correcting a wrong key (exactly the
+   * fix an `error` entry invites) left the safety guard checking the OLD flag while the
+   * trigger fired on the NEW one, re-releasing a variation a guardrail had rolled back. The
+   * entry also never cleared, so it repeated on every deploy.
+   *
+   * Keyed on the address, the guard always runs against the flag we are about to act on,
+   * because that flag comes from the manifest we just read.
+   */
   sourceFile: string;
+  /** LAST KNOWN flag this manifest named. Reporting only — never an identity or a guard input. */
+  flagKey: string;
   /** The sha whose deploy first produced a non-final outcome. */
   firstSeenSha: string;
   /** The sha of the most recent evaluation. */
@@ -55,11 +79,11 @@ export interface PendingStore {
   /** Entries awaiting re-evaluation for one service+environment. */
   list(service: string, environment: string): PendingEntry[];
   upsert(entry: PendingEntry): void;
-  clear(service: string, environment: string, flagKey: string): void;
+  clear(service: string, environment: string, sourceFile: string): void;
 }
 
-const key = (service: string, environment: string, flagKey: string): string =>
-  `${service}@${environment}#${flagKey}`;
+const key = (service: string, environment: string, sourceFile: string): string =>
+  `${service}@${environment}#${sourceFile}`;
 
 export class MemoryPendingStore implements PendingStore {
   protected entries = new Map<string, PendingEntry>();
@@ -69,12 +93,12 @@ export class MemoryPendingStore implements PendingStore {
   }
 
   upsert(entry: PendingEntry): void {
-    this.entries.set(key(entry.service, entry.environment, entry.flagKey), entry);
+    this.entries.set(key(entry.service, entry.environment, entry.sourceFile), entry);
     this.persist();
   }
 
-  clear(service: string, environment: string, flagKey: string): void {
-    if (this.entries.delete(key(service, environment, flagKey))) this.persist();
+  clear(service: string, environment: string, sourceFile: string): void {
+    if (this.entries.delete(key(service, environment, sourceFile))) this.persist();
   }
 
   /** No-op in memory; the file-backed subclass writes. */
@@ -99,8 +123,21 @@ export class FilePendingStore extends MemoryPendingStore {
     super();
     this.file = resolve(filePath);
     try {
-      const raw = JSON.parse(readFileSync(this.file, "utf8")) as Record<string, PendingEntry>;
-      this.entries = new Map(Object.entries(raw));
+      const raw = JSON.parse(readFileSync(this.file, "utf8")) as {
+        version?: number;
+        entries?: Record<string, PendingEntry>;
+      };
+      // Refuse an unrecognised version rather than guess at the keying. A file written under
+      // a different scheme would otherwise load with keys that never match a lookup, so
+      // entries would be re-created alongside their stale twins and never clear.
+      if (raw.version !== PENDING_LEDGER_VERSION) {
+        throw new Error(
+          `pending-release ledger '${this.file}' is version ${String(raw.version)}, this build expects ` +
+            `${PENDING_LEDGER_VERSION}. Delete the file to start fresh — the flags it tracked will need a ` +
+            `manual re-POST, or will be picked up the next time their manifest changes.`,
+        );
+      }
+      this.entries = new Map(Object.entries(raw.entries ?? {}));
     } catch (e) {
       if ((e as { code?: string }).code !== "ENOENT") {
         throw new Error(
@@ -118,7 +155,10 @@ export class FilePendingStore extends MemoryPendingStore {
     if (!this.loaded) return; // constructor-time population is not a write
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.entries), null, 2));
+    writeFileSync(
+      tmp,
+      JSON.stringify({ version: PENDING_LEDGER_VERSION, entries: Object.fromEntries(this.entries) }, null, 2),
+    );
     renameSync(tmp, this.file);
   }
 }
@@ -145,12 +185,10 @@ export function recordOutcome(
   },
 ): void {
   if (!PENDING_ACTIONS.includes(o.action)) {
-    store.clear(o.service, o.environment, o.flagKey);
+    store.clear(o.service, o.environment, o.sourceFile);
     return;
   }
-  const existing = store
-    .list(o.service, o.environment)
-    .find((e) => e.flagKey === o.flagKey);
+  const existing = store.list(o.service, o.environment).find((e) => e.sourceFile === o.sourceFile);
   store.upsert({
     service: o.service,
     environment: o.environment,

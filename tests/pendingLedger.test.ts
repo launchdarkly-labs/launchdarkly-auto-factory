@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { FilePendingStore, MemoryPendingStore, PENDING_ACTIONS, recordOutcome } from "@auto-factory/beacon";
+import {
+  FilePendingStore,
+  MemoryPendingStore,
+  PENDING_ACTIONS,
+  PENDING_LEDGER_VERSION,
+  recordOutcome,
+} from "@auto-factory/beacon";
 
 // ---------------------------------------------------------------------------
 // The re-evaluation ledger.
@@ -107,6 +113,39 @@ describe("FilePendingStore", () => {
     recordOutcome(a, entry("enable-one", "held"));
     recordOutcome(a, entry("enable-one", "released"));
     assert.deepEqual(new FilePendingStore(file).list("demo-backend", "production"), []);
+  });
+
+  it("REFUSES a file whose version it does not recognise", () => {
+    // The keying changed once (flagKey → sourceFile). Without a version, a file written
+    // under the old scheme loads with keys that never match a lookup, so entries are
+    // re-created alongside stale twins that never clear — silently. That is worse than a
+    // refusal, which an operator sees at boot.
+    const dir = tmpDir();
+    const file = join(dir, "pending.json");
+    writeFileSync(file, JSON.stringify({ version: PENDING_LEDGER_VERSION + 1, entries: {} }));
+    assert.throws(() => new FilePendingStore(file), /version/);
+  });
+
+  it("REFUSES the pre-version shape (a bare map of entries)", () => {
+    const dir = tmpDir();
+    const file = join(dir, "pending.json");
+    // Exactly what the previous revision wrote: a flat map, keyed by flagKey, no version.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        "demo-backend@production#enable-one": {
+          service: "demo-backend",
+          environment: "production",
+          flagKey: "enable-one",
+          sourceFile: ".release-flags/enable-one.json",
+          firstSeenSha: "sha1",
+          lastSha: "sha1",
+          lastAction: "held",
+          attempts: 1,
+        },
+      }),
+    );
+    assert.throws(() => new FilePendingStore(file), /version/);
   });
 
   it("REFUSES TO START on an unreadable ledger rather than silently forgetting", () => {

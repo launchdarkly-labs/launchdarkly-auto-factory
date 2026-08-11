@@ -68,6 +68,8 @@ function ghAlways(manifest: unknown, opts: { missingAt?: string } = {}): GitHubC
 interface LdOpts {
   /** Releases returned by the automated-releases listing, newest first. */
   releases?: Array<{ id: string; status: string }>;
+  /** Per-flag releases, for tests where two flags must differ. Overrides `releases`. */
+  releasesByFlag?: Record<string, Array<{ id: string; status: string }>>;
   releasesThrows?: boolean;
   /** Variation the environment currently serves ("off" = a dark flag awaiting release). */
   served?: "on" | "off";
@@ -79,7 +81,9 @@ function fakeLd(patches: unknown[], o: LdOpts = {}): LdClient {
     async request(opts: { path: string }): Promise<{ status: number; ok: boolean; data: unknown }> {
       if (opts.path.includes("/automated-releases")) {
         if (o.releasesThrows) throw new Error("connection reset");
-        return { status: 200, ok: true, data: { items: o.releases ?? [] } };
+        const flagKey = opts.path.split("/flags/")[1]?.split("/")[0] ?? "";
+        const items = o.releasesByFlag ? (o.releasesByFlag[flagKey] ?? []) : (o.releases ?? []);
+        return { status: 200, ok: true, data: { items } };
       }
       if (opts.path.includes("/release-settings")) return { status: 404, ok: true, data: null };
       if (opts.path.includes("/dependent-flags") || opts.path.includes("/flags?")) {
@@ -343,5 +347,118 @@ describe("re-POST safety: a repeat evaluation of an already-processed sha", () =
     // The idempotency guard also cannot read, so this is a 503 either way — the point is
     // that nothing was written.
     assert.equal(r.status, 503);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Round nine, finding 1 (CRITICAL): the ledger's identity must be the manifest's
+// ADDRESS, not its content.
+//
+// An earlier revision keyed entries on flagKey and merely remembered sourceFile. So
+// when a human fixed a manifest by correcting the flag key — exactly the fix an
+// `error`/`held` entry invites — the safety guard inspected the OLD flag while the
+// trigger fired on the NEW one, starting a second rollout of a variation a guardrail
+// had rolled back. The entry then never cleared (recordOutcome keyed by the outcome's
+// flag), so it repeated on every deploy: Beacon and the guardrail fighting each other.
+//
+// These tests hold the FILENAME and the SHA-direction fixed and vary the FLAGKEY —
+// the axis every pre-existing ledger test held constant, which is why this passed.
+// ---------------------------------------------------------------------------
+describe("ledger identity: the manifest's address, not its content", () => {
+  const heldAs = (flagKey: string) => ({
+    flagKey,
+    scope: "backend",
+    releaseIntent: { action: "auto", notBefore: "next tuesday" },
+  });
+
+  it("guards the flag the manifest names NOW, not the one it used to name", async () => {
+    const patches: unknown[] = [];
+    let manifest: unknown = heldAs("flag-a");
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return ["pr-1.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return manifest;
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    // flag-b's newest release was REVERTED by a guardrail; flag-a has no releases.
+    const h = await harness(
+      gh,
+      fakeLd(patches, { served: "off", releasesByFlag: { "flag-b": [{ id: "rel-1", status: "reverted" }] } }),
+      patches,
+    );
+
+    await h.post("sha1");
+    const [entry] = h.pending.list("demo-backend", "production");
+    assert.equal(entry?.sourceFile, ".release-flags/pr-1.json", "the entry is keyed by the manifest path");
+    assert.equal(entry?.flagKey, "flag-a", "the flag it named is remembered for reporting");
+
+    // The human fixes the manifest: it should have pointed at flag-b all along.
+    manifest = heldAs("flag-b");
+    const before = patches.length;
+    const second = await h.post("sha2");
+
+    const o = second.json.outcomes.find((x: any) => x.sourceFile === ".release-flags/pr-1.json");
+    assert.ok(o, "the entry is re-evaluated");
+    assert.equal(o.flag, "flag-b", "the outcome is about the flag the manifest names now");
+    assert.equal(o.needsHuman, true, "flag-b's guardrail rollback must be respected");
+    assert.equal(patches.length, before, "THE DISCRIMINATOR: no second rollout of the reverted variation");
+  });
+
+  it("does not leave a zombie entry when the flagKey changes", async () => {
+    // The entry must still be ONE entry, updated — not a stale twin that never clears.
+    const patches: unknown[] = [];
+    let manifest: unknown = heldAs("flag-a");
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return ["pr-1.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return manifest;
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    const h = await harness(gh, fakeLd(patches, { served: "off" }), patches);
+
+    await h.post("sha1");
+    manifest = { flagKey: "flag-b", scope: "backend" }; // fixed key AND fixed intent
+    await h.post("sha2");
+
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production"),
+      [],
+      "the release succeeded under the new key, so the entry clears — no stale twin",
+    );
+  });
+
+  it("two manifests naming the same flag are two entries, not one", async () => {
+    // A consequence of address-keying, accepted deliberately: two manifests are two units
+    // of work. The second is harmless — it finds the release already running, or noops.
+    const patches: unknown[] = [];
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return ["pr-1.json", "pr-2.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return heldAs("same-flag");
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    const h = await harness(gh, fakeLd(patches, { served: "off" }), patches);
+    await h.post("sha1");
+    const paths = h.pending
+      .list("demo-backend", "production")
+      .map((e) => e.sourceFile)
+      .sort();
+    assert.deepEqual(paths, [".release-flags/pr-1.json", ".release-flags/pr-2.json"]);
   });
 });

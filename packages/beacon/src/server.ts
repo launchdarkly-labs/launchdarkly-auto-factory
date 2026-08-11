@@ -41,6 +41,13 @@ import { triggerRelease } from "./trigger.js";
 
 interface FlagOutcome {
   flag: string;
+  /**
+   * The manifest this outcome is about. THE LEDGER'S IDENTITY, carried on the outcome so the
+   * fold-back needs no side lookup — an earlier revision used a flagKey→sourceFile map with a
+   * `?? ""` fallback, and an empty path made the next re-read fetch nothing, get null, and
+   * silently clear the entry.
+   */
+  sourceFile: string;
   scope: string;
   action: "released" | "held" | "noop" | "already_running" | "skipped" | "waiting" | "error";
   detail?: unknown;
@@ -182,8 +189,6 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     // STRANDS with a 200 and a log that asks for a re-POST. A stranded release is
     // recoverable by a human; re-releasing a reverted flag is not.
     let guardUnverifiable = false;
-    /** flagKey → manifest path, so the ledger knows what to re-read next time. */
-    const sourceFiles = new Map<string, string>();
 
     /**
      * Evaluate ONE manifest, returning its outcome rather than pushing it.
@@ -194,12 +199,11 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
      * release or two.
      */
     const processFlag = async (flag: DiscoveredFlag): Promise<FlagOutcome> => {
-      sourceFiles.set(flag.flagKey, flag.sourceFile);
       const scope = flag.scope ?? "frontend";
       const decision = decideScope(scope, service.side);
 
       if (decision === "skip") {
-        return { flag: flag.flagKey, scope, action: "skipped", detail: "other side handles this scope" };
+        return { flag: flag.flagKey, sourceFile: flag.sourceFile, scope, action: "skipped", detail: "other side handles this scope" };
       }
       if (decision === "check_fullstack") {
         // TRI-STATE (see fullstack.ts). The classifier is kept for the DIAGNOSIS, which
@@ -224,6 +228,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           );
           return {
             flag: flag.flagKey,
+            sourceFile: flag.sourceFile,
             scope,
             action: "error",
             detail: `fullstack readiness could not be VERIFIED (not a verdict on the other side) — release not started; the ledger will re-check on a later deploy, or re-POST to retry now: ${readiness.reason}`,
@@ -238,7 +243,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
               `service '${n.service}' deployed at ${n.sha} but the other side hasn't yet. ` +
               `If its notification never arrives, re-POST /flag-releases for this service once both are deployed.`,
           );
-          return { flag: flag.flagKey, scope, action: "waiting", detail: "other service not deployed yet" };
+          return { flag: flag.flagKey, sourceFile: flag.sourceFile, scope, action: "waiting", detail: "other service not deployed yet" };
         }
       }
       try {
@@ -264,6 +269,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           );
           return {
             flag: flag.flagKey,
+            sourceFile: flag.sourceFile,
             scope,
             action: "error",
             detail: `idempotency check failed — release NOT started (answered 503; the ledger will re-check on a later deploy, or re-POST to retry now): ${String(e)}`,
@@ -271,7 +277,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         }
         if (active) {
           onReleaseStarted(flag.flagKey, n.environment); // re-attach monitoring (e.g. after a Beacon restart)
-          return { flag: flag.flagKey, scope, action: "already_running", detail: { releaseId: active.id } };
+          return { flag: flag.flagKey, sourceFile: flag.sourceFile, scope, action: "already_running", detail: { releaseId: active.id } };
         }
         // A REPEAT evaluation of an already-processed sha must not re-release a flag whose
         // release LaunchDarkly already reverted. `findActiveRelease` above excludes terminal
@@ -289,6 +295,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
             guardUnverifiable = true;
             return {
               flag: flag.flagKey,
+              sourceFile: flag.sourceFile,
               scope,
               action: "error",
               detail: `re-evaluating an already-processed sha and the release history could not be read — NOT re-triggering: ${String(e)}`,
@@ -302,6 +309,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
             );
             return {
               flag: flag.flagKey,
+              sourceFile: flag.sourceFile,
               scope,
               action: "error",
               needsHuman: true,
@@ -333,6 +341,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         }
         return {
           flag: flag.flagKey,
+          sourceFile: flag.sourceFile,
           scope,
           action: result.method === "held" ? "held" : result.method === "noop" ? "noop" : "released",
           detail: result,
@@ -357,6 +366,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         );
         return {
           flag: flag.flagKey,
+          sourceFile: flag.sourceFile,
           scope,
           action: "error",
           detail: `release trigger failed — not started; ledger will re-check on a later deploy, or re-POST to retry now: ${String(e)}`,
@@ -370,13 +380,13 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
      * only path that reaches it.
      */
     const reEvaluate = async (entry: PendingEntry): Promise<FlagOutcome> => {
-      const tag = `${entry.flagKey} (pending since ${entry.firstSeenSha.slice(0, 8)}, attempt ${entry.attempts + 1})`;
-      sourceFiles.set(entry.flagKey, entry.sourceFile);
+      const tag = `${entry.sourceFile} (last named ${entry.flagKey}, pending since ${entry.firstSeenSha.slice(0, 8)}, attempt ${entry.attempts + 1})`;
 
       if (entry.needsHuman) {
         // Reported every time, never retried: see the terminal-status branch below.
         return {
           flag: entry.flagKey,
+          sourceFile: entry.sourceFile,
           scope: "ledger",
           action: "error",
           viaLedger: true,
@@ -394,6 +404,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       } catch (e) {
         return {
           flag: entry.flagKey,
+          sourceFile: entry.sourceFile,
           scope: "ledger",
           action: "error",
           viaLedger: true,
@@ -406,6 +417,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         console.log(`[beacon] ledger: ${tag} — manifest absent at ${n.sha}, no longer pending`);
         return {
           flag: entry.flagKey,
+          sourceFile: entry.sourceFile,
           scope: "ledger",
           action: "skipped",
           viaLedger: true,
@@ -418,13 +430,28 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       // would answer "nothing running" for a release LaunchDarkly already REVERTED, and
       // triggerRelease would start a second rollout of the variation the guardrail just rolled
       // back. Manual re-POST had the same hazard; the ledger would have made it automatic.
+      //
+      // IT MUST GUARD THE FLAG WE ARE ABOUT TO ACT ON, which is the one the manifest names
+      // NOW — `parsed.flagKey`, not `entry.flagKey`. An earlier revision used the remembered
+      // key, so a human correcting a wrong flagKey (exactly the fix an `error` entry invites)
+      // had the guard inspect the old flag while the trigger fired on the new one. Keying the
+      // ledger on the manifest's address rather than its content is what makes these the same
+      // value in the normal case and makes the difference visible in the abnormal one.
+      const actingOn = parsed.flagKey;
+      if (actingOn !== entry.flagKey) {
+        console.log(
+          `[beacon] ledger: ${entry.sourceFile} now names '${actingOn}' (was '${entry.flagKey}') — ` +
+            `guarding and acting on the CURRENT flag`,
+        );
+      }
       let latest: AutomatedRelease | null;
       try {
-        latest = await findLatestRelease(ld, entry.flagKey, n.environment);
+        latest = await findLatestRelease(ld, actingOn, n.environment);
       } catch (e) {
         // Fail closed: no terminal history means no permission to trigger.
         return {
           flag: entry.flagKey,
+          sourceFile: entry.sourceFile,
           scope: "ledger",
           action: "error",
           viaLedger: true,
@@ -436,9 +463,10 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           // Finished while nobody watched. This is the observation the ledger exists for:
           // repoint the children that were pinned to the previous variation.
           console.log(`[beacon] ledger: ${tag} — release ${latest.id} COMPLETED while unwatched; repointing children`);
-          await repointDependentPrerequisites(ld, entry.flagKey, n.environment);
+          await repointDependentPrerequisites(ld, actingOn, n.environment);
           return {
-            flag: entry.flagKey,
+            flag: actingOn,
+            sourceFile: entry.sourceFile,
             scope: "ledger",
             action: "noop",
             viaLedger: true,
@@ -451,7 +479,8 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
             `decide (fix the regression and deploy again, which starts a fresh release).`,
         );
         return {
-          flag: entry.flagKey,
+          flag: actingOn,
+          sourceFile: entry.sourceFile,
           scope: "ledger",
           action: "error",
           viaLedger: true,
@@ -492,7 +521,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         environment: n.environment,
         sha: n.sha,
         flagKey: o.flag,
-        sourceFile: sourceFiles.get(o.flag) ?? "",
+        sourceFile: o.sourceFile,
         action: o.action,
         ...(o.detail !== undefined ? { detail: typeof o.detail === "string" ? o.detail : JSON.stringify(o.detail) } : {}),
         ...(o.needsHuman ? { needsHuman: true } : {}),
