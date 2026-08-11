@@ -115,12 +115,12 @@ from idea to customer value, with control where uncertainty is highest.
 
 | Component | Used in | What it adds |
 |---|---|---|
-| **Config Bridge** | **Build** | Provisioning and synchronization for Agent Configs, Tools, Agent Graphs, flags, and metrics |
-| **Graph walker and runners** | **Build** | Agent traversal, model-provider execution, routing, approvals, and handoffs |
-| **Sandbox tools and safety gates** | **Build** | Code edits, flag and metric creation, test execution, capability limits, and evidence checks |
-| **Knowledge graph** | **Build** | Per-run composition of observability traces, code references, and repository context |
-| **Release manifest** | **Build, Deploy, Release** | A versioned contract carrying release plan, human intent, metrics, dependencies, and scope through deployment |
-| **Beacon** | **Deploy, Release** | Deploy notification handling, manifest discovery, intent enforcement, release triggering, and outcome monitoring |
+| **[Config Bridge](packages/config-bridge/README.md)** | **Build** | Provisioning and synchronization for Agent Configs, Tools, Agent Graphs, flags, and metrics |
+| **[Graph walker and runners](packages/shared/README.md#what-it-owns)** | **Build** | Agent traversal, model-provider execution, routing, approvals, and handoffs |
+| **[Sandbox tools and safety gates](packages/shared/README.md#change-agent-capabilities)** | **Build** | Code edits, flag and metric creation, test execution, capability limits, and evidence checks |
+| **[Knowledge graph](packages/shared/README.md#add-production-context)** | **Build** | Per-run composition of observability traces, code references, and repository context |
+| **[Release manifest](docs/adr/0009-release-intent-and-manifest-steward.md)** | **Build, Deploy, Release** | A versioned contract carrying release plan, human intent, metrics, dependencies, and scope through deployment |
+| **[Beacon](packages/beacon/README.md)** | **Deploy, Release** | Deploy notification handling, manifest discovery, intent enforcement, release triggering, and outcome monitoring |
 
 Claude Code and Cursor provide execution surfaces. Sentry provides external error telemetry
 and Seer Autofix. They integrate with this reference implementation; LaunchDarkly provides
