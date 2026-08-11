@@ -103,6 +103,10 @@ interface MvState {
    * shape in which Beacon cannot know whether it wrote.
    */
   patchLandsThenThrows?: (patch: Patch) => boolean;
+  /** Boolean flags a manifest may name as a `releaseIntent` prerequisite parent. */
+  parents?: string[];
+  /** Make the automated-releases listing throw, for the fail-closed early return. */
+  releasesThrow?: boolean;
 }
 
 const mvState = (o: Partial<MvState> = {}): MvState => ({
@@ -126,6 +130,7 @@ function fakeMvLd(state: MvState, patches: Patch[]): LdClient {
     projectKey: "p",
     async request(opts: { path: string }): Promise<{ status: number; ok: boolean; data: unknown }> {
       if (opts.path.includes("/automated-releases")) {
+        if (state.releasesThrow) throw new Error("connection reset");
         return { status: 200, ok: true, data: { items: state.releases } };
       }
       // 200 with empty fields is what a live environment with no policy returns; a 404 would
@@ -150,6 +155,17 @@ function fakeMvLd(state: MvState, patches: Patch[]): LdClient {
                 fallthrough: { variation: idx(state.served) },
               },
             },
+          },
+        };
+      }
+      if (state.parents?.includes(key)) {
+        // A boolean prerequisite parent: `parentPinVariation` pins its `true` variation.
+        return {
+          status: 200,
+          ok: true,
+          data: {
+            variations: [{ _id: "id-parent-on", value: true }, { _id: "id-parent-off", value: false }],
+            environments: { production: { on: true } },
           },
         };
       }
@@ -326,6 +342,55 @@ describe("a trigger that THREW may have written, so it claims the flag's slot", 
       h.pending.list("demo-backend", "production").map((e) => e.sourceFile).sort(),
       [path(40), path(41)],
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EVERY writing method claims the slot. `performedAWrite` could lose "prerequisites" or
+// "immediate" without failing a single test, and either loss lets a sibling manifest start a
+// rollout on a flag this notification has already patched.
+// ---------------------------------------------------------------------------
+describe("every method that WROTE claims the flag's action slot", () => {
+  it("a `prerequisites` release claims it, so a sibling cannot start a rollout behind it", async () => {
+    // Both manifests ask for v2, so the (stable) sort cannot reorder them: pr-50 is evaluated
+    // first and patches the flag ON serving v2 behind a prerequisite. Unclaimed, pr-51 then starts
+    // a progressive rollout from a fallthrough this same notification wrote.
+    const h = await harness(
+      ghWith([`pr-50.json`, `pr-51.json`], {
+        [path(50)]: manifest("v2", {
+          releaseIntent: { prerequisites: [{ flagKey: "parent-flag", variation: "on" }] },
+        }),
+        [path(51)]: manifest("v2"),
+      }),
+      mvState({ parents: ["parent-flag"] }),
+    );
+    const r = await h.post("sha1");
+    assert.equal(outcomeFor(r.json, 50).action, "released");
+    assert.ok(
+      h.patches.some((p) => p.instructions.some((i) => i.kind === "addPrerequisite")),
+      "pr-50 really did write",
+    );
+    assert.equal(h.starts().length, 0, "THE DISCRIMINATOR: no rollout on a flag already written this round");
+    assert.equal(outcomeFor(r.json, 51).action, "held");
+    assert.match(String(outcomeFor(r.json, 51).detail), /deferred/, "deferred non-finally, so it is re-checked");
+  });
+
+  it("an `immediate` release claims it too", async () => {
+    const h = await harness(
+      ghWith([`pr-50.json`, `pr-51.json`], {
+        [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }),
+        [path(51)]: manifest("v2"),
+      }),
+      mvState(),
+    );
+    const r = await h.post("sha1");
+    assert.equal(outcomeFor(r.json, 50).action, "released");
+    assert.ok(
+      h.patches.some((p) => p.instructions.some((i) => i.kind === "updateFallthroughVariationOrRollout")),
+      "pr-50 really did write",
+    );
+    assert.equal(h.starts().length, 0, "THE DISCRIMINATOR: no rollout on a flag already written this round");
+    assert.match(String(outcomeFor(r.json, 51).detail), /deferred/);
   });
 });
 
@@ -564,5 +629,92 @@ describe("a release that completed unwatched still repoints its children", () =>
     assert.equal(h.starts()[0]?.originalVariationId, "id-v1", "the iteration moves users off what is served");
     assert.equal(h.starts()[0]?.targetVariationId, "id-v2");
     assert.deepEqual(h.pending.list("demo-backend", "production"), [], "released ⇒ no longer pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ledger's terminal gate, and what its early returns report. A sabotage sweep found each
+// of these silently survivable: the `monitoring_stopped` half of the gate was unasserted, and
+// every `targetOf(...)` spread on an early return could be deleted with all tests green.
+// ---------------------------------------------------------------------------
+describe("the ledger refuses BOTH non-completed terminal statuses", () => {
+  it("monitoring_stopped is refused exactly like reverted", async () => {
+    // PREVENTS narrowing the gate to `status === "reverted"`. A release whose monitoring stopped
+    // is FINISHED WITHOUT HAVING COMPLETED — it can be parked mid-ramp with nobody watching — so
+    // re-triggering it is the same hazard as re-releasing a reverted variation. Since the question
+    // now has one implementation (`terminalHistoryRefusal`), this covers the repeat-sha path too.
+    const h = await harness(
+      ghWith([`pr-41.json`], { [path(41)]: manifest("v2") }),
+      mvState({ releases: [{ id: "rel-9", status: "monitoring_stopped" }] }),
+    );
+    h.seed(41, "v2");
+    const r = await h.post("sha1", "sha0");
+    const o = outcomeFor(r.json, 41);
+    assert.equal(o.action, "error");
+    assert.equal(o.needsHuman, true);
+    assert.match(String(o.detail), /monitoring_stopped/);
+    assert.deepEqual(h.patches, [], "THE DISCRIMINATOR: nothing re-triggered");
+    assert.equal(o.targetVariation, "v2", "and the refusal still names the variation it refused");
+  });
+});
+
+describe("every ledger early return still names the variation it is about", () => {
+  // PREVENTS deleting any `targetOf(...)` spread on an early return. `recordOutcome` writes back
+  // what it is GIVEN and deliberately does not merge with the stored value (a manifest that drops
+  // its target now means "the tip"), so a missing spread silently ERASES the field from the
+  // ledger — and then every log line names a flag that four manifests also name, with no way to
+  // tell which PR's work is waiting.
+
+  it("a manifest that cannot be re-read keeps its variation, on the outcome and in the ledger", async () => {
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return [`pr-41.json`];
+      },
+      async getFileJson(): Promise<unknown> {
+        throw new Error("502 from GitHub");
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    const h = await harness(gh, mvState());
+    h.seed(41, "v2");
+    const r = await h.post("sha1", "sha0");
+    const o = outcomeFor(r.json, 41);
+    assert.equal(o.action, "error");
+    assert.equal(o.targetVariation, "v2", "THE DISCRIMINATOR: the outcome still says which variation");
+    assert.equal(
+      h.pending.list("demo-backend", "production")[0]?.targetVariation,
+      "v2",
+      "and the fold-back does not erase it",
+    );
+  });
+
+  it("a withdrawn manifest names its variation as it leaves the ledger", async () => {
+    // Final, so this is the LAST report about this work — the one place a lost variation can
+    // never be recovered on a later deploy.
+    const h = await harness(ghWith([`pr-41.json`], {}), mvState());
+    h.seed(41, "v2");
+    const r = await h.post("sha1", "sha0");
+    const o = outcomeFor(r.json, 41);
+    assert.equal(o.action, "skipped");
+    assert.equal(o.targetVariation, "v2", "THE DISCRIMINATOR: the final word names the work");
+    assert.deepEqual(h.pending.list("demo-backend", "production"), [], "withdrawn ⇒ dropped");
+  });
+
+  it("an unreadable release history names the FRESHLY READ variation", async () => {
+    // This one reports `parsed.targetVariation`, not the remembered one: the manifest was read
+    // successfully, so a human's edit to the target must show up even though the guard failed.
+    const h = await harness(
+      ghWith([`pr-41.json`], { [path(41)]: manifest("v2") }),
+      mvState({ releasesThrow: true }),
+    );
+    h.seed(41, "v1"); // stale: the manifest has since been edited to v2
+    const r = await h.post("sha1", "sha0");
+    const o = outcomeFor(r.json, 41);
+    assert.equal(o.action, "error");
+    assert.match(String(o.detail), /release history/);
+    assert.equal(o.targetVariation, "v2", "THE DISCRIMINATOR: as read now, not as remembered");
+    assert.equal(h.pending.list("demo-backend", "production")[0]?.targetVariation, "v2");
   });
 });

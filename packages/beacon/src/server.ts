@@ -38,7 +38,7 @@ import { FilePendingStore, recordOutcome, type PendingEntry, type PendingStore }
 import { parseRailwayWebhook } from "./railway.js";
 import { decideScope } from "./scope.js";
 import { FileDeployStateStore, resolvePreviousSha, type DeployStateStore } from "./state.js";
-import { triggerRelease } from "./trigger.js";
+import { triggerRelease, type TriggerResult } from "./trigger.js";
 
 interface FlagOutcome {
   flag: string;
@@ -120,9 +120,34 @@ function highestTargetFirst<T>(items: T[], target: (item: T) => string | undefin
   return [...items].sort((a, b) => targetRank(target(b)) - targetRank(target(a)));
 }
 
-/** Methods that WROTE to LaunchDarkly. Only these may claim the per-flag action slot. */
-function performedAWrite(method: string): boolean {
-  return method === "progressive" || method === "guarded" || method === "immediate" || method === "prerequisites";
+/**
+ * Methods that WROTE to LaunchDarkly. Only these — plus a trigger that THREW, see the catch in
+ * `evaluateManifest` — may claim the per-flag action slot.
+ *
+ * A SWITCH over `TriggerResult["method"]` rather than a string disjunction, so a future
+ * `ReleaseKind` fails to compile here instead of being silently classified as a non-write. Silence
+ * is the destructive direction: an unclassified write leaves the flag's slot open and a sibling
+ * manifest then releases a different variation of a flag we just patched. The old disjunction could
+ * lose `"prerequisites"` or `"immediate"` without failing a single test.
+ */
+function performedAWrite(method: TriggerResult["method"]): boolean {
+  switch (method) {
+    case "progressive":
+    case "guarded":
+    case "immediate":
+    case "prerequisites":
+      return true;
+    case "held":
+    case "noop":
+      return false;
+    default: {
+      // Unreachable while the union is exhaustive; adding a member breaks this assignment. If it
+      // ever runs, it throws inside `evaluateManifest`'s try — which claims the slot and reports
+      // `error`, i.e. fails closed rather than guessing "did not write".
+      const unclassified: never = method;
+      throw new Error(`unclassified release method '${String(unclassified)}' — refusing to guess whether it wrote`);
+    }
+  }
 }
 
 /**
