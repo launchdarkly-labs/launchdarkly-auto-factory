@@ -97,6 +97,12 @@ interface MvState {
   releases: Array<{ id: string; status: string }>;
   /** Child flags prerequisite'd on FLAG, for the repointing assertion. */
   children: Record<string, { pinned: string; tags?: string[] }>;
+  /**
+   * "The patch LANDED and the response was lost." Recorded first, then thrown — which is exactly
+   * what a proxy 5xx or a truncated body does to `startRelease`'s `await res.text()`, and the one
+   * shape in which Beacon cannot know whether it wrote.
+   */
+  patchLandsThenThrows?: (patch: Patch) => boolean;
 }
 
 const mvState = (o: Partial<MvState> = {}): MvState => ({
@@ -167,6 +173,9 @@ function fakeMvLd(state: MvState, patches: Patch[]): LdClient {
       instructions: Array<Record<string, unknown>>,
     ): Promise<unknown> {
       patches.push({ flagKey, instructions });
+      if (state.patchLandsThenThrows?.({ flagKey, instructions })) {
+        throw new Error("socket hang up (the patch landed; the response did not)");
+      }
       return { status: 200, ok: true, data: {} };
     },
   } as unknown as LdClient;
@@ -283,6 +292,40 @@ describe("a manifest that writes nothing must not starve one that can release", 
     assert.equal(h.starts()[0]?.targetVariationId, "id-v2");
     assert.equal(outcomeFor(r.json, 50).action, "held");
     assert.equal(outcomeFor(r.json, 51).action, "released", "THE DISCRIMINATOR: a hold wrote nothing");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THREE WRITE STATES, NOT TWO: wrote, did not write, and DON'T KNOW. "Don't know" used to be
+// filed with "did not write", because the action slot was claimed only on the success return.
+// ---------------------------------------------------------------------------
+describe("a trigger that THREW may have written, so it claims the flag's slot", () => {
+  it("a lost response on v2's start does not let a sibling release v1 behind it", async () => {
+    // PREVENTS: `startRelease` awaits `fetch` and then `res.text()`, so a proxy 5xx or a truncated
+    // body throws AFTER LaunchDarkly applied the patch. With the slot left open, pr-40 releases v1
+    // while v2's rollout may already be live — and NEITHER lineage guard catches it, because
+    // mid-rollout the fallthrough still serves `control`, whose lineage index is undefined, so
+    // both backwards guards fall through. Beacon would ramp production onto the older variation.
+    const state = mvState({
+      patchLandsThenThrows: (p) => p.instructions.some((i) => i.kind === "startAutomatedRelease"),
+    });
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
+      state,
+    );
+
+    const r = await h.post("sha1");
+    assert.equal(h.starts().length, 1, "THE DISCRIMINATOR: exactly one start, even though the first one's answer was lost");
+    assert.equal(h.starts()[0]?.targetVariationId, "id-v2", "and it is v2's — v1 never got a rollout");
+    assert.equal(outcomeFor(r.json, 41).action, "error", "the unknown write is reported as an error, not a success");
+    assert.match(String(outcomeFor(r.json, 40).detail), /deferred/, "the sibling defers");
+
+    // Both non-final, so nothing is discarded: the next deploy re-evaluates both, by which time
+    // the releases listing says what actually happened.
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile).sort(),
+      [path(40), path(41)],
+    );
   });
 });
 

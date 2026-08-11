@@ -263,6 +263,10 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
      * `already_running` deliberately does NOT claim it either: it wrote nothing, and a second
      * manifest's own idempotency read sees the very same active release, which is the correct
      * answer for it too.
+     *
+     * AND A WRITE WHOSE OUTCOME IS UNKNOWN CLAIMS IT TOO. There are three states — wrote, did
+     * not write, don't know — and a trigger that THREW is the third: the patch may have landed
+     * and the response been lost. See the catch at the end of `evaluateManifest`.
      */
     const actedOnFlag = new Set<string>();
 
@@ -443,6 +447,20 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           detail: result,
         };
       } catch (e) {
+        // THREE STATES, NOT TWO: this manifest WROTE, it did NOT write, or WE DO NOT KNOW.
+        // This is "we do not know", and it belongs with "wrote" — not, as it used to, with
+        // "did not write" (the claim above runs only on the success return).
+        //
+        // `triggerRelease` → `startRelease` → `await fetch` → `await res.text()`: a lost
+        // response, a proxy 5xx or a truncated body throws AFTER LaunchDarkly applied the
+        // patch. Leaving the slot open then lets a SIBLING manifest for the same flag release
+        // a variation BEHIND the one that may now be live, and neither lineage guard can stop
+        // it — mid-rollout `servedVariation` still answers `control`, so `servedIndex` is
+        // undefined and both backwards guards fall through. Claiming the slot defers the
+        // sibling NON-FINALLY (it stays in the ledger and is re-evaluated on the next deploy,
+        // by which time the releases listing shows what actually happened), so the cost of
+        // being wrong here is a delay; the cost of the other direction is a rollout backwards.
+        actedOnFlag.add(flag.flagKey);
         // ACKS 200, and this STRANDS the flag. Deliberate, and the reverse of the guard
         // above — the asymmetry is the point.
         //
