@@ -199,12 +199,25 @@ fullstack readiness check no longer fails open, because it is now tri-state (`fu
 first is a verdict. That fix is entirely about **diagnosis**; what to *do* about an unverifiable
 answer is the retry question above, which the ledger owns.
 
-Still open, and known: a redelivery arriving after a release reached a terminal status can start
-a second release (no guard consults terminal history before triggering — `findLatestRelease`
-exists and would serve); a 503'd SHA is recorded, so an intervening deploy breaks the retry;
-`discovery.ts` classifies a transient non-JSON response as a permanently malformed manifest,
-because `SyntaxError` is thrown both by `JSON.parse` on file content and by `res.json()` on a
-proxy interstitial. That last one is a sixth instance of the anti-pattern, inside a fix.
+Since fixed: a re-evaluation arriving after a release reached a terminal status can no longer
+start a second one (both the ledger and a repeat-SHA re-POST consult `findLatestRelease` first),
+and re-recording the prior SHA is a no-op so an intervening deploy no longer makes the next
+deploy re-diff a processed range.
+
+**Still open, and known.** `discovery.ts` classifies a transient non-JSON response as a
+permanently malformed manifest, because `SyntaxError` is thrown both by `JSON.parse` on file
+content and by `res.json()` on a proxy interstitial — so a CDN blip gets the file skipped by
+name, the SHA recorded, and a log that blames the manifest. A **sixth instance of the
+anti-pattern, inside a fix.** The fix is to classify at the source: have `getFileJson`
+distinguish "content failed to parse" from "response failed to parse", and keep only the former
+skippable. Note `req()` is shared, so `listDir`/`fileExists` have the same conflation.
+
+Also open: `findLatestRelease` can bless a STALE completion. If the post-trigger attach attempts
+miss the new release and a *previous* release of the same flag completed — the normal v1→v2
+case — the monitor logs the old release's id, repoints, and returns, leaving the real release
+unwatched. There is no creation timestamp on `AutomatedRelease` to gate on; the only signal is
+`stages[].startedAtMillis`, which is optional. If that proves unusable, reverting to
+warn-and-return is the better trade: missing a repoint beats repointing on the wrong release.
 
 What it still would not fix: it is webhook-gated. A `notBefore` date passing causes nothing
 until *some* deploy arrives. Closing that needs a timer, which makes Beacon a scheduler —
