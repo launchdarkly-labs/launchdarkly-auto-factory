@@ -76,7 +76,7 @@ For a flag-worthy change, review these outputs:
 - error, latency, and business metrics
 - flag wiring and metric instrumentation
 - tests for both flag variations
-- `.release-flags/<flag-key>.json`
+- `.release-flags/pr-<PR-number>.json`, or `pr-<sanitized-branch>.json` when no PR exists
 - an independent review verdict
 
 An approval policy may pause the run before an agent acts. Claude Code will ask whether to

@@ -13,7 +13,7 @@ in the editor.
 | Agent edits | Committed to the PR branch | Left uncommitted |
 | Result | PR comment and check | Sidebar, output log, and notification |
 
-Both paths use the shared graph walker, agents, tools, Judges, and approval policy.
+Both paths use the shared graph walker, agents, tools, and approval policy.
 
 ## Run the extension
 

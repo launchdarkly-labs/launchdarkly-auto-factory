@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "An opinionated software factory reference implementation using LaunchDarkly.",
+  "description": "Autonomous, safe software releases using LaunchDarkly (prototype).",
   "workspaces": [
     "packages/*"
   ],

@@ -76,6 +76,30 @@ completes or rolls back the release.
 - [Cursor extension](packages/phase1-cursor-extension/)
 - [Cursor automation](bootstrap/cursor-automation/)
 
+## Operational notes
+
+- **Approvals:** The default `auto-factory-approval-mode` is `yolo`, which runs unattended.
+  Leave `APPROVAL_MODE` and `RISK_THRESHOLD` unset unless you intend to override the
+  LaunchDarkly approval flags. Environment values silently take precedence.
+- **GitHub Actions:** Actions supplies `GITHUB_TOKEN`. The workflow needs `contents: write`,
+  `pull-requests: write`, and `checks: write`. The `enable_flag_creation` and
+  `enable_code_changes` inputs control whether a run creates LaunchDarkly resources and
+  commits code. The template enables both.
+- **Cursor provider:** Use `auto-factory-cursor.yml`, add `CURSOR_API_KEY`, and serve the
+  `cursor` variation from `auto-factory-ai-provider`.
+- **Public repository:** Never commit internal source material. Run `npm run check:public`
+  before pushing; CI runs the same guard.
+- **Observability and Sentry:** LaunchDarkly observability is on by default; set
+  `DISABLE_LD_OBSERVABILITY=true` to opt out. The `sentry-errors-*` metrics require the
+  LaunchDarkly and Sentry integration using event key `sentry-errors` and Sentry context
+  named `launchdarklyContext`.
+- **Agent Graph:** Runs resolve the graph live from LaunchDarkly. Editing the committed graph
+  alone does not change execution; update it in LaunchDarkly or provision it into a project.
+- **Beacon:** Release-method precedence is manifest override, flag release policy, then a
+  guarded release when metrics exist. Configure `BEACON_MONITOR`,
+  `BEACON_MONITOR_POLL_MS`, and `BEACON_MONITOR_TIMEOUT_MS` as needed. For Railway, the
+  service name in the webhook must match a key in `config/services.yaml`.
+
 ## More detail
 
 - [Beacon](packages/beacon/README.md)

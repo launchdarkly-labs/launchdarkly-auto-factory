@@ -4,6 +4,9 @@ Every software factory is different. This repository is an opinionated reference
 implementation for developing a software factory using **LaunchDarkly primitives**
 alongside tools like **Claude Code, Cursor, and Sentry**.
 
+**Terminology:** Build is Phase 1 in package names and runtime logs. Deploy and Release are
+Phase 2.
+
 ## Why
 
 Software factories have optimized build and deploy. AI accelerates planning, coding,

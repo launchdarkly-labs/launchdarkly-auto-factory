@@ -104,6 +104,7 @@ Graph edges can define:
 | `write_manifest` | Create or update agent-owned manifest fields |
 | `steward_manifest` | Normalize human-owned release intent |
 | `query_graph` | Query dependencies and blast radius |
+| `query_repos` | Research registered sibling repositories |
 | `query_sentry` | Read optional Sentry estate context |
 | `read_docs` | Read allowlisted LaunchDarkly documentation |
 
