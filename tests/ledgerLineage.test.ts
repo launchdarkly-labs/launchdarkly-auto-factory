@@ -345,9 +345,11 @@ describe("a manifest that writes nothing must not starve one that can release", 
 // that rule: `startRelease` awaits `res.text()` AFTER the patch is applied, so a lost
 // response is "we do not know whether we wrote".
 //
-// This one is different in every respect that matters: PRE-WRITE, DETERMINISTIC, and
-// PER-MANIFEST. So the slot claim was not a delay but a permanent loss — and `targetRank`
-// evaluates the HIGHER target first, which is the missing one.
+// This refusal has none of those properties: it happens before any patch is sent, and it
+// happens to THIS file alone, every time. Why that combination is the one the slot claim
+// cannot survive is argued in `PATCH_FAILURE_TAXONOMY` (`packages/beacon/src/trigger.ts`),
+// which is the only place this repo states it. What matters here is the consequence:
+// `targetRank` evaluates the HIGHER target first, and that is the missing one.
 // ---------------------------------------------------------------------------
 describe("a manifest naming a nonexistent variation is HELD, not thrown", () => {
   it("does not starve the sibling that can release, on this deploy or any later one", async () => {
@@ -400,9 +402,17 @@ describe("a manifest naming a nonexistent variation is HELD, not thrown", () => 
 // claims the flag's action slot for any throw — a rule written for LOST RESPONSES, where the patch
 // may already have applied.
 //
-// A client-error status is not a lost response: LaunchDarkly answered, and its answer is that it did
-// not apply the patch. So the failure is deterministic, per-manifest, and recurs on every deploy —
-// the one shape for which claiming the slot starves a releasable sibling PERMANENTLY.
+// An ALLOWLISTED client error is not a lost response: LaunchDarkly answered, and its answer is that
+// it did not apply the patch. Which statuses those are, what each one does and does not prove, and
+// why a throw is the wrong answer for them, are in `PATCH_FAILURE_TAXONOMY`
+// (`packages/beacon/src/trigger.ts`) — not here, and NOT generalised over "any client error", which
+// the four tests below disprove one status at a time.
+//
+// This comment used to end by asserting that such a failure always recurs for one manifest and one
+// manifest only. That was a FIFTH copy of the argument, and it had already drifted: the row for the
+// status the test below uses now records a second cause that is a property of the FLAG, so its blast
+// radius is `unknown`. The copy went stale the moment the table was corrected, which is the whole
+// reason the table is the only home.
 // ---------------------------------------------------------------------------
 describe("a release instruction LaunchDarkly REJECTS is held, not filed as a lost write", () => {
   /** Reject only the patch that starts a release of `id-v2`, i.e. pr-41's. */
@@ -411,10 +421,11 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
       ? { status, message }
       : undefined;
 
-  it("a 400 on pr-41's stages does not starve pr-40, which releases", async () => {
+  it("a 400 on pr-41's stages leaves pr-40 free to release", async () => {
     // PREVENTS: zero releases across every deploy. pr-41 asks for a GUARDED release with a 100%
     // stage — `trigger.ts` documents that LaunchDarkly caps guarded stages at 50% and quotes the
-    // live rejection, so this is a permanent 400 on this manifest and only on this manifest. Ordered
+    // live rejection, so THIS fixture is a rejection of pr-41's own content that recurs on every
+    // deploy. (The status itself proves less than that; see its row.) Ordered
     // highest-target-first, pr-41 goes FIRST; as a throw it claimed the flag's slot and pr-40 was
     // deferred with the report "another manifest released 'checkout-flow' in this notification",
     // which had not happened. Deterministic, so every later deploy repeated it identically.
@@ -437,10 +448,22 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
 
     const fortyOne = outcomeFor(r.json, 41);
     assert.equal(fortyOne.action, "held", "a refusal of manifest content needs a human, not a retry");
+    const note = String(fortyOne.detail.note);
     assert.match(
-      JSON.stringify(fortyOne.detail),
+      note,
       /stage allocation must not exceed 50%/,
       "and it names LAUNCHDARKLY'S OWN message, so the operator knows what to edit",
+    );
+
+    // AND THE CAVEAT COMES FIRST, which is the whole point of it. This status has a second cause
+    // that has nothing to do with the manifest (the row says which), so leading with "the values you
+    // sent are wrong" and hedging afterwards is the same over-claim, just later in the sentence. The
+    // caveat is carried by the ROW (`operatorCaveat`), not by the call site, so it cannot leak onto a
+    // status it is not true of — see the 422 test below for the other half.
+    assert.match(note, /CHECK LAUNCHDARKLY BEFORE EDITING ANYTHING/, "the hedge is present");
+    assert.ok(
+      note.indexOf("CHECK LAUNCHDARKLY") < note.indexOf("releasePlan"),
+      "THE DISCRIMINATOR: it precedes the manifest-blame rather than trailing it",
     );
 
     const forty = outcomeFor(r.json, 40);
@@ -462,10 +485,14 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
   // -------------------------------------------------------------------------
   // THE CLASSIFIER IS AN ALLOWLIST, NOT A DENYLIST.
   //
-  // It used to return a refusal for ANY 4xx except {401, 403, 408, 429}. LaunchDarkly documents six
-  // responses on `PATCH /api/v2/flags/{projectKey}/{featureFlagKey}` — 400, 401, 404, 405, 409, 429 —
-  // so that asserted "this manifest's content is wrong" about three statuses that are nothing of the
-  // kind. The 409 case is not merely mislabelled: it CHANGES WHAT PRODUCTION GETS.
+  // It used to return a refusal for ANY 4xx except a short exclusion list, which asserted "this
+  // manifest's content is wrong" about statuses that are nothing of the kind. The 409 case below is
+  // not merely mislabelled: it CHANGES WHAT PRODUCTION GETS.
+  //
+  // These tests are the per-status CANARIES, so each necessarily names its own status. The ARGUMENT
+  // for each classification is not restated here — it is one row of `PATCH_FAILURE_TAXONOMY` in
+  // `packages/beacon/src/trigger.ts`, which is its only home ("the taxonomy has exactly one home"
+  // below pins that). Each comment states only what the test would catch.
   // -------------------------------------------------------------------------
   it("a 409 keeps throwing, and the sibling is NOT spuriously released", async () => {
     // PREVENTS A SPURIOUS ROLLOUT FROM A TRANSIENT CONFLICT — the one item in this round that is a
@@ -513,16 +540,18 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     assert.equal(outcomeFor(second.json, 41).action, "released");
   });
 
-  it("a 405 'approval is required' keeps throwing — it is per-ENVIRONMENT, not per-manifest", async () => {
-    // PREVENTS telling every manifest for every flag to go fix its releasePlan. 405 on this endpoint
-    // is "Approval is required to make this request", which is a per-environment LaunchDarkly setting.
-    // Required approvals in production is standard enterprise configuration and production is
-    // Beacon's target, so as a content refusal EVERY manifest gets a report naming `releasePlan` —
-    // for a setting that has nothing to do with the manifest and cannot be fixed by editing it.
+  it("a 405 approval requirement keeps throwing — every manifest for the flag hits it alike", async () => {
+    // PREVENTS telling every manifest for every flag to go fix its releasePlan for an approval
+    // requirement, which no manifest edit can satisfy. Required approvals in production is standard
+    // enterprise configuration and production is Beacon's target.
     //
-    // Safe to keep throwing precisely BECAUSE it is per-environment: every sibling hits it
-    // identically, so none of them could have released and the slot claim starves nobody.
-    const state = mvState({ patchRejects: rejectV2Start(405, "Approval is required to make this request") });
+    // NOTE WHAT THIS COMMENT NO LONGER CLAIMS. It used to put LaunchDarkly's message in quotation
+    // marks — that wording appears in no LaunchDarkly document, so the fixture below says something
+    // plainly invented instead of re-seeding an unearned quotation. And it argued the scope of the
+    // setting, which is the row's job and was over-claimed there too (see it: the scoping is
+    // narrower than the old wording said, and the conclusion survives anyway). What this test
+    // checks is the observable behaviour: it throws, and the report does not name `releasePlan`.
+    const state = mvState({ patchRejects: rejectV2Start(405, "approval required for this environment") });
     const h = await harness(
       ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
       state,
@@ -539,11 +568,12 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     assert.equal(h.starts().length, 0);
   });
 
-  it("a 404 'invalid resource identifier' keeps throwing — it is per-FLAG, not per-manifest", async () => {
-    // PREVENTS reporting a wrong `environment` on the notification as a permanent per-manifest
-    // defect. 404 on this endpoint is "Invalid resource identifier" — the flag or the environment,
-    // never the release plan — so it is per-flag or per-environment and every manifest for that flag
-    // hits it identically. Reported as content, a mistyped environment blamed the manifest forever.
+  it("a 404 'invalid resource identifier' keeps throwing — the flag or the environment, not this file", async () => {
+    // PREVENTS reporting a wrong `environment` on the notification as a permanent defect of one
+    // manifest. The identifiers in Beacon's request PATH are the flag and the environment, so every
+    // manifest for that flag hits this identically; reported as content, a mistyped environment
+    // blamed the manifest forever. The row carries the argument, including the residual this comment
+    // used to argue away with the word "never".
     const state = mvState({ patchRejects: rejectV2Start(404, "Invalid resource identifier") });
     const h = await harness(
       ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
@@ -559,6 +589,113 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     assert.equal(h.starts().length, 0);
   });
 
+  // -------------------------------------------------------------------------
+  // THE IMMEDIATE PATCH: HELD, AND IT TAKES THE FLAG'S SLOT ANYWAY.
+  //
+  // The owner's narrowing of handoff §6, and the only place in Beacon where an outcome that wrote
+  // nothing blocks its siblings. Two arms, because ONE MECHANISM NOW HAS TWO BEHAVIOURS and only one
+  // of them is the exception: the divergent-target arm below encodes the decision, and the two tests
+  // above (a refused release-start patch, a refused prerequisites patch) are its control arms — both
+  // still hand the slot to the sibling, and both assert which variation actually rolled out.
+  // -------------------------------------------------------------------------
+  /** Refuse the patch `immediate` sends: a fallthrough change with no prerequisite instructions. */
+  const rejectImmediate = (status: number, message: string) => (p: Patch) =>
+    p.instructions.some((i) => i.kind === "updateFallthroughVariationOrRollout") &&
+    !p.instructions.some((i) => i.kind === "addPrerequisite")
+      ? { status, message }
+      : undefined;
+
+  it("is HELD like the other two patches — the same refusal must not read differently", async () => {
+    // PREVENTS AN ASYMMETRY BY RELEASE METHOD. This patch was the only one of the three with no
+    // try/catch, so an identical LaunchDarkly refusal produced `held` plus LaunchDarkly's own message
+    // on a guarded/progressive manifest, and `error — release trigger failed` on an `immediate` one.
+    const h = await harness(
+      ghWith([`pr-50.json`], { [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }) }),
+      mvState({ patchRejects: rejectImmediate(400, "flag is archived") }),
+    );
+
+    const r = await h.post("sha1");
+    const fifty = outcomeFor(r.json, 50);
+    assert.equal(fifty.action, "held", "THE DISCRIMINATOR: held, as for the other two patches");
+    const note = String(fifty.detail.note);
+    assert.match(note, /flag is archived/, "carrying LaunchDarkly's own message");
+    // AND THE NOTE DOES NOT ACCUSE THE MANIFEST, because nothing in this patch came from it: the
+    // variation id is one LaunchDarkly reported. That is what made "classifying it would produce a
+    // certainly-wrong report" sound convincing — but `whereToLook` is a parameter, so the note can
+    // say what is true of this patch instead.
+    assert.match(note, /look at the FLAG and the ENVIRONMENT/, "and pointing away from the manifest's fields");
+    assert.doesNotMatch(note, /releasePlan|releaseIntent/, "no field of this file is blamed");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(50)],
+      "held is not final, so it is re-checked on the next deploy",
+    );
+  });
+
+  it("but it TAKES THE FLAG'S SLOT: a sibling wanting an OLDER variation must not roll out", async () => {
+    // THE OWNER'S REPRODUCTION, and the arm that encodes their decision. It must fail if this patch
+    // ever goes back to leaving the slot free.
+    //
+    // pr-50 wants v2 by an `immediate` release; pr-51 wants v1. `targetRank` runs pr-50 FIRST because
+    // its target is higher, and LaunchDarkly refuses its patch. When `held` freed the slot, pr-51's
+    // own idempotency read then saw nothing running and rolled v1 — the OLDER variation — out to
+    // production while the newer manifest sat held. `server.ts` calls that direction unrecoverable:
+    // no later deploy undoes a rollout backwards.
+    //
+    // Freeing the slot buys nothing in exchange, which is what makes the narrowing sound rather than
+    // merely convenient: nothing in this patch's body came from pr-50, so there is no refusal here
+    // that could have singled it out while pr-51 succeeded. The sibling is DELAYED one deploy, not
+    // denied — `held` is non-final and both entries stay in the ledger.
+    //
+    // The targets are DIVERGENT on purpose. With both manifests on v2 this test passed either way:
+    // one release happened and it was v2's, whichever manifest produced it.
+    const h = await harness(
+      ghWith([`pr-50.json`, `pr-51.json`], {
+        [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }),
+        [path(51)]: manifest("v1"),
+      }),
+      mvState({ patchRejects: rejectImmediate(400, "flag is archived") }),
+    );
+
+    const r = await h.post("sha1");
+    assert.equal(
+      h.starts().length,
+      0,
+      "THE DISCRIMINATOR: nothing rolled out — with the slot free this was a rollout of id-v1",
+    );
+    assert.equal(outcomeFor(r.json, 50).action, "held");
+    const fiftyOne = outcomeFor(r.json, 51);
+    assert.equal(fiftyOne.action, "held", "the sibling is deferred, not released");
+    assert.match(String(fiftyOne.detail), /deferred/);
+
+    // AND THE CLAIM IS AUDITABLE IN THE OUTCOME, not just in the log: a slot taken by something other
+    // than a write is indistinguishable from a bug in `performedAWrite` unless it says why.
+    const claim = String(outcomeFor(r.json, 50).detail.claimsSlotWithoutWriting);
+    assert.match(claim, /carries no manifest content/, "the reason is the property the narrowing turns on");
+    assert.match(claim, /NARROWS handoff §6/, "and it names what it is narrowing");
+
+    // Both non-final, so the next deploy re-evaluates: the sibling loses a deploy, not its release.
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile).sort(),
+      [path(50), path(51)],
+    );
+
+    // The refusal clears, and now v2 releases — the NEWER variation, which is the outcome the slot
+    // claim preserved.
+    h.pending.list("demo-backend", "production");
+    const second = await harness(
+      ghWith([`pr-50.json`, `pr-51.json`], {
+        [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }),
+        [path(51)]: manifest("v1"),
+      }),
+      mvState(),
+    );
+    const r2 = await second.post("sha2");
+    assert.equal(outcomeFor(r2.json, 50).action, "released", "pr-50's immediate release goes through");
+    assert.equal(second.starts().length, 0, "an immediate release starts no automated release");
+    assert.match(String(outcomeFor(r2.json, 51).detail), /deferred/, "and v1 still never rolls out");
+  });
+
   it("an UNDOCUMENTED 4xx keeps throwing rather than being asserted to be a content defect", async () => {
     // PREVENTS re-widening this to "any 4xx". 418 is not in LaunchDarkly's documented set for this
     // endpoint, so there is no basis for calling it a manifest-content defect — and asserting it
@@ -572,14 +709,9 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
   });
 
   it("a 429 is NOT reclassified: it stays an error and still claims the slot", async () => {
-    // PREVENTS widening the classifier to "any 4xx". A 429 is a rate limit, and `LdClient.request`
-    // already spent its own backoff budget before surfacing it — reporting a spent budget as
-    // "a human must fix this manifest" would describe a transient condition as a human problem, and
-    // send an operator to edit a manifest that is correct. 408 is excluded for a different reason
-    // (a timed-out request may have been processed, so write-certainty is as unknowable as a 5xx).
-    //
-    // The behaviour kept is the pre-existing one, in both halves: `error`, and the flag's slot
-    // claimed. That costs pr-40 a DELAY only, because a rate limit is not per-manifest — the next
+    // PREVENTS widening the classifier to "any 4xx" — the row for this status says why it is out,
+    // and this test says what that buys. The behaviour kept is the pre-existing one, in both halves:
+    // `error`, and the flag's slot claimed. pr-40 pays a DELAY rather than its release, and the next
     // deploy re-evaluates both entries.
     const state = mvState({ patchRejects: rejectV2Start(429, "rate limit exceeded") });
     const h = await harness(
@@ -591,7 +723,22 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     const fortyOne = outcomeFor(r.json, 41);
     assert.equal(fortyOne.action, "error", "THE DISCRIMINATOR: a rate limit is not a content refusal");
     assert.match(String(fortyOne.detail), /release trigger failed/);
-    assert.match(String(outcomeFor(r.json, 40).detail), /deferred/, "and the slot is still claimed");
+    const deferred = String(outcomeFor(r.json, 40).detail);
+    assert.match(deferred, /deferred/, "and the slot is still claimed");
+    // AND THE DEFERRAL SAYS WHY HONESTLY. This is the bucket where "nothing was written" is
+    // DEFINITIVE — LaunchDarkly declined the patch — so ANY claim about what the manifest that went
+    // first did is false here: not "released", not "wrote", and not "we do not know" either. The one
+    // thing true of every claimant is that it took the flag's single slot, so that is all the message
+    // says. Three revisions each got a different one of those wrong and none was pinned.
+    assert.match(deferred, /acted on first/, "THE DISCRIMINATOR: the reason given is the slot");
+    // AND THE SLOT'S SCOPE IS STATED CORRECTLY. `actedOnFlag` is keyed by flagKey, so the rule is one
+    // manifest per FLAG per notification; the first version of this message said "only one may act per
+    // notification", which tells an operator whose deploy released three flags that Beacon does one
+    // thing per deploy. `/acted on first/` alone could not see that.
+    assert.match(deferred, /only one manifest per flag may act/, "and its scope is per flag, not per notification");
+    assert.doesNotMatch(deferred, /\bwrote\b|\bwritten\b/, "no write is claimed — LaunchDarkly's refusal rules it out");
+    assert.doesNotMatch(deferred, /released/, "and certainly not a release");
+    assert.doesNotMatch(deferred, /unknown/, "nor 'outcome unknown': the outcome here is known to be nothing");
     assert.equal(h.starts().length, 0, "so nothing released on this flag in this notification");
     assert.deepEqual(
       h.pending.list("demo-backend", "production").map((e) => e.sourceFile).sort(),
@@ -603,7 +750,7 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
   it("a rejected manifest releases as soon as it is corrected, on any later deploy", async () => {
     // The recovery half: `held` is not final, so the ledger keeps re-checking — and re-READS the
     // manifest at the current sha. This is what makes the refusal actionable rather than merely
-    // honest, and it is the property a `noop` (final) classification would have destroyed.
+    // honest, and a `noop` (final) classification would have destroyed it.
     //
     // 422, DELIBERATELY. A bad randomizationUnit is a body LaunchDarkly cannot understand, and
     // 422 is the row in its API-wide error table that says exactly that: "the update description
@@ -611,18 +758,33 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     // are using, either JSON patch or semantic patch."
     //
     // This test previously used 422 and was moved to 400 on the false premise that 422 was an
-    // undocumented status. It is the canonical one. The move made the suite green while the
-    // classifier starved a releasable sibling on every 422 — the canary was edited instead of
-    // the code. Restored. The other allowlisted status, 400, is covered by "a 400 on pr-41's
-    // stages does not starve pr-40" above, so both are pinned per-status: a status silently
-    // dropped from the allowlist stops being `held` and starts starving siblings.
+    // undocumented status. It is the canonical one. The move made the suite green while a releasable
+    // sibling lost its release on every 422 — the canary was edited instead of the code. Restored.
+    // The other allowlisted status, 400, is covered by the first test in this block, so both are
+    // pinned per-status: a status silently dropped from the allowlist stops being `held`.
     const state = mvState({
       patchRejects: rejectV2Start(422, "randomizationUnit 'organisation' is not configured"),
     });
     const h = await harness(ghWith([`pr-41.json`], { [path(41)]: manifest("v2") }), state);
 
     const first = await h.post("sha1");
-    assert.equal(outcomeFor(first.json, 41).action, "held");
+    const held = outcomeFor(first.json, 41);
+    assert.equal(held.action, "held");
+
+    // AND THE OTHER ROW'S CAVEAT DOES NOT LEAK ONTO THIS STATUS. The first attempt at that caveat
+    // appended it inside the call site's `whereToLook`, which is built BEFORE the status is known —
+    // so a 422, the canonical rejection of a semantic patch body, sent the operator hunting for
+    // something the row for a different status warns about. It is per-ROW text now
+    // (`operatorCaveat`), which is what makes per-status honesty mechanical rather than advisory.
+    const note = String(held.detail.note);
+    assert.match(note, /randomizationUnit 'organisation' is not configured/, "LaunchDarkly's own message");
+    assert.match(note, /releasePlan/, "and this status DOES point at the manifest's own fields");
+    assert.doesNotMatch(
+      note,
+      /pending scheduled change|CHECK LAUNCHDARKLY/i,
+      "THE DISCRIMINATOR: no caveat borrowed from a different row",
+    );
+
     assert.deepEqual(
       h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
       [path(41)],
@@ -705,20 +867,20 @@ describe("every method that WROTE claims the flag's action slot", () => {
   });
 
   it("but a REJECTED prerequisites patch does NOT claim it, and the sibling releases", async () => {
-    // PREVENTS PERMANENT SIBLING STARVATION VIA THE PREREQUISITES PATH — the gap the previous round
+    // PREVENTS A SIBLING LOSING ITS RELEASE VIA THIS PATH — the gap the previous round
     // found and documented instead of fixing, for want of a rejection LaunchDarkly really returns.
     // A CIRCULAR prerequisite is one it must refuse, and nothing upstream can prevent it:
     // `sandboxTools` checks only that a prerequisite key looks like a flag key, and
     // `normalizePrerequisites` accepts any syntactically valid one.
     //
-    // Only the RELEASE-START patch was classified, so a 4xx on `addPrerequisite` threw, and the
+    // Only the release-start patch was classified, so a 4xx on `addPrerequisite` threw, and the
     // catch in server.ts claims the flag's slot for any throw. That claim is right for a LOST
-    // RESPONSE and wrong here: this refusal is deterministic and per-manifest, so it recurred on
-    // every deploy and pr-51 was starved forever while being told "another manifest released
-    // 'checkout-flow' in this notification", which had not happened.
+    // RESPONSE and wrong here: this refusal recurs for this one file on every deploy, so pr-51 was
+    // deferred forever while being told "another manifest released 'checkout-flow' in this
+    // notification", which had not happened.
     //
     // Both manifests ask for v2, so the (stable) sort cannot reorder them and pr-50 — the rejected
-    // one — is evaluated FIRST, which is the ordering that makes the starvation reachable.
+    // one — is evaluated FIRST, which is the ordering that makes the lost release reachable.
     const state = mvState({
       parents: ["parent-flag"],
       patchRejects: (p) =>

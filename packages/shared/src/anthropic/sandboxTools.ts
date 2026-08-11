@@ -1250,7 +1250,42 @@ export class SandboxToolExecutor {
                 `nothing. When the release really is guarded, prefer capping the final stage at ` +
                 `${GUARDED_MAX_ALLOCATION} and keeping the metrics. `
               : "") +
-            `Omit stages entirely to use the flag's configured release policy.`,
+            // WHAT OMITTING STAGES ACTUALLY BUYS, and it is a different answer in three cases.
+            // `trigger.ts` resolves the two from different chains: `stages = ov.stages ?? policy.stages
+            // ?? defaults` but `method = ov.releaseMethod ?? policy.releaseMethod ?? inferred`. So
+            // when this manifest PINS a method, dropping `stages` inherits the policy's stages and
+            // NOT its method — the pin still outranks it. Saying "omit stages to use the flag's
+            // configured release policy" there promised the policy would take over, which it will
+            // not, and for a pinned `guarded` that means the cap the author just hit still applies.
+            //
+            // AND `immediate` IS A THIRD CASE, not a variant of the second: `trigger.ts` returns from
+            // its immediate branch BEFORE `stages` is resolved at all, so these stages are not capped,
+            // not defaulted and not inherited — they are ignored. Telling that author about inheritance
+            // would describe a mechanism their manifest never reaches. Note `releaseMethod` itself is
+            // unvalidated here (see the `write_manifest` caveat in the release-method line below), so
+            // it is only quoted back when it is a method this repo recognises.
+            (mergedPlan.releaseMethod === undefined
+              ? `Omit stages entirely to fall back to the flag's configured release policy: its stages ` +
+                `if it sets any, else the demo defaults. With no explicit releaseMethod here the ` +
+                `policy's method applies too — but ONLY if the policy sets one; if it does not, or if ` +
+                `it cannot be read at deploy time, the method is INFERRED from whether this manifest ` +
+                `carries metrics (metrics ⇒ guarded, none ⇒ progressive), and the cap comes back with ` +
+                `it.`
+              : mergedPlan.releaseMethod === "immediate"
+                ? `NOTE releaseMethod is "immediate", which IGNORES stages entirely — an immediate ` +
+                  `release moves the fallthrough in one step and never reads a stage set, so these ` +
+                  `stages are dead either way. Fix them only if you also meant to ask for a staged ` +
+                  `rollout, in which case the method is what is wrong; otherwise remove them.`
+                : `Omitting stages inherits the policy's stages (else the demo defaults) but NOT its ` +
+                  `method: ` +
+                  (mergedPlan.releaseMethod === "guarded" || mergedPlan.releaseMethod === "progressive"
+                    ? `this manifest's explicit releaseMethod "${mergedPlan.releaseMethod}" `
+                    : `this manifest's explicit releaseMethod (which is not one of "guarded", ` +
+                      `"progressive" or "immediate", and nothing here validates it) `) +
+                  `outranks the policy permanently, so ` +
+                  (guarded
+                    ? `the guarded cap still governs whatever stages are inherited.`
+                    : `the method the policy configured is not used.`)),
           isError: true,
         };
       }

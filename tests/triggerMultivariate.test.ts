@@ -100,10 +100,10 @@ describe("triggerRelease — multivariate variation releases", () => {
     //
     // It used to throw. `evaluateManifest`'s catch claims the flag's action slot for any throw
     // (rightly — a throw out of `startRelease` may follow a patch LaunchDarkly already applied),
-    // but this one is DETERMINISTIC, PRE-WRITE and PER-MANIFEST, so the claim was permanent
-    // rather than a delay: it recurred on every deploy and `server.ts`'s "highest target first"
-    // ordering ran it before the sibling that could release. See the sibling-starvation test in
-    // ledgerLineage.test.ts for the end-to-end shape.
+    // but this refusal is decided before any patch is sent and applies to THIS file alone, every
+    // time — so the claim never lifted, and `server.ts`'s "highest target first" ordering ran it
+    // before the sibling that could release. `PATCH_FAILURE_TAXONOMY` (`trigger.ts`) is where that
+    // combination of properties is argued; the end-to-end shape is in ledgerLineage.test.ts.
     //
     // `held` is the same answer as the off-the-lineage refusal three lines below it in
     // trigger.ts: a human named something that does not exist, only a human can say what was
@@ -120,18 +120,18 @@ describe("triggerRelease — multivariate variation releases", () => {
   it("an EMPTY targetVariation is that same held refusal, not the flag-level throw", async () => {
     // `flag.targetVariation ?? tip` uses `??`, so an empty string is NOT absent — it is a target
     // this one manifest names and the flag does not have. As `!targetValue` it fell into the
-    // per-FLAG "no vN lineage" throw and starved siblings exactly like the case above; the flag
-    // here plainly HAS a lineage, which is what makes the misclassification visible.
+    // per-FLAG "no vN lineage" throw and cost siblings their release exactly like the case above;
+    // the flag here plainly HAS a lineage, which is what makes the misclassification visible.
     const { ld, patches } = fakeLd({ "enable-x": mvFlag(["control", "v1"], { on: false, offVariation: 0 }) });
     const r = await triggerRelease(ld, discovered({ targetVariation: "" }), "production");
-    assert.equal(r.method, "held", "THE DISCRIMINATOR: a per-manifest refusal, not a thrown flag-level error");
+    assert.equal(r.method, "held", "THE DISCRIMINATOR: a refusal of this one file, not a thrown flag-level error");
     assert.deepEqual(patches, []);
   });
 
   it("a flag with NO vN lineage still THROWS when the manifest named no target — that is per-flag", async () => {
     // The throw that must NOT be converted. Nothing about this is manifest-specific: there is no
     // lineage to release, so every manifest for this flag fails the same way on the same read and
-    // there is no sibling to starve. Converting it would hide a real error as a hold.
+    // no sibling could have released anyway. Converting it would hide a real error as a hold.
     const { ld } = fakeLd({ "enable-x": mvFlag(["control", "experiment-a"], { on: false, offVariation: 0 }) });
     await assert.rejects(() => triggerRelease(ld, discovered(), "production"), /no vN lineage variation/);
   });
@@ -420,7 +420,7 @@ describe("triggerRelease — boolean noop guard", () => {
 // The two backwards moves get DIFFERENT answers, which is the correction round eleven made:
 // behind-the-lineage is MOOT (final `noop` — the work already happened and then some, so the
 // ledger must stop tracking it), while leaving-the-lineage is a REFUSAL (`held` — a human has
-// to decide). Answering `held` for the moot case is what starved newer manifests forever: a
+// to decide). Answering `held` for the moot case is what blocked newer manifests forever: a
 // held entry never clears, and it used to claim the flag's only per-notification action slot.
 // ---------------------------------------------------------------------------
 describe("triggerRelease — lineage regression guard", () => {

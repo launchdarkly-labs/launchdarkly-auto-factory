@@ -300,9 +300,10 @@ describe("write_manifest: releasePlan.prerequisites is a machine field", () => {
 // 400 on that one manifest.
 //
 // Beacon now RECOVERS from that: the rejection is reported `held` and the flag's action slot is
-// left free for a sibling. This is the other end — authoring-time defence in depth, so the agent
-// path cannot commit the manifest that needs recovering. Both ends exist because
-// `.release-flags/` is hand-editable in git.
+// left free (see `PATCH_FAILURE_TAXONOMY` in `packages/beacon/src/trigger.ts` for which rejections
+// qualify and why). This is the other end — authoring-time defence in depth, so the agent path
+// cannot commit the manifest that needs recovering. Both ends exist because `.release-flags/` is
+// hand-editable in git.
 // ---------------------------------------------------------------------------
 describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be asked for", () => {
   const root = mkdtempSync(join(tmpdir(), "af-manifest-stages-"));
@@ -328,7 +329,7 @@ describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be
     assert.notEqual(r.isError, true, r.content);
   });
 
-  it("rejects a 100% GUARDED stage — the permanent 400 that starved a sibling", async () => {
+  it("rejects a 100% GUARDED stage — the permanent rejection that cost a sibling its release", async () => {
     // PREVENTS writing the manifest LaunchDarkly refuses forever. The message has to state the unit,
     // because 50 / 5000 / 50000 are all plausible-looking guesses for "50%".
     const r = await write({
@@ -390,6 +391,44 @@ describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be
     assert.equal(r.isError, true);
     assert.match(r.content, /releaseMethod: "guarded"/, "it attributes the method to the manifest");
     assert.doesNotMatch(r.content, /FALSE rejection/, "THE DISCRIMINATOR: no false-rejection hedge on a certain one");
+  });
+
+  it("does not promise the policy takes over when the manifest PINNED the method", async () => {
+    // PREVENTS AN ESCAPE HATCH THAT IS NOT ONE. The message's last line used to be "Omit stages
+    // entirely to use the flag's configured release policy" — unconditionally. `trigger.ts` resolves
+    // the two from DIFFERENT chains: `stages = ov.stages ?? policy.stages ?? defaults`, but
+    // `method = ov.releaseMethod ?? policy.releaseMethod ?? inferred`. So with `releaseMethod`
+    // pinned, dropping `stages` inherits the policy's stages and NOT its method — the pin still
+    // outranks it, the release is still guarded, and the cap the author just hit still applies to
+    // whatever they inherited. An author following that advice would come back with the same
+    // rejection and no idea why.
+    const pinned = await write({
+      releaseMethod: "guarded",
+      stages: [{ allocation: 100000, durationMillis: 300000 }],
+    });
+    assert.equal(pinned.isError, true);
+    assert.match(pinned.content, /but NOT its\s+method/, "THE DISCRIMINATOR: omitting stages does not shed the method");
+    assert.match(pinned.content, /outranks the policy permanently/, "and the pin is permanent");
+    assert.doesNotMatch(
+      pinned.content,
+      /Omit stages entirely to use the flag's configured release policy/,
+      "the unconditional promise is gone",
+    );
+
+    // The control arm: with no explicit method, omitting stages really does hand both over.
+    const inferred = await write({
+      metricKeys: ["checkout-latency"],
+      stages: [{ allocation: 100000, durationMillis: 300000 }],
+    });
+    assert.equal(inferred.isError, true);
+    assert.match(inferred.content, /Omit stages entirely to fall back to the flag's configured release policy/);
+    // AND IT HEDGES, because "with no explicit releaseMethod this manifest inherits the policy's
+    // METHOD as well as its stages" — which this assertion used to pin — is false in two traceable
+    // combinations: a policy that sets no `releaseMethod` leaves `trigger.ts` INFERRING one from
+    // metrics, and an unreadable policy leaves `policy` null so nothing is inherited at all. Pinning
+    // the confident version made the suite defend the over-claim.
+    assert.match(inferred.content, /ONLY if the policy sets one/, "THE DISCRIMINATOR: the promise is conditional");
+    assert.match(inferred.content, /INFERRED from whether this manifest\s+carries metrics/, "and the fallback is named");
   });
 
   it("allows a 100% stage for a PROGRESSIVE release — the cap is guarded-only", async () => {

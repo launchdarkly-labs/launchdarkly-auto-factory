@@ -121,8 +121,12 @@ function highestTargetFirst<T>(items: T[], target: (item: T) => string | undefin
 }
 
 /**
- * Methods that WROTE to LaunchDarkly. Only these — plus a trigger that THREW, see the catch in
- * `evaluateManifest` — may claim the per-flag action slot.
+ * Methods that WROTE to LaunchDarkly. These claim the per-flag action slot — as does a trigger that
+ * THREW (see the catch in `evaluateManifest`), and as does the one non-writing outcome that carries
+ * `claimsSlotWithoutWriting` (see its declaration in `trigger.ts` for the narrowed invariant and
+ * whose decision it is). This function answers only "did it write"; it must NOT be widened to answer
+ * "does it claim the slot", because that would give the same answer at all three patches
+ * `triggerRelease` sends, and at two of them a `held` must keep the slot free.
  *
  * A SWITCH over `TriggerResult["method"]` rather than a string disjunction, so a future
  * `ReleaseKind` fails to compile here instead of being silently classified as a non-write. Silence
@@ -391,22 +395,44 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       }
       try {
         if (actedOnFlag.has(flag.flagKey)) {
-          // Another manifest for this flag already WROTE this round. Defer rather than
-          // discard: the ledger keeps this entry and the next deploy re-evaluates it, by
+          // Another manifest for this flag ALREADY TOOK ITS ACTION SLOT this round. Defer rather
+          // than discard: the ledger keeps this entry and the next deploy re-evaluates it, by
           // which time the lineage guard can see what actually got served.
+          //
+          // THE PREDICATE IS THE SLOT, AND NOTHING ELSE. This message has now been wrong THREE ways,
+          // each time by trying to say what the manifest that went first actually DID:
+          //
+          //  - "another manifest RELEASED this flag" — false whenever a throw claimed the slot
+          //    without releasing anything.
+          //  - "wrote or MAY HAVE WRITTEN" — false in the other direction: most claimants wrote
+          //    nothing, and we know it.
+          //  - "it wrote, or its outcome is unknown" — still false for most of them. A refusal
+          //    LaunchDarkly answered proves nothing was written, and so do the pre-write throws; the
+          //    outcome is not unknown, it is known to be "nothing". Only the lost-response bucket is
+          //    genuinely unknown.
+          //
+          // So the message states the slot and stops. That is the one thing true of every claimant,
+          // it is the actual reason THIS manifest is deferred, and it needs no case analysis that a
+          // later change to the catch below could falsify. What the manifest that went first did is
+          // in that manifest's OWN outcome, in the same response.
+          //
+          // AND THE SCOPE IS PER FLAG, which the first version of this wording lost: `actedOnFlag`
+          // is keyed by `flagKey`, so a notification that discovers manifests for four different
+          // flags acts on all four. "Only one may act per notification" told an operator whose deploy
+          // released three flags that Beacon does one thing per deploy.
           console.warn(
-            `[beacon] DEFERRED: '${flag.sourceFile}' also targets '${flag.flagKey}', which another manifest ` +
-              `already wrote or MAY HAVE WRITTEN in this notification. Left pending for the next deploy.`,
+            `[beacon] DEFERRED: '${flag.sourceFile}' also targets '${flag.flagKey}', and another manifest for ` +
+              `that flag was ACTED ON FIRST in this notification — only one manifest PER FLAG may act per ` +
+              `notification. See that manifest's own outcome for what happened. Left pending for the next deploy.`,
           );
           return {
             flag: flag.flagKey,
             sourceFile: flag.sourceFile,
             scope,
             action: "held",
-            // "wrote or may have written", not "released". The slot is claimed by the three-state
-            // rule above, and the third state is a THROW — so on that path no release happened, and
-            // telling the innocent sibling one did points a human at the wrong manifest.
-            detail: `deferred — another manifest wrote or may have written '${flag.flagKey}' in this notification; still pending`,
+            detail:
+              `deferred — another manifest for '${flag.flagKey}' was acted on first in this notification ` +
+              `(only one manifest per flag may act per notification; see that manifest's own outcome); still pending`,
           };
         }
         // Idempotency: a re-delivered notification must not double-trigger.
@@ -481,6 +507,27 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // `noop` return wrote nothing, so it must leave the flag available to the manifest that
         // can actually release it, in this same notification.
         if (performedAWrite(result.method)) actedOnFlag.add(flag.flagKey);
+        else if (result.claimsSlotWithoutWriting) {
+          // THE ONE EXCEPTION, AND IT IS A DELIBERATE NARROWING OF §6 BY THE REPO OWNER — not a bug
+          // being tolerated. §6 said a manifest that writes nothing must not take the flag's action
+          // slot, because a refusal that repeats for one manifest forever would cost a releasable
+          // sibling its release on every deploy. That reasoning needs the refusal to be capable of
+          // singling out one manifest. At one of the patches `triggerRelease` sends it cannot be —
+          // nothing in that body comes from the manifest — so the loss §6 guards against is
+          // unreachable there, while the loss that a free slot permits is not: the sibling's own
+          // idempotency read sees nothing running and rolls out a DIFFERENT variation, which is the
+          // direction the log below calls unrecoverable.
+          //
+          // `trigger.ts` decides this from the patch, not from the status, and hands back the reason
+          // rather than a flag — LOGGED, because a slot claimed by something other than a write must
+          // be visible to whoever is reading why a sibling deferred. A silent one is
+          // indistinguishable from `performedAWrite` having gone wrong.
+          actedOnFlag.add(flag.flagKey);
+          console.warn(
+            `[beacon] SLOT CLAIMED WITHOUT A WRITE for '${flag.flagKey}' ('${flag.sourceFile}'): ` +
+              `${result.claimsSlotWithoutWriting} Any other manifest for this flag is deferred to the next deploy.`,
+          );
+        }
         // Only staged rollouts get release monitoring: "held"/"noop" started
         // nothing, "prerequisites"/"immediate" have no automated release to watch.
         if (result.method === "progressive" || result.method === "guarded") {
@@ -521,85 +568,37 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // it — mid-rollout `servedVariation` still answers `control`, so `servedIndex` is
         // undefined and both backwards guards fall through.
         //
-        // CLAIMING IT UNCONDITIONALLY COSTS A DELAY RATHER THAN A RELEASE, AND HERE IS WHY — the
-        // claim is only defensible because of what `triggerRelease` no longer throws. The dividing
-        // line is NOT pre-write vs post-write and never was; it is whether a throw recurs
-        // identically for THIS ONE MANIFEST on every deploy. Such a throw makes the slot claim
-        // permanent, and permanent starvation is a lost release rather than a delayed one.
+        // CLAIMING IT UNCONDITIONALLY IS ONLY DEFENSIBLE BECAUSE OF WHAT `triggerRelease` NO LONGER
+        // THROWS, AND THIS FILE IS NOT WHERE THAT IS SETTLED. The dividing line is not pre-write vs
+        // post-write and never was; it is the SHAPE of each surviving failure, which
+        // `PATCH_FAILURE_TAXONOMY` in `trigger.ts` decides case by case, and from which the
+        // classifier's behaviour is derived rather than described.
         //
-        // What still reaches here, and why each is survivable:
+        // THAT TABLE IS THE ARGUMENT'S ONE HOME. This comment, the beacon README and
+        // `docs/loop-seam.md` each used to re-derive it independently — four copies, eleven
+        // corrections, and every correction updated three of them. So this comment states no part of
+        // it: not a status, not a status name, not the vocabulary the argument turns on.
+        // `tests/ledgerLineage.test.ts` fails if any of that reappears here, in numerals or in
+        // paraphrase, because paraphrase was the hole the first version of that test left.
         //
-        //  - MAY HAVE WRITTEN, and TRANSIENT: a 5xx, a network failure, a truncated body — the
-        //    `await res.text()` case above — plus HTTP 408, where a timed-out request may still have
-        //    been processed. The next deploy re-evaluates (the entry is non-final in the ledger) and
-        //    by then the releases listing says what actually happened, so the deferred sibling loses
-        //    one deploy, not its release.
-        //  - REFUSED, BUT STILL TRANSIENT: HTTP 429 ("Rate limited") and HTTP 409 ("Status
-        //    conflict"). LaunchDarkly declined both, so nothing was written. For 429,
-        //    `LdClient.request` had already spent its own backoff budget and the cause is load, not
-        //    the manifest. For 409 the cause is a CONCURRENT API request — a human editing the flag
-        //    in the LaunchDarkly UI as our patch lands — and LaunchDarkly's own remediation is
-        //    "Retry your request." Both are excluded from `contentRefusalStatus` ON PURPOSE:
-        //    reporting either as "a human must fix this manifest" would describe a transient
-        //    condition as a human problem. 409 is also the one where the classification changes
-        //    PRODUCTION BEHAVIOUR rather than just the report — see `contentRefusalStatus`.
-        //  - REFUSED, and PER-FLAG or PER-ENVIRONMENT: HTTP 405 ("Approval is required to make this
-        //    request", a per-environment setting) and HTTP 404 ("Invalid resource identifier" — the
-        //    flag or the environment, never the release plan). Nothing was written, and every
-        //    manifest for that flag hits them identically, so there is no sibling that could have
-        //    released and the slot claim starves nobody.
-        //  - PRE-WRITE and PER-FLAG: no true/false pair on a boolean flag, no vN lineage on a flag
-        //    whose manifest named no target, no resolvable served variation, or a failed `getFlag`
-        //    read. Every sibling manifest for that flag hits the same throw on the same read, so
-        //    NONE of them could have released — claiming the slot starves nobody.
-        //  - DETERMINISTIC, BUT PER-FLAG OR PER-ENVIRONMENT AT WORST: HTTP 401 ("Invalid access
-        //    token") / 403. Beacon's credentials, not the manifest's content, and the file to fix is
-        //    the deployment's environment rather than `releasePlan`.
+        // WHAT THIS FILE OWNS is the write-state rule, and only two things reach here that the
+        // taxonomy has nothing to say about:
         //
-        //    THIS USED TO SAY "GLOBAL — every manifest for every flag hits them identically", which
-        //    asserted a property LaunchDarkly's model does not have: custom-role resource specifiers
-        //    are globbed and ENVIRONMENT-SCOPED (`proj/*:env/*:flag/ops_*` is a documented example,
-        //    and a flag is a child of both a project and an environment), so a 403 can be narrower
-        //    than global. The CONCLUSION survives the corrected premise — per-flag is already an
-        //    accepted "starves nobody" bucket two entries up — and there is no PER-MANIFEST 403:
-        //    LaunchDarkly has no separate role action for a guarded versus a progressive release, so
-        //    two manifests for one flag always request the same actions and one cannot be refused
-        //    while the other succeeds. Same defect class as the commit that last rewrote this
-        //    paragraph: asserting a property the model never had.
-        //  - NOT ASSERTED TO BE ANYTHING: any other 4xx. `contentRefusalStatus` is an ALLOWLIST, so
-        //    a status LaunchDarkly does not document on this endpoint keeps throwing rather than
-        //    being called a manifest-content defect. Note HTTP 408 appears NOWHERE in LaunchDarkly's
-        //    v2 spec — a proxy in front of it can emit one — and it is deliberately excluded for its
-        //    own reason: a timed-out request may have been received and PROCESSED, so it belongs in
-        //    the first bucket above rather than this one.
+        //  - A THROW WHOSE WRITE IS UNKNOWABLE, which must claim the slot: a 5xx, a network failure,
+        //    a truncated body — the `await res.text()` case above. The next deploy re-evaluates (the
+        //    entry is non-final in the ledger) and by then the releases listing says what actually
+        //    happened, so the deferred sibling loses one deploy rather than its release.
+        //  - PRE-WRITE throws from `triggerRelease` itself, which carry no status at all: no
+        //    true/false pair on a boolean flag, no vN lineage on a flag whose manifest named no
+        //    target, no resolvable served variation, or a failed `getFlag` read. Every sibling
+        //    manifest for that flag hits the same throw on the same read, so none of them could have
+        //    released and the claim costs nobody anything.
         //
-        // WHAT IS DELIBERATELY NOT IN THAT LIST is a deterministic PER-MANIFEST throw, and the
-        // earlier claim that only one such throw had ever existed was FALSE. A throw driven by
-        // manifest CONTENT is deterministic too, and the content reaches LaunchDarkly unvalidated:
-        // `startRelease`'s instruction body carries `releasePlan.stages`, `metricKeys`,
-        // `metricGroupKeys` and `randomizationUnit` straight through, and before this round neither
-        // `write_manifest` nor Beacon checked any of them. The reachable instance was a 100% guarded
-        // stage — LaunchDarkly caps guarded stages at 50% (see trigger.ts) — a permanent 400 that
-        // `targetRank` evaluated FIRST, so the releasable sibling was starved on every deploy and
-        // told "another manifest released this flag", which had not happened.
-        //
-        // All THREE per-manifest refusals are now answered `held` at source in `trigger.ts` rather
-        // than patched around here: "this manifest names a variation the flag does not have", a
-        // content rejection of the RELEASE-START patch, and a content rejection of the
-        // `prerequisites` release's patch (built from `releaseIntent.prerequisites`, where a
-        // CIRCULAR prerequisite is the reachable instance — `sandboxTools` checks only key syntax
-        // and `normalizePrerequisites` accepts any syntactically valid key). Both patch sites share
-        // one classifier and one `held` builder, so the "nothing was written" claim cannot drift
-        // between them; it holds for these multi-instruction patches because LaunchDarkly documents
-        // that semantic patches are never applied partially. `write_manifest` also validates
-        // `stages` now, but that is defence in depth, not the guarantee: `.release-flags/` is
-        // hand-editable in git and the other three fields are still unchecked before they reach
-        // LaunchDarkly.
-        //
-        // SO THE RESIDUAL IS: whatever LaunchDarkly rejects with a NON-client error (transient, and
-        // it may have written), plus any 4xx outside the allowlist `{400, 422}` — neither of which
-        // is asserted to be manifest content. If a new pre-write, manifest-specific refusal is added,
-        // it belongs in `trigger.ts` too.
+        // Everything else is a refusal LaunchDarkly answered, and `trigger.ts` answers those at
+        // source — returning `held` where it can, and throwing where it deliberately will not
+        // classify. If a new refusal of that kind is found, it belongs there, not patched around
+        // here. The residual, including one shape that is recorded rather than solved, is in the
+        // table.
         //
         // The cost of the other direction is a rollout backwards, which no later deploy undoes.
         actedOnFlag.add(flag.flagKey);

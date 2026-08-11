@@ -32,7 +32,7 @@ branch merges.
 
 ## 3. How verification silently lies here — read before trusting any green suite
 
-Five distinct traps, each of which has produced a wrong conclusion in this branch's history:
+Six distinct traps, each of which has produced a wrong conclusion in this branch's history:
 
 1. **`npm test` runs against built `dist/`.** Tests import workspace packages by name
    (`@auto-factory/beacon`), which resolve to compiled output. Editing `src/` and running
@@ -49,6 +49,13 @@ Five distinct traps, each of which has produced a wrong conclusion in this branc
    `node_modules/@auto-factory/beacon → ../../packages/beacon` resolves through the symlink's real
    path back to the main checkout, so a sabotage compiled into the worktree's `dist/` is never
    loaded. Rebuild `node_modules` with a real `@auto-factory` dir pointing into the worktree.
+6. **`npm test` does not typecheck the tests, so a green suite proves nothing about `tsc`.**
+   The runner is `node --import tsx --test tests/*.test.ts`, and `tsx` strips types rather than
+   checking them — while `npm run typecheck` builds the packages *and* runs `tsc -p tests
+   --noEmit`. A new test file can therefore pass the full suite and still fail the typechecker;
+   this happened with an unguarded index access under `noUncheckedIndexedAccess` (`m[1]` on a regex
+   match), which `npm test` reported as 680/680 green. The two commands answer different questions:
+   **run both, and do not report a suite as clean until `npm run typecheck` has also passed.**
 
 **The discipline that works:** sabotage the mechanism, `npx tsc --build --force`, run the full
 suite, and confirm the *predicted* test failed.
