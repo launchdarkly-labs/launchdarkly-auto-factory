@@ -37,6 +37,12 @@ import { dirname, resolve } from "node:path";
  *
  * v1: keyed by sourceFile. (An unreleased pre-v1 shape keyed by flagKey; see the note on
  * `sourceFile` below for why that was wrong.)
+ *
+ * NOT bumped for the additive OPTIONAL `targetVariation` field, deliberately. What this gate
+ * protects against is keys that silently no longer match a lookup, and an absent optional field
+ * cannot produce one — a v1 entry without it simply reports no target until its next evaluation
+ * writes one. Bumping would force operators to delete the file (the message below says so) and
+ * lose real in-flight work in exchange for a reporting field.
  */
 export const PENDING_LEDGER_VERSION = 1;
 
@@ -59,11 +65,25 @@ export interface PendingEntry {
   sourceFile: string;
   /** LAST KNOWN flag this manifest named. Reporting only — never an identity or a guard input. */
   flagKey: string;
+  /**
+   * LAST KNOWN variation this manifest asked for (absent = "the lineage tip", which is what
+   * `trigger.ts` resolves an absent `targetVariation` to). Reporting only, exactly like
+   * `flagKey` above — never an identity, never a guard input.
+   *
+   * It exists so a log can say "pr-41.json is waiting to release v2" instead of naming a flag
+   * that four manifests also name. Deliberately NOT load-bearing: whether a manifest's work is
+   * still outstanding is `served` vs `target` computed FRESH from LaunchDarkly at the moment of
+   * decision (trigger.ts), because a remembered target goes stale the instant a human edits the
+   * manifest — the same reason the ledger is keyed on the manifest's address and not its
+   * content. The one non-reporting use is EVALUATION ORDER in server.ts, which is a fairness
+   * heuristic and cannot decide anything: every entry is re-read before it is acted on.
+   */
+  targetVariation?: string;
   /** The sha whose deploy first produced a non-final outcome. */
   firstSeenSha: string;
   /** The sha of the most recent evaluation. */
   lastSha: string;
-  /** The most recent non-final action (`held` | `waiting` | `error`). */
+  /** The most recent action that left work outstanding — see `PENDING_ACTIONS`. */
   lastAction: string;
   lastDetail?: string;
   /** How many times this flag has been evaluated, including the first. */
@@ -174,8 +194,24 @@ export class FilePendingStore extends MemoryPendingStore {
   }
 }
 
-/** Actions that leave work unfinished. Must agree with notifyReport's NON_FINAL_ACTIONS. */
-export const PENDING_ACTIONS: readonly string[] = ["held", "waiting", "error"];
+/**
+ * Actions after which THIS MANIFEST'S work is still outstanding, so the ledger keeps the entry
+ * and re-checks it on a later deploy.
+ *
+ * DELIBERATELY NOT the same list as notifyReport's `NON_FINAL_ACTIONS`, which they used to be
+ * pinned to each other — the two lists answer two different questions:
+ *
+ *   this list          — "should the ledger keep re-checking this manifest?"
+ *   NON_FINAL_ACTIONS  — "must a human do something?"
+ *
+ * `already_running` is the case that separates them, and conflating them lost work: only one
+ * variation of a flag can be releasing at a time, so a manifest asking for v2 can hit an
+ * `already_running` for the release of v1. That is not this manifest's work finishing. It used
+ * to be FINAL, which cleared the entry and reported the discarded v2 release as a success. It is
+ * still not ATTENTION-WORTHY — a redelivery during a normal rollout is the expected shape — so
+ * it stays out of the notifier's set.
+ */
+export const PENDING_ACTIONS: readonly string[] = ["held", "waiting", "error", "already_running"];
 
 /**
  * Fold one evaluation's outcome into the ledger: remember it while unfinished, forget it
@@ -189,6 +225,8 @@ export function recordOutcome(
     environment: string;
     sha: string;
     flagKey: string;
+    /** Reporting metadata, like `flagKey`. Written as last read; never consulted as a fact. */
+    targetVariation?: string;
     sourceFile: string;
     action: string;
     detail?: string;
@@ -204,6 +242,10 @@ export function recordOutcome(
     service: o.service,
     environment: o.environment,
     flagKey: o.flagKey,
+    // Written as most recently READ, not merged with what was remembered: a manifest that drops
+    // its `targetVariation` now means "the tip", and carrying the old value forward would report
+    // a target the manifest no longer asks for.
+    ...(o.targetVariation !== undefined ? { targetVariation: o.targetVariation } : {}),
     sourceFile: o.sourceFile,
     firstSeenSha: existing?.firstSeenSha ?? o.sha,
     lastSha: o.sha,

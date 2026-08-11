@@ -26,11 +26,23 @@
  */
 export const NON_FINAL_ACTIONS: readonly string[] = ["held", "waiting", "error"];
 
-/** Actions that need nobody: the release happened, or was correctly not this service's job. */
+/**
+ * Actions that need nobody: the release happened, was correctly not this service's job, or is
+ * already under way.
+ *
+ * `already_running` is in HERE and ALSO in `pending.ts`'s `PENDING_ACTIONS`, which is not a
+ * contradiction — the lists answer different questions ("must a human act?" vs "should the
+ * ledger keep re-checking?"). A redelivery landing on a release that is already rolling out is
+ * the expected shape of a normal deploy and pages nobody; the ledger still keeps the entry,
+ * because a release of v1 does not finish a manifest that asked for v2.
+ */
 export const FINAL_ACTIONS: readonly string[] = ["released", "noop", "skipped", "already_running"];
 
 interface RawOutcome {
   flag?: unknown;
+  /** The MANIFEST. Present from server.ts; absent-tolerant so a partial body still reports. */
+  sourceFile?: unknown;
+  targetVariation?: unknown;
   action?: unknown;
   detail?: unknown;
 }
@@ -111,7 +123,7 @@ export function describeNotifyResult(input: {
         `next deploy; nothing happens before then, and a flag marked needsHuman is never retried.`,
     );
     for (const o of stranded) {
-      lines.push(`  ${String(o.flag)}: ${String(o.action)} — ${detailText(o.detail)}`);
+      lines.push(`  ${label(o)}: ${String(o.action)} — ${detailText(o.detail)}`);
     }
     lines.push(rePostHint(beaconUrl, service, sha));
     return { attention: true, lines };
@@ -132,8 +144,28 @@ export function describeNotifyResult(input: {
   return { attention: false, lines };
 }
 
+/**
+ * How one outcome is named to an operator: the MANIFEST first, then the flag, then the variation
+ * it wants.
+ *
+ * The flag key alone is ambiguous, and ambiguous in exactly the case that needs reading: one flag
+ * routinely has several manifests (one per PR, never deleted) each wanting a different variation,
+ * so two outcomes rendered as `checkout-flow=held, checkout-flow=held` and an operator could not
+ * tell which PR to fix — or that there were two. The address is the identity everywhere else in
+ * Beacon; the reporting surface should not be the one place that uses the content.
+ *
+ * Absent fields are tolerated rather than printed as "undefined": the notifier parses a response
+ * body it did not build, and a body from an older Beacon (or a proxy's partial JSON) must still
+ * produce a readable line.
+ */
+function label(o: RawOutcome): string {
+  const file = typeof o.sourceFile === "string" && o.sourceFile ? `${o.sourceFile} ` : "";
+  const target = typeof o.targetVariation === "string" && o.targetVariation ? `→${o.targetVariation}` : "";
+  return `${file}${String(o.flag)}${target}`;
+}
+
 function describeOne(o: RawOutcome): string {
-  return `${String(o.flag)}=${String(o.action)}`;
+  return `${label(o)}=${String(o.action)}`;
 }
 
 function detailText(detail: unknown): string {

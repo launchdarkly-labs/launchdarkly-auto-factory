@@ -6,7 +6,9 @@ import { after, describe, it } from "node:test";
 
 import {
   FilePendingStore,
+  FINAL_ACTIONS,
   MemoryPendingStore,
+  NON_FINAL_ACTIONS,
   PENDING_ACTIONS,
   PENDING_LEDGER_VERSION,
   recordOutcome,
@@ -40,12 +42,33 @@ const entry = (flagKey: string, action: string) => ({
 });
 
 describe("recordOutcome — remember unfinished, forget finished", () => {
-  it("keeps every non-final action and drops every final one", () => {
+  it("keeps every action that left work outstanding and drops every action that finished it", () => {
     const store = new MemoryPendingStore();
-    for (const a of ["held", "waiting", "error"]) recordOutcome(store, entry(`f-${a}`, a));
-    for (const a of ["released", "noop", "skipped", "already_running"]) recordOutcome(store, entry(`f-${a}`, a));
+    for (const a of ["held", "waiting", "error", "already_running"]) recordOutcome(store, entry(`f-${a}`, a));
+    for (const a of ["released", "noop", "skipped"]) recordOutcome(store, entry(`f-${a}`, a));
     const kept = store.list("demo-backend", "production").map((e) => e.flagKey).sort();
-    assert.deepEqual(kept, ["f-error", "f-held", "f-waiting"]);
+    assert.deepEqual(kept, ["f-already_running", "f-error", "f-held", "f-waiting"]);
+  });
+
+  it("KEEPS an already_running entry — a release of v1 does not finish a manifest wanting v2", () => {
+    // This used to be final, and being final is what lost work: only one variation of a flag can
+    // be releasing at a time, so the manifest asking for v2 hits `already_running` on v1's
+    // rollout. Clearing the entry there discarded an unreleased v2 and reported it as success.
+    const store = new MemoryPendingStore();
+    recordOutcome(store, { ...entry("checkout-flow", "already_running"), targetVariation: "v2" });
+    const [e] = store.list("demo-backend", "production");
+    assert.equal(e?.lastAction, "already_running", "still tracked, so a later deploy re-checks it");
+    assert.equal(e?.targetVariation, "v2");
+  });
+
+  it("records targetVariation as last READ, so dropping it means 'the tip' again", () => {
+    // Reporting metadata, treated exactly like flagKey: written from the manifest just read,
+    // never merged with what was remembered. An absent target MEANS the lineage tip, so carrying
+    // a stale "v2" forward would report a target the manifest no longer asks for.
+    const store = new MemoryPendingStore();
+    recordOutcome(store, { ...entry("checkout-flow", "held"), targetVariation: "v2" });
+    recordOutcome(store, entry("checkout-flow", "held"));
+    assert.equal(store.list("demo-backend", "production")[0]?.targetVariation, undefined);
   });
 
   it("a flag that finally releases stops being tracked", () => {
@@ -85,10 +108,30 @@ describe("recordOutcome — remember unfinished, forget finished", () => {
     assert.equal(store.list("demo-backend", "production")[0]?.needsHuman, true);
   });
 
-  it("PENDING_ACTIONS agrees with what the Notifier calls non-final", () => {
-    // Two lists in two files: if they disagree, a flag is either reported to an operator
-    // and never re-checked, or re-checked forever and never reported.
-    assert.deepEqual([...PENDING_ACTIONS].sort(), ["error", "held", "waiting"]);
+  it("PENDING_ACTIONS deliberately DISAGREES with the Notifier's attention set, on already_running", () => {
+    // These two lists were pinned to each other, on the reasoning that a disagreement means a
+    // flag is either reported and never re-checked or re-checked and never reported. That
+    // conflated two different questions:
+    //
+    //   PENDING_ACTIONS    — "should the ledger keep re-checking this manifest?"
+    //   NON_FINAL_ACTIONS  — "must a human do something?"
+    //
+    // `already_running` answers YES and NO. A manifest wanting v2 that finds v1's release under
+    // way still has outstanding work (so the ledger must keep it — being final here is what
+    // discarded it), but a redelivery during a normal rollout is the expected shape of a healthy
+    // deploy and must not page anyone.
+    assert.deepEqual([...PENDING_ACTIONS].sort(), ["already_running", "error", "held", "waiting"]);
+    assert.deepEqual([...NON_FINAL_ACTIONS].sort(), ["error", "held", "waiting"]);
+    assert.ok(
+      PENDING_ACTIONS.includes("already_running") && !NON_FINAL_ACTIONS.includes("already_running"),
+      "keep re-checking it, and do not wake anyone about it",
+    );
+    assert.ok(FINAL_ACTIONS.includes("already_running"), "the Notifier's own two sets must still cover it");
+    // Everything the Notifier DOES call actionable must still be re-checked: the direction that
+    // would strand work is a non-final action the ledger forgets.
+    for (const a of NON_FINAL_ACTIONS) {
+      assert.ok(PENDING_ACTIONS.includes(a), `${a} needs a human but the ledger would forget it`);
+    }
   });
 });
 
