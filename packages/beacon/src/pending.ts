@@ -13,8 +13,13 @@
  *  - re-evaluation re-reads the manifest AT THE CURRENT SHA, so a human's fix to a bad
  *    `releaseIntent` actually takes effect (previously a no-op: the file existed at both
  *    SHAs, so discovery never surfaced it again);
- *  - a release that finished while nobody was watching is noticed, so its dependent child
- *    flags get repointed.
+ *  - a release that finished while nobody was watching is noticed on the next deploy, so its
+ *    dependent child flags get repointed. Stated exactly, because this claim has drifted from
+ *    the code twice: the repoint happens for ANY entry of that flag whose manifest still reads
+ *    (server.ts, `latest?.status === "completed"`), INCLUDING one held by its own intent, and it
+ *    happens without answering "is this manifest done?" — that stays `served`-vs-`target` inside
+ *    `triggerRelease`. What it still needs is a deploy to arrive and at least one entry for the
+ *    flag to be pending; a flag with nothing outstanding is release monitoring's job (monitor.ts).
  *
  * WEBHOOK-GATED, deliberately. Nothing here fires on a timer, so a `notBefore` date
  * passing still causes nothing until some deploy arrives. Closing that would make Beacon
@@ -38,11 +43,22 @@ import { dirname, resolve } from "node:path";
  * v1: keyed by sourceFile. (An unreleased pre-v1 shape keyed by flagKey; see the note on
  * `sourceFile` below for why that was wrong.)
  *
- * NOT bumped for the additive OPTIONAL `targetVariation` field, deliberately. What this gate
- * protects against is keys that silently no longer match a lookup, and an absent optional field
- * cannot produce one — a v1 entry without it simply reports no target until its next evaluation
- * writes one. Bumping would force operators to delete the file (the message below says so) and
- * lose real in-flight work in exchange for a reporting field.
+ * NOT bumped for the additive OPTIONAL `targetVariation` field, deliberately — and for these
+ * reasons, which are about EFFECT rather than about keying (an earlier revision argued "an absent
+ * optional field cannot produce a mis-keyed entry", which is true, is what this gate protects, and
+ * is not what makes the field safe to add):
+ *
+ *  - nothing DECIDES anything from the stored value. The pending pass orders entries by the target
+ *    read from each manifest at the current sha (server.ts), so a legacy entry cannot even
+ *    mis-order the pass;
+ *  - `Array.prototype.sort` is stable, so even while ordering did read this field, a purely legacy
+ *    ledger — every entry missing it, hence every entry ranked equally — behaved EXACTLY as before;
+ *  - every entry heals on its first successful re-evaluation, which writes the field as read;
+ *  - and ordering only ever has an effect among manifests sharing a `flagKey`, because that is the
+ *    axis the single action slot runs on — so a mixed file's exposure was bounded to that.
+ *
+ * Against that: bumping forces operators to delete the file (the message below says so) and lose
+ * real in-flight work, in exchange for a reporting field.
  */
 export const PENDING_LEDGER_VERSION = 1;
 
@@ -74,9 +90,16 @@ export interface PendingEntry {
    * that four manifests also name. Deliberately NOT load-bearing: whether a manifest's work is
    * still outstanding is `served` vs `target` computed FRESH from LaunchDarkly at the moment of
    * decision (trigger.ts), because a remembered target goes stale the instant a human edits the
-   * manifest — the same reason the ledger is keyed on the manifest's address and not its
-   * content. The one non-reporting use is EVALUATION ORDER in server.ts, which is a fairness
-   * heuristic and cannot decide anything: every entry is re-read before it is acted on.
+   * manifest — the same reason the ledger is keyed on the manifest's address and not its content.
+   *
+   * There is NO non-reporting use left. There was one — evaluation order — and the comment here
+   * called it "a fairness heuristic [that] cannot decide anything", which was false: only one
+   * variation of a flag can be releasing at a time, so whichever manifest is evaluated first takes
+   * the flag's action slot and thereby decides what production serves. A test says so in as many
+   * words ("orders the DISCOVERED list, so v2 releases and v1 defers"). That is why the pass now
+   * orders on the target read from the manifest at the current sha instead of on this field: a
+   * human retargeting an entry from v1 to v2 would otherwise still be ranked as v1 and lose the
+   * slot to a sibling.
    */
   targetVariation?: string;
   /** The sha whose deploy first produced a non-final outcome. */

@@ -173,10 +173,17 @@ other service's deploy notification to re-evaluate.
 > because served-vs-target is recomputed from LaunchDarkly at every decision.
 >
 > It is **webhook-gated**: nothing fires on a timer, so a `notBefore` date passing does
-> nothing until some deploy arrives. A release LaunchDarkly **reverted** is marked
-> `needsHuman` and never re-triggered — re-releasing would undo the guardrail's rollback.
-> That refusal is **flag-level and deliberately broad**: a guardrail rejecting one variation
-> blocks re-triggering *any* manifest for that flag until a human decides.
+> nothing until some deploy arrives. A release LaunchDarkly **reverted** (or that stopped
+> monitoring without completing) is not re-triggered — re-releasing would undo the
+> guardrail's rollback — and is reported as `needsHuman`. That refusal is **flag-level and
+> deliberately broad**: a guardrail rejecting one variation blocks re-triggering *any*
+> manifest for that flag until a human decides. It is also **re-derived on every deploy
+> rather than remembered**, so the report stops by itself once the flag's newest release is
+> no longer terminal-without-completing; the stored `needsHuman` is last-known reporting, not
+> a latch (as a latch, nothing but hand-editing the ledger file could clear it).
+> A release that **completed while nobody was watching** repoints the flag's dependent
+> children on the next deploy, for any manifest of that flag still in the ledger — but it
+> does not decide whether that manifest's own work is done, which stays served-vs-target.
 > `BEACON_PENDING_FILE` sets the ledger path (default `beacon-pending.json`).
 >
 > **The notification itself is never redelivered**, so alert on `notify: ACTION REQUIRED`.
