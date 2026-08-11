@@ -21,6 +21,7 @@ import {
   normalizeReleaseIntent,
   notBeforeHolds,
   startRelease,
+  LdApiError,
   type DiscoveredFlag,
   type LdClient,
   type MetricRef,
@@ -44,6 +45,60 @@ const DEFAULT_GUARDED_STAGES: Stage[] = [
   { allocation: 50000, durationMillis: 300000 },
 ];
 const DEFAULT_RANDOMIZATION_UNIT = "user";
+
+/**
+ * 4xx statuses that are NOT a rejection of what we sent, so they must keep throwing.
+ *
+ *  - 429 is a rate limit, and `LdClient.request` already spent its own backoff budget before
+ *    surfacing it (RATE_LIMIT_RETRIES). Reporting a spent budget as "a human must fix this
+ *    manifest" would be a lie about a transient condition, and the ledger's retry is the right
+ *    answer to it.
+ *  - 408 is a request timeout: the request may have been received and PROCESSED, so it is the one
+ *    4xx where write-certainty is exactly as unknowable as a 5xx. It must stay in the
+ *    "we do not know" bucket that claims the flag's action slot.
+ *  - 401/403 are Beacon's credentials, not the manifest's content. They are deterministic but
+ *    GLOBAL — every manifest for every flag hits them identically, so nobody is starved by the
+ *    slot claim, and pointing an operator at `releasePlan` when the API key is wrong sends them
+ *    to the wrong file.
+ */
+const NOT_A_CONTENT_REJECTION: ReadonlySet<number> = new Set([401, 403, 408, 429]);
+
+/**
+ * Did LaunchDarkly REFUSE this patch (as opposed to failing to answer about it)? Returns the
+ * status when so.
+ *
+ * Classified on the STATUS CODE carried by `LdApiError`, which is what `LdClient.request` throws
+ * for every non-2xx — never on the message text, which is LaunchDarkly's to change.
+ *
+ * WHY THIS IS A DIFFERENT KIND OF FAILURE from everything else `startRelease` can throw. The rule
+ * in `server.ts` is that a throw claims the flag's per-notification action slot, because
+ * `startRelease` awaits the response AFTER the patch is applied — so a lost response is "we do not
+ * know whether we wrote". A client-error status is not a lost response: LaunchDarkly answered, and
+ * its answer is that it did not apply the patch. Write-certainty is therefore knowable from the
+ * error itself, and the failure is DETERMINISTIC and PER-MANIFEST — the same manifest is refused on
+ * every deploy — which is the one shape for which claiming the slot starves a releasable sibling
+ * permanently rather than delaying it.
+ */
+function contentRefusalStatus(e: unknown): number | undefined {
+  if (!(e instanceof LdApiError)) return undefined;
+  if (e.status < 400 || e.status >= 500) return undefined;
+  if (NOT_A_CONTENT_REJECTION.has(e.status)) return undefined;
+  return e.status;
+}
+
+/** LaunchDarkly's own explanation, so an operator can act on it without reading Beacon's logs. */
+function ldMessage(responseBody: unknown): string {
+  if (typeof responseBody === "string") return responseBody.slice(0, 300);
+  if (responseBody && typeof responseBody === "object") {
+    const m = (responseBody as { message?: unknown }).message;
+    if (typeof m === "string" && m) return m.slice(0, 300);
+  }
+  try {
+    return JSON.stringify(responseBody).slice(0, 300);
+  } catch {
+    return String(responseBody);
+  }
+}
 
 /**
  * Union of two key lists, deduped, order-stable. Merges the release policy's metric set
@@ -72,9 +127,10 @@ export interface TriggerResult {
    * The release method used, or an intent outcome:
    *  - "held" — NOT FINAL, so the ledger keeps re-checking it: releaseIntent said hold/manual,
    *    a future notBefore, a not-yet-executable ask like segments, an unintelligible intent
-   *    (fail-closed), a target the flag HAS NO VARIATION for, or a target that would leave the vN
-   *    lineage altogether. Every one of these is a human's decision, and NONE of them writes — so
-   *    they must not claim the flag's action slot in `server.ts`.
+   *    (fail-closed), a target the flag HAS NO VARIATION for, a target that would leave the vN
+   *    lineage altogether, or a release instruction LaunchDarkly REFUSED with a client error (see
+   *    `contentRefusalStatus`). Every one of these is a human's decision, and NONE of them writes —
+   *    so they must not claim the flag's action slot in `server.ts`.
    *  - "prerequisites" — flag turned on behind LD prerequisites; it releases when its parents do.
    *  - "noop" — FINAL: there is nothing left for this manifest to release. Either the target is
    *    already what the environment serves (a re-deploy after the release completed), or a NEWER
@@ -428,22 +484,55 @@ export async function triggerRelease(
     ov.stages ?? policy?.stages ?? (method === "guarded" ? DEFAULT_GUARDED_STAGES : DEFAULT_PROGRESSIVE_STAGES);
   const usedDefaults = !ov.stages && !policy?.stages;
 
-  await startRelease(ld, {
-    flagKey: flag.flagKey,
-    environmentKey,
-    turnFlagOn: !flagIsOn,
-    releaseKind: method,
-    originalVariationId: originalVar._id,
-    targetVariationId: targetVar._id,
-    randomizationUnit: ov.randomizationUnit ?? policy?.randomizationUnit ?? DEFAULT_RANDOMIZATION_UNIT,
-    stages,
-    ...(ov.extensionDurationMillis !== undefined
-      ? { extensionDurationMillis: ov.extensionDurationMillis }
-      : {}),
-    ...(method === "guarded" && metrics.length
-      ? { metrics, metricMonitoringPreferences }
-      : {}),
-  });
+  // THE INSTRUCTION BODY IS BUILT FROM MANIFEST CONTENT THAT NOTHING HAS VALIDATED AGAINST
+  // LAUNCHDARKLY: `stages`, `metricKeys`, `metricGroupKeys`, `randomizationUnit`. So a REJECTION is
+  // reachable, deterministic, and per-manifest — and it must not be reported as a transport error.
+  //
+  // The live instance: guarded stages are capped at 50% (see DEFAULT_GUARDED_STAGES), so a manifest
+  // with a 100% guarded stage is a permanent 400 ("stage allocation must not exceed 50%"). As a
+  // throw that claimed the flag's action slot on EVERY deploy, and since `targetRank` evaluates the
+  // higher target first, the rejected manifest went first and the releasable sibling was told
+  // "another manifest released this flag" — which had not happened. Zero releases, forever.
+  //
+  // `held`, for the same reasons as the other per-manifest refusals in this file: nothing was
+  // written (so the sibling can still release in this same notification), only a human can say what
+  // the manifest should have said, and `held` is not final so the ledger re-checks it once they fix
+  // it. `write_manifest` now checks the stage shape at authoring time as well, but the manifest is
+  // hand-editable in git and this closes the whole CLASS — a missing metric, a bad randomization
+  // unit, and anything else LaunchDarkly refuses.
+  try {
+    await startRelease(ld, {
+      flagKey: flag.flagKey,
+      environmentKey,
+      turnFlagOn: !flagIsOn,
+      releaseKind: method,
+      originalVariationId: originalVar._id,
+      targetVariationId: targetVar._id,
+      randomizationUnit: ov.randomizationUnit ?? policy?.randomizationUnit ?? DEFAULT_RANDOMIZATION_UNIT,
+      stages,
+      ...(ov.extensionDurationMillis !== undefined
+        ? { extensionDurationMillis: ov.extensionDurationMillis }
+        : {}),
+      ...(method === "guarded" && metrics.length
+        ? { metrics, metricMonitoringPreferences }
+        : {}),
+    });
+  } catch (e) {
+    const status = contentRefusalStatus(e);
+    if (status === undefined) throw e; // transient, or a write we cannot rule out — see the catch in server.ts
+    return {
+      flagKey: flag.flagKey,
+      method: "held",
+      note:
+        `LaunchDarkly REJECTED this manifest's ${method} release instruction (HTTP ${status}): ` +
+        `"${ldMessage((e as LdApiError).responseBody)}". The patch was NOT applied, so nothing was ` +
+        `written and a sibling manifest for '${flag.flagKey}' can still release in this same ` +
+        `notification. HELD for a human: the rejected values come from the manifest's releasePlan ` +
+        `(stages, metricKeys, metricGroupKeys, randomizationUnit) or the flag's release policy — a ` +
+        `guarded stage allocation above 50% is the common one. Fix it and deploy again; this is ` +
+        `re-checked on any later deploy.`,
+    };
+  }
 
   const rollbackNote =
     method === "guarded" && metrics.length > 0 && rollbackUncertain

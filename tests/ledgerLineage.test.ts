@@ -11,7 +11,7 @@ import {
   type BeaconConfig,
   type GitHubClient,
 } from "@auto-factory/beacon";
-import type { LdClient } from "@auto-factory/shared";
+import { LdApiError, type LdClient } from "@auto-factory/shared";
 
 // ---------------------------------------------------------------------------
 // Round eleven: the ledger remembers a MANIFEST, but every "is this done?" decision was
@@ -103,6 +103,13 @@ interface MvState {
    * shape in which Beacon cannot know whether it wrote.
    */
   patchLandsThenThrows?: (patch: Patch) => boolean;
+  /**
+   * "LaunchDarkly REFUSED the patch." The opposite shape to `patchLandsThenThrows`: the patch is
+   * NOT recorded, because a non-2xx means it was never applied — which is the whole property fix 1
+   * turns on. Returns the status LD answered with and its own message; `LdClient.request` throws
+   * exactly this for every non-2xx, so the status really is on the throw.
+   */
+  patchRejects?: (patch: Patch) => { status: number; message: string } | undefined;
   /** Boolean flags a manifest may name as a `releaseIntent` prerequisite parent. */
   parents?: string[];
   /** Make the automated-releases listing throw, for the fail-closed early return. */
@@ -201,6 +208,14 @@ function fakeMvLd(state: MvState, patches: Patch[]): LdClient {
       _env: string,
       instructions: Array<Record<string, unknown>>,
     ): Promise<unknown> {
+      const rejection = state.patchRejects?.({ flagKey, instructions });
+      if (rejection) {
+        // Deliberately NOT recorded: LaunchDarkly declined to apply it.
+        throw new LdApiError("PATCH", `/api/v2/flags/p/${flagKey}`, rejection.status, {
+          code: "invalid_request",
+          message: rejection.message,
+        });
+      }
       patches.push({ flagKey, instructions });
       if (state.patchLandsThenThrows?.({ flagKey, instructions })) {
         throw new Error("socket hang up (the patch landed; the response did not)");
@@ -373,6 +388,130 @@ describe("a manifest naming a nonexistent variation is HELD, not thrown", () => 
       h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
       [path(41)],
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A LAUNCHDARKLY REJECTION OF MANIFEST CONTENT IS A REFUSAL, NOT A TRANSPORT ERROR.
+//
+// The instruction body `startRelease` sends is built from manifest content that NOTHING has
+// validated against LaunchDarkly: `releasePlan.stages`, `metricKeys`, `metricGroupKeys`,
+// `randomizationUnit`. `patchFlagSemantic` turns any non-2xx into a throw, and `server.ts`'s catch
+// claims the flag's action slot for any throw — a rule written for LOST RESPONSES, where the patch
+// may already have applied.
+//
+// A client-error status is not a lost response: LaunchDarkly answered, and its answer is that it did
+// not apply the patch. So the failure is deterministic, per-manifest, and recurs on every deploy —
+// the one shape for which claiming the slot starves a releasable sibling PERMANENTLY.
+// ---------------------------------------------------------------------------
+describe("a release instruction LaunchDarkly REJECTS is held, not filed as a lost write", () => {
+  /** Reject only the patch that starts a release of `id-v2`, i.e. pr-41's. */
+  const rejectV2Start = (status: number, message: string) => (p: Patch) =>
+    p.instructions.some((i) => i.kind === "startAutomatedRelease" && i.targetVariationId === "id-v2")
+      ? { status, message }
+      : undefined;
+
+  it("a 400 on pr-41's stages does not starve pr-40, which releases", async () => {
+    // PREVENTS: zero releases across every deploy. pr-41 asks for a GUARDED release with a 100%
+    // stage — `trigger.ts` documents that LaunchDarkly caps guarded stages at 50% and quotes the
+    // live rejection, so this is a permanent 400 on this manifest and only on this manifest. Ordered
+    // highest-target-first, pr-41 goes FIRST; as a throw it claimed the flag's slot and pr-40 was
+    // deferred with the report "another manifest released 'checkout-flow' in this notification",
+    // which had not happened. Deterministic, so every later deploy repeated it identically.
+    const state = mvState({
+      patchRejects: rejectV2Start(400, "stage allocation must not exceed 50%"),
+    });
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], {
+        [path(40)]: manifest("v1"),
+        [path(41)]: manifest("v2", {
+          releasePlan: { releaseMethod: "guarded", metricKeys: ["latency"], stages: [{ allocation: 100000, durationMillis: 300000 }] },
+        }),
+      }),
+      state,
+    );
+
+    const r = await h.post("sha1");
+    assert.equal(h.starts().length, 1, "THE DISCRIMINATOR: exactly one release, where there used to be none");
+    assert.equal(h.starts()[0]?.targetVariationId, "id-v1", "and it is the SIBLING's target");
+
+    const fortyOne = outcomeFor(r.json, 41);
+    assert.equal(fortyOne.action, "held", "a refusal of manifest content needs a human, not a retry");
+    assert.match(
+      JSON.stringify(fortyOne.detail),
+      /stage allocation must not exceed 50%/,
+      "and it names LAUNCHDARKLY'S OWN message, so the operator knows what to edit",
+    );
+
+    const forty = outcomeFor(r.json, 40);
+    assert.equal(forty.action, "released");
+    assert.doesNotMatch(
+      JSON.stringify(forty.detail),
+      /another manifest/,
+      "and it is no longer told that a release it never got had already happened",
+    );
+
+    // pr-41 stays tracked (held is not final), so a corrected manifest takes effect on any later
+    // deploy; pr-40 is done.
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(41)],
+    );
+  });
+
+  it("a 429 is NOT reclassified: it stays an error and still claims the slot", async () => {
+    // PREVENTS widening the classifier to "any 4xx". A 429 is a rate limit, and `LdClient.request`
+    // already spent its own backoff budget before surfacing it — reporting a spent budget as
+    // "a human must fix this manifest" would describe a transient condition as a human problem, and
+    // send an operator to edit a manifest that is correct. 408 is excluded for a different reason
+    // (a timed-out request may have been processed, so write-certainty is as unknowable as a 5xx).
+    //
+    // The behaviour kept is the pre-existing one, in both halves: `error`, and the flag's slot
+    // claimed. That costs pr-40 a DELAY only, because a rate limit is not per-manifest — the next
+    // deploy re-evaluates both entries.
+    const state = mvState({ patchRejects: rejectV2Start(429, "rate limit exceeded") });
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
+      state,
+    );
+
+    const r = await h.post("sha1");
+    const fortyOne = outcomeFor(r.json, 41);
+    assert.equal(fortyOne.action, "error", "THE DISCRIMINATOR: a rate limit is not a content refusal");
+    assert.match(String(fortyOne.detail), /release trigger failed/);
+    assert.match(String(outcomeFor(r.json, 40).detail), /deferred/, "and the slot is still claimed");
+    assert.equal(h.starts().length, 0, "so nothing released on this flag in this notification");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile).sort(),
+      [path(40), path(41)],
+      "both non-final, so the next deploy re-evaluates them",
+    );
+  });
+
+  it("a rejected manifest releases as soon as it is corrected, on any later deploy", async () => {
+    // The recovery half: `held` is not final, so the ledger keeps re-checking — and re-READS the
+    // manifest at the current sha. This is what makes the refusal actionable rather than merely
+    // honest, and it is the property a `noop` (final) classification would have destroyed.
+    const state = mvState({
+      patchRejects: rejectV2Start(422, "randomizationUnit 'organisation' is not configured"),
+    });
+    const h = await harness(ghWith([`pr-41.json`], { [path(41)]: manifest("v2") }), state);
+
+    const first = await h.post("sha1");
+    assert.equal(outcomeFor(first.json, 41).action, "held");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(41)],
+      "kept, so a human's fix can take effect",
+    );
+
+    // The human fixes the manifest; LaunchDarkly now accepts it.
+    state.patchRejects = undefined;
+
+    const second = await h.post("sha2");
+    assert.equal(outcomeFor(second.json, 41).action, "released", "THE DISCRIMINATOR: the fix is not a no-op");
+    assert.equal(h.starts().length, 1);
+    assert.deepEqual(h.pending.list("demo-backend", "production"), [], "released ⇒ no longer pending");
   });
 });
 
