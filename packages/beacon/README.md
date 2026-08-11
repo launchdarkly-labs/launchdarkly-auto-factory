@@ -90,15 +90,28 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
 - **Highest target variation acts first**, in both the discovered and the pending pass.
   An absent `targetVariation` means the lineage tip, so it sorts highest. Filename order
   and ledger insertion order both mean "oldest first", which for a lineage is backwards.
-- **Only a write claims the flag's action slot.** A `held` or `noop` manifest wrote
-  nothing and must not defer one that can release; a second manifest that does reach the
-  trigger is deferred **non-finally**, so the ledger re-checks it.
+- **Only a write claims the flag's action slot — plus a write we cannot rule out.** A `held`
+  or `noop` manifest wrote nothing and must not defer one that can release; a second manifest
+  that does reach the trigger is deferred **non-finally**, so the ledger re-checks it. A
+  trigger that **threw** claims the slot as well, because there are three states and not two:
+  `startRelease` awaits the response *after* LaunchDarkly applied the patch, so a lost response
+  is "we do not know". That claim only costs the sibling a delay because every throw left in
+  `triggerRelease` is either transient or **per-flag** — a deterministic per-manifest refusal
+  returns `held` instead (next bullet but one).
 - **A manifest whose target is BEHIND what the environment serves is moot**, not held: a
   newer variation superseded it, so it resolves as a final `noop` and stops being tracked.
   Holding it would wait forever for a release that must never happen.
 - **A manifest whose target is not in the lineage at all** (`control`, a hand-named
   variation) is **held for a human**. Releasing it would ramp production off the released
   lineage — a deliberate rollback is LaunchDarkly's job, not a deploy notification's.
+- **A manifest naming a variation the flag does not have** is **held for a human** too, and
+  for the same reason: only a person can say whether the variation was never added or the
+  manifest's `targetVariation` is wrong. It must not *throw*: a throw claims the flag's action
+  slot, and this refusal is deterministic and per-manifest, so it would claim it on every
+  deploy and starve the sibling that could release — permanently, since "highest target first"
+  ranks the manifest naming the *missing* higher variation ahead of the releasable one.
+  `write_manifest` checks `targetVariation` against `/^v\d+$/` but never against the flag's
+  real variations.
 
 > **Known limitation: mutual exclusion is per-notification, not per-flag.** The slot
 > above is a set inside one request. `config/services.yaml` registers **four
@@ -184,6 +197,10 @@ other service's deploy notification to re-evaluate.
 > A release that **completed while nobody was watching** repoints the flag's dependent
 > children on the next deploy, for any manifest of that flag still in the ledger — but it
 > does not decide whether that manifest's own work is done, which stays served-vs-target.
+> The repoint costs one extra read and fires **only while nothing is running on that flag**:
+> its destination is the parent's *live* fallthrough, so during a rollout it would follow the
+> heaviest arm — the variation being ramped *away* from — and pull children onto it. If that
+> read fails the repoint is skipped, not guessed.
 > `BEACON_PENDING_FILE` sets the ledger path (default `beacon-pending.json`).
 >
 > **The notification itself is never redelivered**, so alert on `notify: ACTION REQUIRED`.

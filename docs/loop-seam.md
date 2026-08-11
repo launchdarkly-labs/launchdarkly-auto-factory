@@ -100,13 +100,13 @@ deploy, independently of discovery.
 
 | Outcome | Why it isn't final | Recovery now |
 |---|---|---|
-| `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | **ledger re-checks on any later deploy**, re-reading the manifest at the current SHA — so a human's fix takes effect. Re-POST to retry sooner |
+| `held` | intent said hold/manual, a future `notBefore`, segments recorded-not-executed, a target the flag **has no variation for**, or a target off the vN lineage | **ledger re-checks on any later deploy**, re-reading the manifest at the current SHA — so a human's fix takes effect. Re-POST to retry sooner |
 | `waiting` | the fullstack counterpart **definitively** hasn't deployed — the readiness check is tri-state, so this is a real verdict rather than a shrug | the counterpart's own deploy releases it; if that notification is lost, **the ledger catches it** on any later deploy |
 | `error`, idempotency guard unverifiable | the read that would prove no release is running failed | 503 (a refusal, not a retry — nothing redelivers it) **plus a ledger entry**, so the next deploy re-checks |
 | `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | **ledger**, and it is *diagnosed* as unverified rather than reported as "not deployed" |
-| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **ledger**, guarded by the terminal-status check below. And it **claims the flag's action slot**, because a throw is not "did not write" but "we do not know": `startRelease` awaits the response *after* the patch is applied, so a sibling manifest must not release a different variation of that flag in the same notification |
+| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **ledger**, guarded by the terminal-status check below. And it **claims the flag's action slot**, because a throw is not "did not write" but "we do not know": `startRelease` awaits the response *after* the patch is applied, so a sibling manifest must not release a different variation of that flag in the same notification. That claim costs the deferred sibling a **delay** only because of what is left to throw: either something transient that may have written, or a **per-flag** condition every sibling hits on the same read (no true/false pair, no vN lineage, no resolvable served variation) — so there is nobody to starve. The one **deterministic per-manifest** pre-write throw, "this manifest names a variation the flag does not have", is answered `held` in `trigger.ts` instead: as a throw it recurred every deploy and `targetRank` ran it **first**, so it took the slot forever and the releasable sibling never released |
 | `already_running` | a release is under way for **some** variation of this flag, which does not mean THIS manifest's variation released | **not** in the Notifier's attention set (a redelivery mid-rollout needs nobody) but **kept in the ledger**, so the manifest gets another look once that release ends. It used to be final, which cleared the entry and reported the discarded work as success |
-| release completed while unwatched (paused-then-resumed, or after the 24h window) | monitoring stopped at its deadline | **the ledger repoints the flag's children as it goes past** — for any entry of that flag whose manifest still reads, including one held by its own intent — and separately `triggerRelease` decides this manifest's own outcome from served-vs-target (`noop` when they match, and a `noop` repoints as well). The two are deliberately split: "some release of this flag completed" is a fact about the FLAG and is allowed to repoint; it is not an answer to "is THIS manifest done?" |
+| release completed while unwatched (paused-then-resumed, or after the 24h window) | monitoring stopped at its deadline | **the ledger repoints the flag's children as it goes past** — for any entry of that flag whose manifest still reads, including one held by its own intent, and **only once a `findActiveRelease` read says nothing is running on that flag** (the repoint's destination is the parent's LIVE fallthrough, so mid-rollout it aims at the heaviest arm, i.e. the variation the release is ramping *away* from; an unreadable listing skips the repoint rather than guessing) — and separately `triggerRelease` decides this manifest's own outcome from served-vs-target (`noop` when they match, and a `noop` repoints as well). The two are deliberately split: "some release of this flag completed" is a fact about the FLAG and is allowed to repoint; it is not an answer to "is THIS manifest done?" |
 | newest release was **reverted** or **monitoring_stopped** | a guardrail rolled it back, or it ended without completing | **never re-triggered while that is still true.** One check answers it for both write paths (`terminalHistoryRefusal`): the ledger pass, and a re-POST of an already-processed sha. It is **recomputed on every deploy**, so the `needsHuman` report clears by itself once a human completes the release, starts a new one, or the flag moves on — the stored field is last-known reporting, not a latch. A NEW sha still releases, because fix-and-redeploy is the way out of a revert. Deliberately flag-level: a rejected v1 also blocks a manifest wanting v2, which errs in the blocking direction |
 
 **What is still not closed:** the ledger is webhook-gated, so a `notBefore` date passing does
@@ -199,7 +199,10 @@ guardrail just rolled back. So re-evaluation consults `findLatestRelease` first:
 deploy rather than latching it; unreadable history → fail closed and stay pending. `completed`
 deliberately renders **no verdict** here — the manifest's own outcome is served-vs-target inside
 `triggerRelease` — but it does **repoint the flag's children** on the way past, which is the one
-thing the deleted branch was right about. See the next section.
+thing the deleted branch was right about. That repoint takes one further read first: `completed` is
+a fact about a **moment in the past** while the destination is the parent's **live** fallthrough, so
+it fires only while nothing is running on the flag, matching the `!active` fence `monitor.ts`
+already had. See the next section.
 
 **Still WEBHOOK-GATED, deliberately.** Nothing fires on a timer, so a `notBefore` date passing
 causes nothing until some deploy arrives. Closing that would make Beacon a scheduler, against
@@ -239,8 +242,14 @@ Three consequences, each of which reported success while losing work:
   restarts mid-rollout; the flag's only pending manifest is an iteration awaiting approval; the
   child flag stays dark indefinitely), because every path that returns before `triggerRelease`
   reads LaunchDarkly — `held`, `waiting`, readiness `unknown`, the idempotency read failure, the
-  slot deferral, and (final, so the last chance ever) scope `skipped` and manifest-absent — never
-  reached the surviving repoint.
+  slot deferral, and (final, so genuinely the last chance ever) scope `skipped` — never reached the
+  surviving repoint. **Not manifest-absent**, which was measured rather than assumed: that check
+  now lives in the pending pass, *ahead* of `reEvaluate`, so a withdrawn manifest never reaches the
+  repoint and — being final — never will. Deliberately so. A fresh read that finds no manifest
+  leaves nothing to aim at but the remembered `entry.flagKey`, and feeding remembered content into
+  a guard is exactly the content-as-identity mistake these rounds took out of the ledger; a missed
+  repoint is recoverable by any later deploy carrying any manifest for that flag, and by release
+  monitoring, while a repoint aimed at the wrong flag is not.
 - **`already_running` was final**, so an entry cleared while a release for a *different*
   variation ran. Now kept by the ledger and still absent from the Notifier's attention set —
   two lists answering two different questions, which is the one place they must disagree.
