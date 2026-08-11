@@ -33666,6 +33666,28 @@ function warnIfOnlyStaleWouldMatch(isLoop, source, target, kind, cond, accumulat
     return;
   console.warn(`[loop] edge ${source} \u2192 ${target} can never fire: its ${kind} names routing tag(s) ${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched against the source run's own tags, so this condition is unsatisfiable \u2014 check the SERVED graph.`);
 }
+var NUMERIC_HANDOFF_FIELDS = [
+  {
+    field: "max_visits",
+    lost: "this edge is NOT budget-capped \u2014 it is treated as an ordinary forward edge, so the loop is bounded only by the run-level cap and no loop-budget report is produced"
+  },
+  {
+    field: "loop_if_judge_below",
+    lost: "this edge no longer gates on the judge score \u2014 it fires whenever its tag conditions pass, so rework is triggered without any quality signal"
+  }
+];
+function warnIfMalformedNumericHandoff(source, target, handoff, warned) {
+  for (const { field, lost } of NUMERIC_HANDOFF_FIELDS) {
+    const raw = handoff?.[field];
+    if (raw === void 0 || typeof raw === "number")
+      continue;
+    const wk = `${source}\u2192${target}#${field}`;
+    if (warned.has(wk))
+      continue;
+    warned.add(wk);
+    console.warn(`[loop] edge ${source} \u2192 ${target} has ${field}=${JSON.stringify(raw)}, which is ${Array.isArray(raw) ? "an array" : typeof raw} and not a number, so the walker IGNORES it: ${lost}. The committed-config check rejects this, so it came from the SERVED graph \u2014 run 'npm run bridge -- upgrade' to restore the committed value.`);
+  }
+}
 function grantedVisits(grants, edge, runsConsumed) {
   let total = 0;
   for (const g of grants ?? []) {
@@ -33810,6 +33832,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
   const edgeCounts = /* @__PURE__ */ new Map();
   const budgetSpent = /* @__PURE__ */ new Map();
   const exitWarned = /* @__PURE__ */ new Set();
+  const malformedHandoffWarned = /* @__PURE__ */ new Set();
   const exitNeverPossible = /* @__PURE__ */ new Map();
   const routingSnapshots = [];
   const entryEdgeFields = /* @__PURE__ */ new Map();
@@ -33959,6 +33982,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
       const isLoop = handoffNumber(h, "max_visits") !== void 0;
+      warnIfMalformedNumericHandoff(key, edge.key, h, malformedHandoffWarned);
       const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
       const require2 = handoffTags(h, "require_tags");
       if (require2 && !tagsMatch(matchAgainst, require2)) {

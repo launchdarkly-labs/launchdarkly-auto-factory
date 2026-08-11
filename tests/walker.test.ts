@@ -509,6 +509,97 @@ describe("walkGraph — loop-back edges", () => {
     );
   });
 
+  it("5c-bis. a SERVED max_visits that is not a number is not a loop edge at all, and says so", async () => {
+    // The walker's test for "is this a loop edge" is `typeof === "number"`; check-configs 6a
+    // uses `mv !== undefined` and then requires an integer. The two agree on the committed
+    // graph (a string fails the build) and disagree on the graph LaunchDarkly SERVES, which
+    // nothing validates. Measured before the warning existed: this walk ran 44 nodes instead
+    // of 10, reported `run-cap` rather than `budget`, produced an EMPTY loopBudgetSpent, and
+    // emitted no `[loop]` output whatsoever — because the exit-tag and dead-edge warnings are
+    // themselves gated on the recognition that was silently lost.
+    const served = (maxVisits: unknown): LDAgentGraphFlagValue => ({
+      root: "research",
+      edges: {
+        research: [{ key: "flag" }],
+        flag: [{ key: "test" }],
+        test: [{ key: "review" }],
+        // The reviewer never approves, so ONLY a budget can end this loop.
+        review: [
+          { key: "flag", handoff: { max_visits: maxVisits, skip_if_tags: { review_approved: "approve" } } as never },
+        ],
+      },
+    });
+    const runner = new ScriptedRunner({ review: { tags: { review_approved: "reject" } } });
+
+    const run = async (maxVisits: unknown) => {
+      const warnings: string[] = [];
+      const realWarn = console.warn;
+      console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+      try {
+        return { r: await walkGraph(graphFrom(served(maxVisits)), runner, { PR_NUMBER: "1" }), warnings };
+      } finally {
+        console.warn = realWarn;
+      }
+    };
+
+    // The control: a real number is budget-capped and reports the spend.
+    const ok = await run(2);
+    assert.equal(ok.r.loopExhausted?.reason, "budget");
+    assert.equal(ok.r.loopBudgetSpent?.length, 1);
+    assert.ok(
+      !ok.warnings.some((w) => w.includes("not a number")),
+      `a numeric max_visits must not be accused, got: ${ok.warnings.join(" | ")}`,
+    );
+
+    // The drift: still bounded (by the run cap, which is what keeps this fail-safe), but
+    // no longer a loop edge — and now audible.
+    for (const bad of ["2", null, true] as unknown[]) {
+      const { r, warnings } = await run(bad);
+      assert.equal(r.loopExhausted?.reason, "run-cap", `${JSON.stringify(bad)} should fall through to the run cap`);
+      assert.equal(r.loopBudgetSpent, undefined, "an unrecognised edge records no budget spend");
+      assert.ok(r.runs.length > ok.r.runs.length, "and it costs strictly more runs than the bounded version");
+      const w = warnings.find((x) => x.includes("max_visits") && x.includes("not a number"));
+      assert.ok(w, `expected a malformed-handoff warning for ${JSON.stringify(bad)}, got: ${warnings.join(" | ")}`);
+      assert.match(w, /NOT budget-capped/, "the warning must say which behaviour was lost");
+      assert.match(w, /SERVED graph/, "and where the value came from, since the build check rejects it");
+      assert.equal(
+        warnings.filter((x) => x.includes("max_visits") && x.includes("not a number")).length,
+        1,
+        "warned once per walk, not once per traversal",
+      );
+    }
+  });
+
+  it("5c-ter. a SERVED loop_if_judge_below that is not a number stops gating on the judge", async () => {
+    // The opposite loss from 5c-bis, which is why the two warnings differ: an ignored
+    // threshold does not remove the budget, it removes the QUALITY SIGNAL — the edge fires on
+    // its tag conditions alone, so rework is triggered with no score behind it. check-configs
+    // 6d rejects a non-number in the committed graph.
+    const g = graphFrom({
+      root: "research",
+      edges: {
+        research: [{ key: "flag" }],
+        flag: [{ key: "review" }],
+        review: [{ key: "flag", handoff: { max_visits: 2, loop_if_judge_below: "0.7" } as never }],
+      },
+    });
+    const runner = new ScriptedRunner({});
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+    let r;
+    try {
+      // No judgeHook at all: with a real threshold the edge would fail OPEN and never fire.
+      r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+    } finally {
+      console.warn = realWarn;
+    }
+    assert.ok(countOf(r, "flag") > 1, "the ungated edge fired without any judge score — the defect being reported");
+    const w = warnings.find((x) => x.includes("loop_if_judge_below") && x.includes("not a number"));
+    assert.ok(w, `expected a malformed-threshold warning, got: ${warnings.join(" | ")}`);
+    assert.match(w, /no longer gates on the judge score/, "the warning names the signal that was lost");
+  });
+
   it("5d. inventory ACCUMULATES metric_keys across iterations; other facts are last-write-wins", async () => {
     // The tool executor is per node run, so a re-run's metric_keys lists only what THAT
     // run created. Last-write-wins would hide iteration 1's metrics as soon as a rework

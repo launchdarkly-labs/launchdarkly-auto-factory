@@ -367,6 +367,66 @@ function warnIfOnlyStaleWouldMatch(
 }
 
 /**
+ * Handoff fields the walker reads as NUMBERS and silently ignores when they are not one,
+ * changing control flow as it does so. Each entry says what is lost, because the two
+ * losses are opposite and a reader chasing the wrong symptom wastes the warning.
+ *
+ * `check-configs` 6a/6d reject a non-numeric value in the COMMITTED graph. The walker
+ * executes the graph LaunchDarkly SERVES, and its own test for "is this a loop edge" is
+ * `typeof === "number"` — so the two disagree exactly where nothing validates. A dashboard
+ * edit that stores `max_visits: "2"` therefore makes the edge not a loop edge at all: no
+ * budget, no `loopBudgetSpent`, no exit-tag warning (all of those are gated on the edge
+ * being RECOGNISED), and `loopExhausted.reason` comes back as the generic `run-cap`. A
+ * bounded walk measured at 10 runs became 44 — the run cap is the only thing that stopped
+ * it, and nothing said why.
+ *
+ * Deliberately a WARNING and not a coercion. Reading `"2"` as 2 would make the walker
+ * accept input the validator rejects, which is a second definition of a loop edge and the
+ * very drift being closed here. The walker's job is to NOTICE what the validator refuses.
+ */
+const NUMERIC_HANDOFF_FIELDS: ReadonlyArray<{ field: string; lost: string }> = [
+  {
+    field: "max_visits",
+    lost:
+      "this edge is NOT budget-capped — it is treated as an ordinary forward edge, so the loop is bounded " +
+      "only by the run-level cap and no loop-budget report is produced",
+  },
+  {
+    field: "loop_if_judge_below",
+    lost:
+      "this edge no longer gates on the judge score — it fires whenever its tag conditions pass, so rework " +
+      "is triggered without any quality signal",
+  },
+];
+
+/**
+ * Warn once per edge+field when a numeric handoff field is present but is not a number.
+ *
+ * Once per walk rather than per pass: the condition is a property of the served graph, not
+ * of this iteration, so repeating it per traversal would bury the run it belongs to.
+ */
+function warnIfMalformedNumericHandoff(
+  source: string,
+  target: string,
+  handoff: Record<string, unknown> | undefined,
+  warned: Set<string>,
+): void {
+  for (const { field, lost } of NUMERIC_HANDOFF_FIELDS) {
+    const raw = handoff?.[field];
+    if (raw === undefined || typeof raw === "number") continue;
+    const wk = `${source}→${target}#${field}`;
+    if (warned.has(wk)) continue;
+    warned.add(wk);
+    console.warn(
+      `[loop] edge ${source} → ${target} has ${field}=${JSON.stringify(raw)}, which is ` +
+        `${Array.isArray(raw) ? "an array" : typeof raw} and not a number, so the walker IGNORES it: ${lost}. ` +
+        `The committed-config check rejects this, so it came from the SERVED graph — ` +
+        `run 'npm run bridge -- upgrade' to restore the committed value.`,
+    );
+  }
+}
+
+/**
  * Extra traversals granted to `edge` for a budget decision taken after `runsConsumed` runs.
  * Clamped non-negative and integral; the caller still applies the hard cap.
  */
@@ -763,6 +823,10 @@ export async function walkGraph(
   const budgetSpent = new Map<string, NonNullable<WalkResult["loopBudgetSpent"]>[number]>();
   // Per-edge: warned about an unemitted exit tag already (once per walk, not per pass).
   const exitWarned = new Set<string>();
+  // Per edge+field: warned that a numeric handoff field is not a number (see
+  // NUMERIC_HANDOFF_FIELDS). Keyed with the field so max_visits and
+  // loop_if_judge_below on one edge each get said once.
+  const malformedHandoffWarned = new Set<string>();
   // Per-edge: every traversal so far was taken while its exit tag went unemitted. Lets the
   // categorical "the exit never had a chance" claim be a RECORD at exhaustion rather than a
   // prediction from one pass.
@@ -1025,6 +1089,10 @@ export async function walkGraph(
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
       const isLoop = handoffNumber(h, "max_visits") !== undefined;
+      // Before any decision reads them: say so if a numeric field drifted to a non-number,
+      // because every other signal about this edge (budget, loopBudgetSpent, the exit-tag
+      // warnings) is gated on the recognition this would have silently lost.
+      warnIfMalformedNumericHandoff(key, edge.key, h, malformedHandoffWarned);
       // A LOOP edge's ROUTING conditions must be satisfied by the just-completed
       // run's OWN tags, not by whatever is left in accumulatedTags.
       //
