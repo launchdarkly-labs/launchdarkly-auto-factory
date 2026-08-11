@@ -608,12 +608,8 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       // decides. Arguably too broad — v2 is different work from a reverted v1 — but the error is
       // in the blocking direction, which is the safe one.
       //
-      // What deleting the branch NARROWS, stated so nobody rediscovers it as a bug: repointing
-      // after an unwatched completion now needs an entry that actually REACHES `triggerRelease`,
-      // so a manifest still held by its own `releaseIntent` no longer repoints on the way past.
-      // That coverage was accidental — it required some unrelated manifest for the same flag to
-      // happen to be pending, and a flag with nothing pending never got it at all. The reliable
-      // paths are release monitoring (monitor.ts) and the `noop` result above.
+      // The deleted branch's SIDE EFFECT is kept, just below: what was wrong about it was the
+      // VERDICT, not the repointing.
       if (latest && isReleaseFinished(latest.status) && latest.status !== "completed") {
         console.warn(
           `[beacon] ledger: ${tag} — newest release ${latest.id} is '${latest.status}'. NOT re-triggering: a ` +
@@ -630,6 +626,32 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           needsHuman: true,
           detail: `newest release is '${latest.status}' — NOT re-triggered (that would undo a guardrail rollback); needs a human`,
         };
+      }
+
+      // AN UNWATCHED COMPLETION: REPOINT, AND DO NOT RETURN A VERDICT.
+      //
+      // The deleted `completed` branch answered "is this manifest done?" with a flag-level fact,
+      // which was wrong and is not reinstated — `served`-vs-`target` inside `triggerRelease` is
+      // still the only answer to that. But it also carried a side effect that IS flag-level and
+      // was correct: a completed release moved the fallthrough forward, so any child flag
+      // prerequisite'd on the previous variation is now dark, and repointing it is the whole
+      // reason the ledger watches for unwatched completions. Because the branch ran BEFORE
+      // `processFlag`, ANY entry for the flag triggered the repoint — including one held by its
+      // own intent, which was therefore its own trigger.
+      //
+      // Without this, every path that returns before `triggerRelease` reaches its LD read loses
+      // it: intent `hold`/`manual`, a future `notBefore`, `segments`, an unintelligible intent,
+      // `waiting`, readiness `unknown`, the idempotency read failure, the `actedOnFlag` deferral,
+      // and — being final, so it is the LAST chance ever — scope `skipped` and manifest-absent.
+      // The reachable failure is the one the ledger exists for: Beacon restarts mid-rollout, no
+      // deploy arrives before the release completes, and the flag's only pending manifest is an
+      // iteration awaiting approval (the documented steady state). The child stays dark
+      // indefinitely.
+      //
+      // Idempotent by contract (`repoint.ts` skips already-pointed children and never throws), so
+      // the `noop`/`immediate` repoint inside `evaluateManifest` doing it again costs one read.
+      if (latest?.status === "completed") {
+        await repointDependentPrerequisites(ld, actingOn, n.environment);
       }
 
       console.log(`[beacon] ledger: re-evaluating ${tag}`);

@@ -510,6 +510,43 @@ describe("a release that completed unwatched still repoints its children", () =>
     assert.deepEqual(h.pending.list("demo-backend", "production"), []);
   });
 
+  it("repoints even when the only pending manifest is HELD BY ITS OWN INTENT", async () => {
+    // PREVENTS: the child flag staying dark indefinitely. Deleting the flag-level `completed`
+    // branch removed its verdict (right) and its side effect (wrong). Because that branch ran
+    // BEFORE processFlag, any entry for the flag repointed on the way past — including one held by
+    // its own intent, which was its OWN trigger. So this is not the "unrelated manifest happened
+    // to be pending" case: it is the documented steady state. Beacon restarts mid-rollout, no
+    // deploy arrives before the release completes, and the flag's one pending manifest is an
+    // iteration awaiting approval — `held` returns before triggerRelease ever reads LaunchDarkly,
+    // so nothing repoints, on this deploy or any later one.
+    const state = mvState({
+      on: true,
+      served: "v2",
+      releases: [{ id: "rel-1", status: "completed" }],
+      children: { "enable-child": { pinned: "control" } },
+    });
+    const h = await harness(
+      ghWith([`pr-41.json`], { [path(41)]: manifest("v2", { releaseIntent: { action: "hold" } }) }),
+      state,
+    );
+    h.seed(41, "v2");
+
+    const r = await h.post("sha1", "sha0");
+    assert.equal(r.json.discovered, 0, "only the ledger can reach this manifest");
+    const o = outcomeFor(r.json, 41);
+    assert.equal(o.action, "held", "the VERDICT is unchanged: its own intent still holds it");
+
+    const childPatch = h.patches.find((p) => p.flagKey === "enable-child");
+    assert.ok(childPatch, "THE DISCRIMINATOR: an unwatched completion repoints its children anyway");
+    assert.equal(childPatch.instructions[1]?.variationId, "id-v2");
+    assert.equal(h.starts().length, 0, "and repointing is not releasing");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(41)],
+      "held is not final, so the entry stays — the repoint is a side effect, not an answer",
+    );
+  });
+
   it("a COMPLETED release of v1 does not discard a manifest waiting to release v2", async () => {
     // THE DEFECT the deletion fixes, as opposed to the redundancy above. `findLatestRelease` is a
     // question about a FLAG; the entry is a MANIFEST. So "this flag's newest release completed"
