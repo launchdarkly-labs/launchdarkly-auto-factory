@@ -428,9 +428,21 @@ const FULL_ALLOCATION = 100_000;
  * merely rejected — it is asking for something the release does by itself.
  *
  * `guarded` is decided from the MANIFEST alone, mirroring `trigger.ts`'s precedence as far as a
- * manifest can see it: an explicit `releaseMethod`, else metrics imply `guarded`. The flag's release
- * policy can still override the method at deploy time, so the message names the explicit
- * `releaseMethod: "progressive"` escape rather than pretending this is the last word.
+ * manifest can see it: an explicit `releaseMethod`, else metrics imply `guarded`.
+ *
+ * SO THIS CAN REJECT A MANIFEST THAT WOULD HAVE RELEASED LEGALLY, and the message has to be honest
+ * about it. At release time the method is
+ * `ov.releaseMethod ?? policy?.releaseMethod ?? (hasMetrics ? "guarded" : "progressive")`, so the
+ * flag's LaunchDarkly release policy BEATS the metrics inference (only an explicit manifest
+ * `releaseMethod` beats the policy). `metricKeys` plus a 100% stage on a flag whose policy is
+ * `progressive-release` therefore releases fine, and is refused here anyway.
+ *
+ * That trade is acceptable — a loud error naming an escape beats a silent permanent 400 — but the
+ * escape has a COST, and the message must state it, because otherwise the nudge trades a false
+ * rejection for a silently ignored metric set: `releaseMethod: "progressive"` pins the method over
+ * the flag's policy FOREVER for that manifest, and `trigger.ts` sends `metrics` only when the method
+ * is guarded, so the manifest's `metricKeys`/`metricGroupKeys` become dead weight. The rollout stops
+ * being guarded by anything.
  */
 function stageSetProblem(stages: unknown, guarded: boolean): string | undefined {
   if (!Array.isArray(stages)) return "must be an array of {allocation, durationMillis}";
@@ -1203,11 +1215,14 @@ export class SandboxToolExecutor {
     // releasePlan.stages: see stageSetProblem. The rollout shape LaunchDarkly will be asked for,
     // checked here so the agent path cannot commit a manifest that is a permanent 400.
     if (mergedPlan.stages !== undefined) {
-      const guarded =
-        mergedPlan.releaseMethod === "guarded" ||
-        (mergedPlan.releaseMethod === undefined &&
-          ((Array.isArray(mergedPlan.metricKeys) && mergedPlan.metricKeys.length > 0) ||
-            (Array.isArray(mergedPlan.metricGroupKeys) && mergedPlan.metricGroupKeys.length > 0)));
+      const hasMetrics =
+        (Array.isArray(mergedPlan.metricKeys) && mergedPlan.metricKeys.length > 0) ||
+        (Array.isArray(mergedPlan.metricGroupKeys) && mergedPlan.metricGroupKeys.length > 0);
+      // Guarded because the manifest SAID so, versus guarded only because metrics IMPLY it. The
+      // second is the one the flag's release policy can overturn at deploy time, so it is the one
+      // where this check can refuse a release that would have been legal — see `stageSetProblem`.
+      const guardedByInference = mergedPlan.releaseMethod === undefined && hasMetrics;
+      const guarded = mergedPlan.releaseMethod === "guarded" || guardedByInference;
       const problem = stageSetProblem(mergedPlan.stages, guarded);
       if (problem) {
         return {
@@ -1216,11 +1231,21 @@ export class SandboxToolExecutor {
             `(20000 = 20%, ${FULL_ALLOCATION} = 100%), durationMillis is that stage's monitoring window ` +
             `in milliseconds, and allocations must ASCEND. ` +
             (guarded
-              ? `This is a GUARDED release (releaseMethod: "guarded", or metricKeys with no explicit ` +
-                `releaseMethod), and LaunchDarkly caps a guarded stage at ${GUARDED_MAX_ALLOCATION} (50%) — ` +
-                `it needs a control group at least as large as the treatment, and the release completes to ` +
-                `100% by itself after the final monitored stage passes. Set releaseMethod "progressive" if ` +
-                `a 100% stage is genuinely wanted. `
+              ? `This is a GUARDED release (${guardedByInference ? `metricKeys with no explicit releaseMethod` : `releaseMethod: "guarded"`}), ` +
+                `and LaunchDarkly caps a guarded stage at ${GUARDED_MAX_ALLOCATION} (50%) — it needs a ` +
+                `control group at least as large as the treatment, and the release completes to 100% by ` +
+                `itself after the final monitored stage passes, so a 100% stage asks for something the ` +
+                `release already does. ` +
+                (guardedByInference
+                  ? `NOTE this may be a FALSE rejection: at deploy time the flag's LaunchDarkly release ` +
+                    `policy beats the metrics inference, so if that policy is a progressive release these ` +
+                    `stages would have been accepted. `
+                  : "") +
+                `Setting releaseMethod "progressive" is the escape if a 100% stage is genuinely wanted, ` +
+                `BUT KNOW WHAT IT COSTS: an explicit releaseMethod outranks the flag's release policy ` +
+                `permanently for this manifest, and metrics are only sent when the method is guarded — so ` +
+                `this manifest's metricKeys/metricGroupKeys become DEAD, and the rollout is guarded by ` +
+                `nothing. Prefer capping the final stage at ${GUARDED_MAX_ALLOCATION} and keeping the metrics. `
               : "") +
             `Omit stages entirely to use the flag's configured release policy.`,
           isError: true,

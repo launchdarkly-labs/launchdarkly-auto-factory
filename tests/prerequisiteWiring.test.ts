@@ -341,13 +341,55 @@ describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be
     assert.match(r.content, /progressive/, "and the escape is named, since the flag's policy may override the method");
   });
 
+  it("names what the progressive escape COSTS, so it is not a silently dead metric set", async () => {
+    // PREVENTS trading a rejection for a worse manifest. The message names
+    // `releaseMethod: "progressive"` as the escape, and taking it has two consequences an author
+    // cannot see from here: an explicit `releaseMethod` outranks the flag's LaunchDarkly release
+    // policy PERMANENTLY for this manifest (`ov.releaseMethod ?? policy?.releaseMethod ?? …`), and
+    // `trigger.ts` sends `metrics` only when the method is guarded — so the manifest's `metricKeys`
+    // become DEAD and the rollout is guarded by nothing.
+    //
+    // Without this the nudge swapped a loud false rejection for a silent loss of the metric set,
+    // which is the worse of the two: nobody finds out.
+    const r = await write({
+      releaseMethod: "guarded",
+      metricKeys: ["checkout-latency"],
+      stages: [{ allocation: 100000, durationMillis: 300000 }],
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.content, /metricKeys\/metricGroupKeys become DEAD/, "THE DISCRIMINATOR: the cost is stated");
+    assert.match(r.content, /outranks the flag's release policy/, "and that the pin is permanent, not per-deploy");
+    assert.match(r.content, /guarded by\s+nothing/, "and what that leaves the rollout with");
+  });
+
   it("infers GUARDED from metrics when no releaseMethod is set — as trigger.ts does", async () => {
     // PREVENTS a gap between the check and the code it protects: `trigger.ts` resolves the method as
     // `releaseMethod ?? policy ?? (hasMetrics ? "guarded" : "progressive")`, so metrics with no
     // explicit method mean guarded, and a 100% stage is still a 400.
+    //
+    // AND IT SAYS SO: this is the inference, not the manifest's own word, so the flag's release
+    // policy can overturn it at deploy time (only an EXPLICIT releaseMethod beats the policy). A
+    // flag whose policy is a progressive release would have accepted these stages, so the rejection
+    // can be FALSE — acceptable as a loud error naming an escape, dishonest if unstated.
     const r = await write({ metricKeys: ["checkout-latency"], stages: [{ allocation: 100000, durationMillis: 300000 }] });
     assert.equal(r.isError, true);
     assert.match(r.content, /guarded cap/);
+    assert.match(r.content, /metricKeys with no explicit releaseMethod/, "it says WHY it thinks this is guarded");
+    assert.match(r.content, /FALSE rejection/, "THE DISCRIMINATOR: the inference admits it can be overruled");
+    assert.match(r.content, /policy beats the metrics inference/, "and names what overrules it");
+  });
+
+  it("does NOT claim a false rejection when the manifest itself said guarded", async () => {
+    // The control arm for the warning above. An explicit `releaseMethod: "guarded"` BEATS the flag's
+    // policy, so nothing can overturn it and the cap is the last word — printing "this may be a
+    // false rejection" there would be wrong, and would teach an author to ignore a real refusal.
+    const r = await write({
+      releaseMethod: "guarded",
+      stages: [{ allocation: 100000, durationMillis: 300000 }],
+    });
+    assert.equal(r.isError, true);
+    assert.match(r.content, /releaseMethod: "guarded"/, "it attributes the method to the manifest");
+    assert.doesNotMatch(r.content, /FALSE rejection/, "THE DISCRIMINATOR: no false-rejection hedge on a certain one");
   });
 
   it("allows a 100% stage for a PROGRESSIVE release — the cap is guarded-only", async () => {
