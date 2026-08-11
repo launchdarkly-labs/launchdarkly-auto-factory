@@ -112,3 +112,22 @@ other service's deploy notification to re-evaluate.
 > notification is visible. **Manual re-trigger:** once both services are deployed,
 > re-POST `/flag-releases` for the service (same `sha`/`service`) to re-run discovery
 > and release the now-ready flag — the state store re-resolves the same diff range.
+
+> **Nothing retries automatically — alert on `notify: ACTION REQUIRED`.** There is no
+> automatic retry anywhere in Phase 2: the Notifier is non-blocking by contract (a
+> non-2xx is reported and it still exits 0, so it can never fail a deploy), and Railway
+> documents no webhook retry policy. So every recovery ends in a human re-POST.
+>
+> The Notifier prints `notify: ACTION REQUIRED` to **stderr** whenever a human must act,
+> and names the recovery command. **Critically, that includes HTTP 200s**: Beacon acks a
+> notification and reports per-flag outcomes in the body, so `held`, `waiting`, and
+> `error` all arrive inside a successful response. A deploy log line reading "HTTP 200"
+> is not evidence that the flags released.
+>
+> Until the re-evaluation ledger exists, a log alert matching that marker is the cheapest
+> way to notice a stranded release. A clean deploy prints only to stdout and never uses
+> the marker, so it does not cry wolf.
+>
+> When re-POSTing, pass `previousSha` explicitly — the original notification already
+> advanced Beacon's recorded SHA, so a bare re-POST diffs the wrong range and discovers
+> nothing.
