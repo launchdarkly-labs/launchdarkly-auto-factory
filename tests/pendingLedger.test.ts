@@ -102,7 +102,12 @@ describe("recordOutcome — remember unfinished, forget finished", () => {
     assert.equal(store.list("demo-frontend", "production").length, 1);
   });
 
-  it("needsHuman survives, so a reverted release is never quietly re-tried", () => {
+  it("needsHuman is persisted for REPORTING — it is not what prevents the retry", () => {
+    // The distinction matters, and the old name for this test ("needsHuman survives, so a reverted
+    // release is never quietly re-tried") got it backwards. What prevents the retry is
+    // `terminalHistoryRefusal` in server.ts, recomputed from the flag's release history on every
+    // evaluation. This field only carries the LAST KNOWN answer into a log or a report — as control
+    // flow it was a latch nothing could clear.
     const store = new MemoryPendingStore();
     recordOutcome(store, { ...entry("enable-one", "error"), needsHuman: true });
     assert.equal(store.list("demo-backend", "production")[0]?.needsHuman, true);

@@ -15,7 +15,8 @@ import { describeNotifyResult, FINAL_ACTIONS, NON_FINAL_ACTIONS } from "@auto-fa
 //     Nothing REDELIVERS the notification (the Notifier exits 0; Railway documents no
 //     webhook retry). The ledger (pending.ts) re-checks unfinished flags on the next
 //     deploy, so they are no longer permanent — but nothing happens before then, and a
-//     flag marked needsHuman is never retried at all.
+//     flag whose newest release is terminal-without-completing is refused rather than
+//     retried, for as long as that stays true (server.ts, `terminalHistoryRefusal`).
 //
 // The exit code stays 0. What changes is that a human is told.
 // ---------------------------------------------------------------------------
