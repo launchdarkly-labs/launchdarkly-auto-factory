@@ -126,11 +126,14 @@ Claude Code and Cursor provide execution surfaces. Sentry provides external erro
 and Seer Autofix. They integrate with this reference implementation; LaunchDarkly provides
 the primitives above.
 
-## Go deeper
+## Continue
 
-- [Setup and reference](REFERENCE.md)
-- [Factory design](docs/design-partners-factory.md)
-- [Detailed pipeline](docs/pipeline-overview.html)
+1. **What:** [Understand the factory design](docs/design-partners-factory.md)
+2. **How:** [Set up the reference implementation](REFERENCE.md)
+3. **Inspect:** [Explore the detailed pipeline](docs/pipeline-overview.html)
+
+Implementation references:
+
 - [Build orchestration](packages/shared/README.md)
 - [Release orchestration](packages/beacon/README.md)
 - [Architecture decisions](docs/adr/)

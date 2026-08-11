@@ -10,8 +10,8 @@
     --panel: #161b22;
     --node: #1f2630;
     --node-border: #30363d;
-    --accent1: #58a6ff;   /* Phase 1 */
-    --accent2: #3fb950;   /* Phase 2 */
+    --accent1: #58a6ff;   /* Build */
+    --accent2: #3fb950;   /* Deploy and Release */
     --rollback: #f85149;
     --text: #e6edf3;
     --muted: #8b949e;
@@ -118,20 +118,19 @@
 
 <header>
   <h1>AutoFactory pipeline</h1>
-  <p>Phase 1 runs in CI on each pull request and creates the release resources
-     (flag, metrics, tests, review verdict). Phase 2 receives deploy notifications
-     and runs the release using those resources. Hover a node for the mechanics.</p>
-  <p class="disclaimer"><b>Note:</b> this diagram reflects the primary repo
-     maintainer's current setup. The pipeline itself is modular and customizable —
-     where it runs, which agent provider(s) and models execute the chain, and
-     which CD system notifies Beacon are all swappable seams that can be extended
-     to other platforms and providers as needed; the agents' instructions, graph,
-     and permissions are configuration, not code.</p>
+  <p><b>Why:</b> deployment makes code available, but release determines whether
+     customers should receive it. AutoFactory connects those decisions.</p>
+  <p><b>What:</b> agents create a release-ready change, existing CI/CD deploys it
+     with behavior off, and LaunchDarkly controls the release.</p>
+  <p><b>How:</b> follow the flow below. Hover a node only when you need its mechanics.</p>
+  <p class="disclaimer"><b>One reference implementation:</b> the entry point,
+     model provider, and CD system are replaceable. Agent instructions, graph,
+     tools, and permissions are runtime configuration.</p>
 </header>
 
 <section class="phase p1">
-  <h2>Phase 1: PR &rarr; release resources</h2>
-  <p class="sub">GitHub Action on pull_request. Six agents, resolved from LaunchDarkly AI Configs at run time, chained by an agent graph.</p>
+  <h2>Build: change &rarr; release-ready code</h2>
+  <p class="sub">A GitHub pull request is one entry point. Six agents resolve from LaunchDarkly at run time and execute through an Agent Graph.</p>
   <div class="flow">
 
     <div class="node">
@@ -297,14 +296,14 @@
       <div class="hint">flag remains off</div>
       <div class="tip">Standard merge. The flag is off in every environment, so the
         deploy serves the control path. The release manifest is now on the default
-        branch where Phase 2 discovery can see it.</div>
+        branch where Beacon can discover it after deploy.</div>
     </div>
 
   </div>
 </section>
 
 <section class="phase p2">
-  <h2>Phase 2: deploy &rarr; guarded release (Beacon)</h2>
+  <h2>Deploy and Release: running code &rarr; customer exposure</h2>
   <p class="sub">HTTP service, hosted separately from the application. Receives deploy notifications, diffs release manifests, and triggers releases via the LaunchDarkly API. The release itself — traffic shifting, metric monitoring, auto-rollback — runs server-side in LaunchDarkly; Beacon only observes the outcome.</p>
   <div class="flow">
 
@@ -383,7 +382,7 @@
       <div class="title">LaunchDarkly runs the release</div>
       <div class="hint">staged rollout, metric monitoring — server-side</div>
       <div class="tip">From here the work is LaunchDarkly's, not Beacon's: LaunchDarkly
-        shifts traffic per stage and continuously compares the Phase 1 metrics between
+        shifts traffic per stage and continuously compares the Build metrics between
         treatment and control on live traffic.
         <ul>
           <li><span class="k">autoRollback</span> is set per metric at trigger time.</li>
@@ -427,8 +426,8 @@
 </section>
 
 <div class="legend">
-  <span><span class="dot" style="background:var(--accent1)"></span>Phase 1: CI agent chain</span>
-  <span><span class="dot" style="background:var(--accent2)"></span>Phase 2: Beacon release orchestration</span>
+  <span><span class="dot" style="background:var(--accent1)"></span>Build: agent chain</span>
+  <span><span class="dot" style="background:var(--accent2)"></span>Deploy and Release: delivery plus Beacon</span>
   <span><span class="dot" style="background:var(--rollback)"></span>automated rollback path</span>
   <span><span class="dot" style="background:var(--reason)"></span>Sonnet — reasoning agents</span>
   <span><span class="dot" style="background:var(--cursor)"></span>Composer ⇄ Sonnet A/B — coding agents</span>

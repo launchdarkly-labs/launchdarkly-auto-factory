@@ -1,39 +1,64 @@
-# shared
+# Shared factory core
 
-The core of the prototype — the agent-execution seam and everything the other
-packages build on. If you're looking for the customization points, they're here.
+This package contains the runtime used by every AutoFactory entry point. It turns
+LaunchDarkly configuration into constrained agent execution and shared release behavior.
 
-## Module map
+## What it owns
 
-| File | Purpose |
-|------|---------|
-| `src/agentRunner.ts` | The **provider seam**: `AgentRunner` interface + neutral request/result types the graph walker codes against |
-| `src/anthropic/anthropicAgentRunner.ts` | Default backend: a local Anthropic tool-use loop driving each node |
-| `src/anthropic/sandboxTools.ts` | Capability-gated agent tools (read/list/grep/git_diff; create_flag/edit_file/commit_and_push) — the security boundary for agent file access |
-| `src/anthropic/ldWriter.ts` | Real flag creation against the app project (409 → already-exists) |
-| `src/cursor/cursorAgentRunner.ts` | Cursor backend: runs each node as a Cursor agent via `@cursor/sdk` (lazy-loaded), reusing the sandbox tools as Cursor `customTools` |
-| `src/cursor/cursorModel.ts` | Maps the LD AI config's model name + parameters onto a Cursor model selection (exact → fuzzy → `CURSOR_MODEL` fallback) |
-| `src/judges.ts` | LaunchDarkly judge execution: `createJudgeHook` runs judges attached to a node's AI config (SDK `Judge` class over a provider-supplied completion) and records scores on the node's tracker |
-| `src/judgeEvidence.ts` | Ground truth for judges: node-scoped `git diff` of exactly the commits the judged agent landed (HEAD-snapshot collector) |
-| `src/anthropic/judgeCompletion.ts` | Anthropic judge execution: one forced-tool-use completion returning `{score, reasoning}` |
-| `src/cursor/judgeCompletion.ts` | Cursor judge execution: hermetic one-shot `Agent.prompt` + lenient JSON extraction |
-| `src/vegaAgentRunner.ts` | Alternative backend: thin adapter over the Vega client |
-| `src/vegaClient.ts` / `src/vegaTransport.ts` | Vega dispatch: client polls to terminal; `GraphQLVegaTransport` is the real impl, `StubVegaTransport` the no-config fallback |
-| `src/ldSdk.ts` | Native LaunchDarkly bootstrap: server SDK (flag eval) + AI SDK (configs/graphs/trackers) + the pipeline context |
-| `src/providerFlag.ts` | Resolves `auto-factory-ai-provider` (default `anthropic`) via the server SDK |
-| `src/ldClient.ts` | REST client (configurable base URL) for flags, metrics, AI configs, graphs |
-| `src/graph/` | Knowledge graph (ADR 0010): `schema` (artifact types), `traceEdges` (observability spans → service edges), `codeRefs` (find-code-refs CSV → flag wrap points), `o11yClient` (hosted o11y MCP span fetch, fail-soft), `assemble` (per-run composition: registry + spans + code refs, degrades per source), `query` (dependents/dependencies BFS + `blastRadius`) |
-| `src/releaseAdapter.ts` | Phase 2 release API: `startAutomatedRelease`, `getReleasePolicy`, `normalizeReleasePolicy` |
-| `src/env.ts` | `.env` loader + `targetConnection` / `appConnection` / `sourceConnection` |
-| `src/config.ts` | Schemas for the YAML files under `config/` |
-| `src/types.ts` | Common types (approval modes, release shapes, release-flag file) |
+| Area | Responsibility |
+|---|---|
+| **Runners** | Execute one graph node through Anthropic, Cursor, or Vega |
+| **Sandbox tools** | Limit file, Git, flag, and metric operations available to an agent |
+| **LaunchDarkly clients** | Resolve flags, Agent Configs, Tools, graphs, and monitoring |
+| **Judges** | Score agent output against verified, node-scoped diffs |
+| **Knowledge graph** | Combine service telemetry, Code References, and repository context |
+| **Release adapter** | Normalize policies and call the LaunchDarkly release API |
+| **Shared types and config** | Define handoffs, approvals, manifests, and connections |
 
-## Customization seams
+The entry points decide when a run starts and where edits land. This package decides how the
+graph executes.
 
-- **Add a provider:** implement `AgentRunner` and wire it into the action's
-  `createAgentRunner` (see [ADR 0005](../../docs/adr/0005-provider-seam-local-anthropic-execution.md)
-  for the seam, and [ADR 0006](../../docs/adr/0006-cursor-sdk-provider.md) for the Cursor backend as
-  a worked example — model mapping, custom-tool reuse, lazy SDK load).
-- **Change agent capabilities:** `sandboxTools.ts` (note the known config-key
-  coupling in `anthropicAgentRunner.ts` — CLEANUP #24).
-- **Point at a different LD instance/project:** env vars consumed by `env.ts`.
+## Extend it
+
+### Add an execution provider
+
+Implement `AgentRunner` in `src/agentRunner.ts`, then wire it into the entry point's runner
+selection. The Cursor implementation shows model mapping, lazy loading, and custom-tool reuse.
+
+### Change agent capabilities
+
+Edit `src/anthropic/sandboxTools.ts` and the graph's per-node capabilities together. Runtime
+code is the maximum write boundary. LaunchDarkly configuration may narrow access but must not
+expand it beyond that boundary.
+
+### Add production context
+
+Extend `src/graph/`. The current graph combines:
+
+- service relationships from observability spans
+- flag locations from Code References
+- services and related repositories declared by the application
+
+Each source fails softly and reports missing coverage.
+
+### Change release behavior
+
+Use `src/releaseAdapter.ts` for LaunchDarkly release policy resolution and API calls. Beacon
+owns deploy notifications and discovery; LaunchDarkly owns rollout execution.
+
+## Find the main modules
+
+| Path | Purpose |
+|---|---|
+| `src/agentRunner.ts` | Provider-neutral execution contract |
+| `src/anthropic/` | Local tool-use runner and sandbox |
+| `src/cursor/` | Cursor SDK runner and model selection |
+| `src/vegaAgentRunner.ts` | Vega adapter |
+| `src/judges.ts` and `src/judgeEvidence.ts` | Quality evaluation |
+| `src/graph/` | Knowledge-graph assembly and queries |
+| `src/ldSdk.ts` and `src/ldClient.ts` | LaunchDarkly SDK and REST access |
+| `src/releaseAdapter.ts` | Release API integration |
+
+See [ADR 0005](../../docs/adr/0005-provider-seam-local-anthropic-execution.md) for the
+runner boundary and [ADR 0010](../../docs/adr/0010-knowledge-graph-ld-native-composition.md)
+for the knowledge graph.
