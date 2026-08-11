@@ -61,7 +61,11 @@ interface FlagOutcome {
   detail?: unknown;
   /** True when this outcome came from the re-evaluation ledger, not from discovery. */
   viaLedger?: boolean;
-  /** True when re-evaluation must not proceed unattended (a reverted release). */
+  /**
+   * True when this evaluation refused to act unattended (the flag's newest release is terminal and
+   * not `completed`). A CONCLUSION recomputed from LaunchDarkly on every evaluation — see
+   * `terminalHistoryRefusal` — never a remembered flag that gates anything.
+   */
   needsHuman?: boolean;
 }
 
@@ -119,6 +123,40 @@ function highestTargetFirst<T>(items: T[], target: (item: T) => string | undefin
 /** Methods that WROTE to LaunchDarkly. Only these may claim the per-flag action slot. */
 function performedAWrite(method: string): boolean {
   return method === "progressive" || method === "guarded" || method === "immediate" || method === "prerequisites";
+}
+
+/**
+ * MAY THIS MANIFEST BE RE-TRIGGERED, given the flag's terminal release history? Null = no
+ * objection; otherwise the refusal, with the detail to report.
+ *
+ * ONE answer, asked from the two write paths that can arrive after a release already ended: a
+ * repeat evaluation of an already-processed sha, and a ledger re-evaluation. They were two copies
+ * with identical conditions and divergent detail strings — the last place a flag-level answer was
+ * given to a manifest-level question in two voices.
+ *
+ * `findActiveRelease` excludes TERMINAL statuses, so it answers "nothing running" for a release
+ * LaunchDarkly already REVERTED; and a revert restores the ORIGINAL variation, so served != target
+ * and the noop guard does not fire either. Without this, either path starts a second rollout of the
+ * variation a guardrail just rolled back.
+ *
+ * DELIBERATELY FLAG-LEVEL AND CONSERVATIVE, and this is policy, not an oversight: a guardrail
+ * rejecting v1 also blocks a manifest wanting v2, which is arguably wrong but errs in the blocking
+ * direction. `completed` is excluded because it is not an objection to anything — what a completed
+ * release means for THIS manifest is decided by served-vs-target inside `triggerRelease`.
+ */
+function terminalHistoryRefusal(
+  latest: AutomatedRelease | null,
+  /** Why we were about to act — the caller's context, prefixed onto the shared explanation. */
+  why: string,
+): { status: string; detail: string } | null {
+  if (!latest || !isReleaseFinished(latest.status) || latest.status === "completed") return null;
+  return {
+    status: latest.status,
+    detail:
+      `${why} and the newest release ${latest.id} is '${latest.status}' — NOT re-triggered, because ` +
+      `re-releasing would undo a guardrail's rollback. NEEDS A HUMAN: deploy the fix as a new commit, ` +
+      `which starts a fresh release`,
+  };
 }
 
 /** Constant-time secret comparison (hashed first to equalize lengths). */
@@ -397,19 +435,16 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
               detail: `re-evaluating an already-processed sha and the release history could not be read — NOT re-triggering: ${String(e)}`,
             };
           }
-          if (latest && isReleaseFinished(latest.status) && latest.status !== "completed") {
-            console.warn(
-              `[beacon] NOT re-releasing '${flag.flagKey}': this sha (${n.sha}) was already processed and the ` +
-                `newest release ${latest.id} is '${latest.status}'. Re-releasing would undo a guardrail's ` +
-                `rollback. Deploy the fix as a new commit to start a fresh release.`,
-            );
+          const refusal = terminalHistoryRefusal(latest, `this sha (${n.sha}) was already processed`);
+          if (refusal) {
+            console.warn(`[beacon] NOT re-releasing '${flag.flagKey}': ${refusal.detail}`);
             return {
               flag: flag.flagKey,
               sourceFile: flag.sourceFile,
               scope,
               action: "error",
               needsHuman: true,
-              detail: `sha already processed and newest release is '${latest.status}' — NOT re-triggered (that would undo a guardrail rollback); deploy a fix to start a fresh release`,
+              detail: refusal.detail,
             };
           }
         }
@@ -507,19 +542,21 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     const reEvaluate = async (entry: PendingEntry): Promise<FlagOutcome> => {
       const tag = `${entry.sourceFile} (last named ${entry.flagKey}, pending since ${entry.firstSeenSha.slice(0, 8)}, attempt ${entry.attempts + 1})`;
 
-      if (entry.needsHuman) {
-        // Reported every time, never retried: see the terminal-status branch below.
-        return {
-          flag: entry.flagKey,
-          sourceFile: entry.sourceFile,
-          ...targetOf(entry.targetVariation),
-          scope: "ledger",
-          action: "error",
-          viaLedger: true,
-          needsHuman: true,
-          detail: `NEEDS A HUMAN, not retried: ${entry.lastDetail ?? "(no detail)"}`,
-        };
-      }
+      // NOTE WHAT IS NOT HERE: a `entry.needsHuman` short-circuit. It used to be the first thing
+      // this function did, which made the field a LATCH rather than a conclusion — it preceded the
+      // manifest re-read and was not sha-gated, so nothing on any code path could clear it and the
+      // entry reported `ACTION REQUIRED` on every deploy until someone hand-edited the ledger file.
+      //
+      // That became reachable for manifests that WROTE NOTHING once `already_running` stopped being
+      // final: `config/services.yaml` puts four `side: backend` services on one repo, so one merge
+      // produces four notifications that discover the same manifest — one releases, three answer
+      // `already_running` and are kept, and one revert then stamps `needsHuman` on all three.
+      //
+      // So the entry takes the normal path: re-read the manifest, consult `findLatestRelease`, and
+      // conclude `needsHuman` AGAIN if the flag is still terminal-not-completed. Same report, but
+      // DERIVED FROM CURRENT STATE, so it clears by itself when a human completes the release,
+      // starts a new one, or the flag moves on. The stored field stays as reporting metadata (last
+      // known) and is never control flow again.
 
       // Re-read the manifest AT THE CURRENT SHA. This is the property that makes a human's
       // fix take effect — editing a bad `releaseIntent` used to be a no-op, because the file
@@ -610,12 +647,9 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       //
       // The deleted branch's SIDE EFFECT is kept, just below: what was wrong about it was the
       // VERDICT, not the repointing.
-      if (latest && isReleaseFinished(latest.status) && latest.status !== "completed") {
-        console.warn(
-          `[beacon] ledger: ${tag} — newest release ${latest.id} is '${latest.status}'. NOT re-triggering: a ` +
-            `reverted release means a guardrail rolled it back, and re-releasing would undo that. A human must ` +
-            `decide (fix the regression and deploy again, which starts a fresh release).`,
-        );
+      const refusal = terminalHistoryRefusal(latest, `${entry.sourceFile} is still pending`);
+      if (refusal) {
+        console.warn(`[beacon] ledger: ${tag} — ${refusal.detail}`);
         return {
           flag: actingOn,
           sourceFile: entry.sourceFile,
@@ -624,7 +658,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           action: "error",
           viaLedger: true,
           needsHuman: true,
-          detail: `newest release is '${latest.status}' — NOT re-triggered (that would undo a guardrail rollback); needs a human`,
+          detail: refusal.detail,
         };
       }
 

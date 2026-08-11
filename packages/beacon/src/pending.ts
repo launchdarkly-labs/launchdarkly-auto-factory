@@ -89,8 +89,15 @@ export interface PendingEntry {
   /** How many times this flag has been evaluated, including the first. */
   attempts: number;
   /**
-   * Set when re-evaluation must NOT proceed without a human — currently only a release
-   * LaunchDarkly reverted. Kept in the ledger (so it stays visible) but never re-triggered.
+   * LAST KNOWN answer to "did the previous evaluation refuse to act unattended?" — currently only
+   * a release LaunchDarkly reverted or stopped monitoring. REPORTING ONLY, exactly like `flagKey`
+   * and `targetVariation` above.
+   *
+   * It used to be CONTROL FLOW: `reEvaluate` short-circuited on it before re-reading the manifest,
+   * and the check was not sha-gated, so nothing in the code could ever clear it — a hand-edit of
+   * this file was the only way out. Now the refusal is recomputed from the flag's release history
+   * on every re-evaluation (server.ts, `terminalHistoryRefusal`), so the report is the same while
+   * a human is still needed and stops by itself when one is not.
    */
   needsHuman?: boolean;
 }

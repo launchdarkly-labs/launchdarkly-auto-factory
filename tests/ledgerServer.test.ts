@@ -254,6 +254,55 @@ describe("ledger: the guard that makes automatic re-evaluation safe", () => {
     assert.equal(patches.length, before, "still nothing started");
   });
 
+  it("CLEARS needsHuman once the flag's newest release is no longer terminal-not-completed", async () => {
+    // PREVENTS a permanent `ACTION REQUIRED`. `needsHuman` used to short-circuit `reEvaluate`
+    // before the manifest re-read, and was not sha-gated, so NOTHING in the code could clear it —
+    // only a hand-edit of the ledger file. That became reachable for manifests that wrote nothing
+    // once `already_running` stopped being final: four `side: backend` services share one repo in
+    // `config/services.yaml`, so one merge produces four notifications that discover the same
+    // manifest, three answer `already_running` and stay pending, and one revert stamps all three.
+    //
+    // The field is now a CONCLUSION recomputed from the flag's release history, so the same report
+    // appears while a human is still needed and stops when one is not.
+    const patches: unknown[] = [];
+    let manifest: unknown = HELD_MANIFEST;
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return ["pr-1.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return manifest;
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    // Mutated between deploys, which is the point: the same ledger entry sees a different flag.
+    const ld: LdOpts = { served: "off", releases: [{ id: "rel-1", status: "reverted" }] };
+    const h = await harness(gh, fakeLd(patches, ld), patches);
+
+    await h.post("sha1"); // held on an unintelligible notBefore ⇒ pending
+    const second = await h.post("sha2");
+    assert.equal(second.json.outcomes.find((x: any) => x.flag === "enable-one")?.needsHuman, true);
+    assert.equal(h.pending.list("demo-backend", "production")[0]?.needsHuman, true, "stored as LAST KNOWN");
+
+    // The human fixes the regression, drives a release to completion by hand, and fixes the
+    // manifest's intent in the same PR. Production now serves the target.
+    manifest = GOOD_MANIFEST;
+    ld.releases = [{ id: "rel-2", status: "completed" }];
+    ld.served = "on";
+
+    const third = await h.post("sha3");
+    const o = third.json.outcomes.find((x: any) => x.flag === "enable-one");
+    assert.equal(o.needsHuman, undefined, "THE DISCRIMINATOR: a conclusion, not a latch");
+    assert.equal(o.action, "noop", "and the normal path runs, deciding from served-vs-target");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production"),
+      [],
+      "the entry finishes without anyone hand-editing the ledger file",
+    );
+  });
+
   it("notices a release that COMPLETED unwatched — via the trigger, not a flag-level shortcut", async () => {
     // The other observation the ledger exists for: monitoring stopped at its deadline, a human
     // resumed the release, and it finished with nobody watching.
