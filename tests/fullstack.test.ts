@@ -44,12 +44,14 @@ function cfgWith(frontendStatusUrl: string): BeaconConfig {
         repo: { owner: "o", name: "backend" },
         statusUrl: "http://127.0.0.1:1/unused",
         statusShaField: "version",
+        privateNetwork: false,
       },
       "demo-frontend": {
         side: "frontend",
         repo: { owner: "o", name: "frontend" },
         statusUrl: frontendStatusUrl,
         statusShaField: "version",
+        privateNetwork: false,
       },
     },
   };
@@ -125,3 +127,96 @@ describe("otherSideHasFile — tri-state readiness", () => {
     assert.deepEqual(await otherSideHasFile(cfg, gh, "backend", ".release-flags/pr-1.json"), { state: "absent" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Private-network counterparts must not poison the answer.
+//
+// config/services.yaml has always said the cross-check "skips unreachable
+// counterparts" — free under `.catch(() => false)`, but once the check became
+// tri-state an unreadable counterpart made the whole answer `unknown`. ToggleMart
+// runs catalog/orders/users on *.railway.internal, unreachable from Beacon and
+// PERMANENTLY so, which would have turned every ordinary "the backend hasn't
+// deployed yet" into a reported error on every delivery. `privateNetwork: true`
+// is what makes the documented skip real.
+// ---------------------------------------------------------------------------
+function togglemartCfg(gatewayStatusUrl: string): BeaconConfig {
+  const repo = { owner: "ttotenberg-ld", name: "launchdarkly-autofactory-application" };
+  const internal = (port: number) => ({
+    side: "backend" as const,
+    repo,
+    statusUrl: `http://togglemart-x.railway.internal:${port}/api/status`,
+    statusShaField: "version",
+    privateNetwork: true,
+  });
+  return {
+    secret: "s",
+    githubToken: "unused",
+    ldEnvironmentKey: "production",
+    releaseFlagsDir: ".release-flags/",
+    stateFile: "unused.json",
+    services: {
+      "togglemart-frontend": {
+        side: "frontend",
+        repo,
+        statusUrl: "http://127.0.0.1:1/unused",
+        statusShaField: "version",
+        privateNetwork: false,
+      },
+      "togglemart-gateway": {
+        side: "backend",
+        repo,
+        statusUrl: gatewayStatusUrl,
+        statusShaField: "version",
+        privateNetwork: false,
+      },
+      "togglemart-catalog": internal(8081),
+      "togglemart-orders": internal(8082),
+      "togglemart-users": internal(8083),
+    },
+  };
+}
+
+describe("otherSideHasFile — private-network counterparts", () => {
+  it("ABSENT, not unknown, when the reachable counterpart definitively lacks the file", async () => {
+    // The ordinary fullstack wait for ToggleMart: the gateway is up and has not
+    // deployed the manifest yet; three internal services are unreachable by design.
+    const cfg = togglemartCfg(await statusEndpoint({ version: "gw-sha" }));
+    const gh = ghWhereFileExists(async () => false); // a definitive 404
+    const r = await otherSideHasFile(cfg, gh, "frontend", ".release-flags/pr-7.json");
+    assert.deepEqual(r, { state: "absent" }, "an unreachable-BY-DESIGN counterpart is not a failed read");
+  });
+
+  it("still PRESENT when the reachable counterpart has the file", async () => {
+    const cfg = togglemartCfg(await statusEndpoint({ version: "gw-sha" }));
+    const gh = ghWhereFileExists(async () => true);
+    assert.deepEqual(await otherSideHasFile(cfg, gh, "frontend", ".release-flags/pr-7.json"), { state: "present" });
+  });
+
+  it("UNKNOWN when the one reachable counterpart genuinely fails", async () => {
+    // The marker must not blunt real failures: the gateway's endpoint is down, so
+    // nothing on the other side was read and the answer is still not a verdict.
+    const cfg = togglemartCfg("http://127.0.0.1:1/down");
+    const gh = ghWhereFileExists(async () => false);
+    const r = await otherSideHasFile(cfg, gh, "frontend", ".release-flags/pr-7.json");
+    assert.equal(r.state, "unknown");
+  });
+
+  it("UNKNOWN when EVERY counterpart is private — never absent", async () => {
+    // Guessing "not deployed" here would hold the flag in `waiting` forever, with no
+    // event that could ever release it. Say we cannot answer, and name the fix.
+    const cfg = togglemartCfg(await statusEndpoint({ version: "gw-sha" }));
+    cfg.services["togglemart-gateway"]!.privateNetwork = true;
+    const r = await otherSideHasFile(cfg, gh0(), "frontend", ".release-flags/pr-7.json");
+    assert.equal(r.state, "unknown");
+    assert.match(String((r as { reason: string }).reason), /reachable from Beacon/);
+    assert.match(String((r as { reason: string }).reason), /public status URL|scope the flag/);
+  });
+});
+
+function gh0(): GitHubClient {
+  return {
+    fileExists: async () => {
+      throw new Error("must not be called: there is no witness to check");
+    },
+  } as unknown as GitHubClient;
+}

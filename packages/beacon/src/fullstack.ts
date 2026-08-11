@@ -58,8 +58,31 @@ export async function otherSideHasFile(
   sourceFile: string,
 ): Promise<FullstackReadiness> {
   const others = otherSideServices(cfg, callerSide);
+  // A service whose status endpoint Beacon cannot reach BY DESIGN is not a witness, and
+  // must not be counted as a failed read. `config/services.yaml` has always documented
+  // that the cross-check "skips unreachable counterparts"; under `.catch(() => false)`
+  // that happened for free. Once the check became tri-state, an unreachable counterpart
+  // started poisoning the answer to `unknown` — so for a project with private-network
+  // services (ToggleMart's catalog/orders/users, on *.railway.internal) every ordinary
+  // "the other side has not deployed yet" would have been reported as an error, on every
+  // delivery, permanently. The declaration is now what makes the documented behaviour real.
+  const witnesses = others.filter((s) => !s.privateNetwork);
+  // NOTE the `others.length > 0`. Zero registered counterparts is a DIFFERENT case, answered
+  // `absent` by long-standing behaviour a test pins deliberately — there is no other side to
+  // wait for. This branch is "there IS an other side and none of it is observable", where
+  // guessing "not deployed" would hold the flag in `waiting` forever with no event that could
+  // ever release it.
+  if (others.length > 0 && witnesses.length === 0) {
+    return {
+      state: "unknown",
+      reason:
+        `no opposite-side service has a status endpoint reachable from Beacon ` +
+        `(${others.length} counterpart(s), all marked privateNetwork) — fullstack coordination ` +
+        `cannot be answered; give one counterpart a public status URL, or scope the flag to one side`,
+    };
+  }
   const failures: string[] = [];
-  for (const svc of others) {
+  for (const svc of witnesses) {
     const read = await fetchDeployedSha(svc.statusUrl, svc.statusShaField);
     if ("error" in read) {
       failures.push(read.error);

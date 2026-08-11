@@ -19,6 +19,7 @@ const cfg: BeaconConfig = {
       repo: { owner: "o", name: "r" },
       statusUrl: "http://unused/api/status",
       statusShaField: "version",
+      privateNetwork: false,
     },
   },
 };
@@ -267,6 +268,7 @@ describe("beacon: fullstack readiness check failure", () => {
           repo: { owner: "o", name: "fe" },
           statusUrl: await statusEndpoint(),
           statusShaField: "version",
+          privateNetwork: false,
         },
       },
     };
