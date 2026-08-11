@@ -103,16 +103,15 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
   carries `releasePlan.stages`, `metricKeys`, `metricGroupKeys` and `randomizationUnit` straight
   through to LaunchDarkly, and *neither* `write_manifest` *nor* Beacon validated any of them —
   so a 100% guarded stage (LD caps guarded stages at 50%) was a permanent 400 that
-  `targetRank` evaluated **first**. Both per-manifest refusals now return `held` at source in
-  `trigger.ts`: a target the flag has no variation for, and any **client-error rejection of the
-  release-start patch**, which closes the class rather than the instance. What is left for the
-  catch is what LaunchDarkly rejects with a *non*-client error (transient, and it may have
-  written), a rate limit (429, deliberately kept transient rather than reported as a human
-  problem), a **per-flag** pre-write throw, and a **global** credential failure (401/403) —
-  none of which can starve a sibling, because every sibling hits them identically.
-  Known gap: only the release-start patch is classified, so a 4xx on the `prerequisites`
-  release's `addPrerequisite` patch (built from `releaseIntent`) is still deterministic,
-  per-manifest, and still claims the slot.
+  `targetRank` evaluated **first**. All **three** per-manifest refusals now return `held` at
+  source in `trigger.ts`: a target the flag has no variation for, a content rejection of the
+  **release-start** patch, and a content rejection of the **`prerequisites`** release's patch —
+  each closing the class rather than the instance. What is left for the catch is what
+  LaunchDarkly rejects with a *non*-client error (transient, and it may have written), a
+  transient refusal (429 rate limit, 409 concurrent-request conflict), a **per-flag or
+  per-environment** refusal (405 approval-required, 404 invalid identifier), a **per-flag**
+  pre-write throw, a credential failure (401/403), and any 4xx LaunchDarkly does not document
+  on this endpoint — none of which can starve a sibling, because none is per-manifest.
 - **A manifest whose target is BEHIND what the environment serves is moot**, not held: a
   newer variation superseded it, so it resolves as a final `noop` and stops being tracked.
   Holding it would wait forever for a release that must never happen.
@@ -127,13 +126,33 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
   ranks the manifest naming the *missing* higher variation ahead of the releasable one.
   `write_manifest` checks `targetVariation` against `/^v\d+$/` but never against the flag's
   real variations.
-- **A release instruction LaunchDarkly REJECTS with a client error is held for a human**, named
-  with LaunchDarkly's own message. A 4xx means LD answered and the patch did **not** apply, so
-  write-certainty is knowable from the error and nothing was written — the sibling can still
-  release in this same notification. 429 and 408 are excluded (a spent rate-limit budget is
-  transient; a timed-out request may have been processed) and so are 401/403, which are Beacon's
-  credentials rather than the manifest's content. Classified on `LdApiError.status`, never on
-  message text.
+- **A patch LaunchDarkly REJECTS on CONTENT grounds is held for a human**, named with
+  LaunchDarkly's own message, for *both* patches Beacon sends — the release-start one and the
+  `prerequisites` one. LD answered, so the patch did **not** apply and nothing was written; that
+  holds for these multi-instruction patches because LD documents that *"semantic patches are not
+  applied partially"*. The sibling can still release in this same notification.
+  Classified on `LdApiError.status`, never on message text, and the classifier is an
+  **allowlist** — `{400}`, the content rejection LD documents on
+  `PATCH /api/v2/flags/{proj}/{flag}`. It was a *denylist* ("any 4xx except 401/403/408/429"),
+  which mislabelled three of the six responses LD documents there (400, 401, 404, 405, 409, 429):
+  - **409** "Status conflict" is transient (LD's own remediation is *"Retry your request"*), and
+    misclassifying it **changed production behaviour** — `held` leaves the flag's action slot
+    open, so a sibling wanting an *earlier* variation rolled out spuriously.
+  - **405** "Approval is required" is a per-**environment** setting, and required approvals in
+    production is standard enterprise config — so every manifest for every flag was told to fix
+    its `releasePlan`.
+  - **404** "Invalid resource identifier" is the flag or the environment, so a notification with
+    a wrong `environment` blamed the manifest forever.
+
+  429 and 408 stay excluded too (a spent rate-limit budget is transient; a timed-out request may
+  have been processed — and note 408 appears nowhere in LD's v2 spec, so it is a proxy's, not
+  LD's). So do 401/403: Beacon's credentials rather than the manifest's content. Those are
+  **per-flag or per-environment at worst, never per-manifest** — *not* "global", which this file
+  used to claim: LD's custom-role resource specifiers are globbed and environment-scoped
+  (`proj/*:env/*:flag/ops_*`). The conclusion survives anyway, because per-flag already starves
+  nobody, and there is no per-manifest 403 — LD has no separate role action for guarded versus
+  progressive, so two manifests for one flag request the same actions. An **unknown 4xx keeps
+  throwing** rather than being asserted to be a manifest defect.
 
 > **Known limitation: mutual exclusion is per-notification, not per-flag.** The slot
 > above is a set inside one request. `config/services.yaml` registers **four
