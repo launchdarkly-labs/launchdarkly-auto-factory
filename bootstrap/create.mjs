@@ -90,7 +90,7 @@ Next steps (provider: cursor):
      Add repo variable:   LD_APP_PROJECT_KEY  (e.g. autofactory-demo)
      (GITHUB_TOKEN is provided automatically. For Phase 2, also add BEACON_WEBHOOK_SECRET.)
   4. Open a PR. Phase 1 runs automatically (LLM Observability is on — DISABLE_LD_OBSERVABILITY to opt out;
-     set repo variable AUTOFACTORY_REQUIRE_LABEL=true to gate runs on the `autofactory` PR label).
+     set repo variable AUTOFACTORY_REQUIRE_LABEL=true to gate runs on the \`autofactory\` PR label).
   Optional A/B: to split Composer vs Sonnet per coding agent, add a Composer model + a 'run'
   context kind in LaunchDarkly and bucket those agents' rollouts by 'run' (see
   config/agentcontrol/CHANGELOG.md).`
@@ -102,7 +102,7 @@ Next steps (provider: anthropic):
      Add repo variable:   LD_APP_PROJECT_KEY  (e.g. autofactory-demo)
      (GITHUB_TOKEN is provided automatically. For Phase 2, also add BEACON_WEBHOOK_SECRET.)
   3. Open a PR. Phase 1 runs automatically (LLM Observability is on — DISABLE_LD_OBSERVABILITY to opt out;
-     set repo variable AUTOFACTORY_REQUIRE_LABEL=true to gate runs on the `autofactory` PR label).
+     set repo variable AUTOFACTORY_REQUIRE_LABEL=true to gate runs on the \`autofactory\` PR label).
 
   Using Claude Code instead of the GitHub Action? Skip the steps above and follow
   INSTALL-CLAUDE-CODE.md (you're already past step 1).`;
