@@ -39,6 +39,24 @@ function required(name: string): string {
   return v;
 }
 
+const PROJECT_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Fail fast on a malformed project key instead of letting it reach the REST
+ * API, where it surfaces as an opaque HTTP 405 mid-run (observed live: an
+ * LD_APP_PROJECT_KEY that had picked up a space + extra text in a .env paste).
+ */
+export function validateProjectKey(name: string, value: string): string {
+  if (!PROJECT_KEY_RE.test(value)) {
+    const hint = /\s/.test(value) ? " — it contains whitespace, likely a .env paste error" : "";
+    throw new Error(
+      `${name}='${value}' is not a valid LaunchDarkly project key${hint}. ` +
+        "Use the project's key (letters, digits, '.', '_', '-' only); check your .env.",
+    );
+  }
+  return value;
+}
+
 /** Connection details for a LaunchDarkly instance/project. */
 export interface LdConnection {
   apiKey: string;
@@ -52,7 +70,7 @@ export function targetConnection(): LdConnection {
   return {
     apiKey: required("LD_API_KEY"),
     baseUrl: (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, ""),
-    projectKey: required("LD_PROJECT_KEY"),
+    projectKey: validateProjectKey("LD_PROJECT_KEY", required("LD_PROJECT_KEY")),
   };
 }
 
@@ -65,7 +83,9 @@ export function appConnection(): LdConnection {
   return {
     apiKey: required("LD_API_KEY"),
     baseUrl: (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, ""),
-    projectKey: process.env.LD_APP_PROJECT_KEY || required("LD_PROJECT_KEY"),
+    projectKey: process.env.LD_APP_PROJECT_KEY
+      ? validateProjectKey("LD_APP_PROJECT_KEY", process.env.LD_APP_PROJECT_KEY)
+      : validateProjectKey("LD_PROJECT_KEY", required("LD_PROJECT_KEY")),
   };
 }
 

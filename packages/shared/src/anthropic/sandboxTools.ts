@@ -1315,16 +1315,19 @@ export class SandboxToolExecutor {
   /** Auto-detect the repo's test runner (pytest / npm / go), install deps, and run it. */
   private runTests(dir?: string): ToolExecResult {
     if (!this.allowEdits) return { content: "run_tests is not available", isError: true };
-    const result = this.runTestsInner(dir);
+    const { ran, ...result } = this.runTestsInner(dir);
     // Tool-owned fact for the deterministic handoff shim: the LAST real test
-    // execution's outcome. "no recognized test setup" is inconclusive, not a run.
-    if (!result.content.includes("no recognized test setup")) {
+    // execution's outcome. A repo with NO test harness (no runner, no test
+    // script, nothing collected) is inconclusive, not a red run — otherwise a
+    // greenfield repo deadlocks: every node hands off "fail" and the chain dies
+    // before flag-testing, the node whose job is to create the missing suite.
+    if (ran) {
       this.tags.tests_last_run = result.isError ? "fail" : "pass";
     }
     return result;
   }
 
-  private runTestsInner(dir?: string): ToolExecResult {
+  private runTestsInner(dir?: string): ToolExecResult & { ran: boolean } {
     const cwd = dir ? this.safeResolve(dir) : this.root;
     const has = (f: string) => existsSync(resolve(cwd, f));
     let entries: string[] = [];
@@ -1346,18 +1349,50 @@ export class SandboxToolExecutor {
       this.sh("python3", ["-m", "pip", "install", "-q", "pytest"], cwd);
       const t = this.sh("python3", ["-m", "pytest", "-q"], cwd);
       const body = `${log.join("\n")}\n$ python3 -m pytest -q (in ${where})\n${t.out}`.trim();
-      return { content: this.trunc(body), isError: t.code !== 0 };
+      // pytest exit 5 = "no tests were collected": a missing suite, not a red one.
+      if (t.code === 5) {
+        return {
+          content: this.trunc(`${body}\nrun_tests: pytest collected NO tests — the repo has no test suite yet. Write the test files (and any needed config) first, then re-run.`),
+          isError: true,
+          ran: false,
+        };
+      }
+      return { content: this.trunc(body), isError: t.code !== 0, ran: true };
     }
     if (has("package.json")) {
+      // A package.json without a real `test` script means "no test harness",
+      // not "tests failing" — `npm test` would just exit 1 on npm's default
+      // "Error: no test specified" stub.
+      if (!this.npmTestScript(cwd)) {
+        return {
+          content: `run_tests: package.json in ${where} has no "test" script — the repo has no test harness yet. Add the test files AND a package.json "test" script (run_tests invokes \`npm test\`), then re-run.`,
+          isError: true,
+          ran: false,
+        };
+      }
       this.sh("npm", ["install", "--no-audit", "--no-fund"], cwd);
       const t = this.sh("npm", ["test"], cwd);
-      return { content: this.trunc(`$ npm test (in ${where})\n${t.out}`), isError: t.code !== 0 };
+      return { content: this.trunc(`$ npm test (in ${where})\n${t.out}`), isError: t.code !== 0, ran: true };
     }
     if (has("go.mod")) {
       const t = this.sh("go", ["test", "./..."], cwd);
-      return { content: this.trunc(`$ go test ./... (in ${where})\n${t.out}`), isError: t.code !== 0 };
+      return { content: this.trunc(`$ go test ./... (in ${where})\n${t.out}`), isError: t.code !== 0, ran: true };
     }
-    return { content: "run_tests: no recognized test setup (pytest/npm/go) found in this directory", isError: true };
+    return { content: "run_tests: no recognized test setup (pytest/npm/go) found in this directory", isError: true, ran: false };
+  }
+
+  /** The package.json `test` script, if it's a real one (npm's default "no test specified" stub doesn't count). */
+  private npmTestScript(cwd: string): string | undefined {
+    try {
+      const pkg = JSON.parse(readFileSync(resolve(cwd, "package.json"), "utf8")) as {
+        scripts?: Record<string, unknown>;
+      };
+      const script = pkg.scripts?.test;
+      if (typeof script !== "string" || !script.trim() || script.includes("no test specified")) return undefined;
+      return script;
+    } catch {
+      return undefined;
+    }
   }
 
   private commitAndPush(message: string): ToolExecResult {

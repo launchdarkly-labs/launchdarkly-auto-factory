@@ -257,7 +257,13 @@ export async function walkGraph(
 
     // Judges attached to this node's config (if any) score the output now, on
     // the same tracker. Defensive: a judge problem must never break the walk.
-    if (judgeHook) {
+    // A FAILED node is never judged: its "output" is an error string (e.g.
+    // "Request timed out."), so a score would measure infrastructure luck, not
+    // agent quality — observed live as a misleading 0.00 on work that had
+    // actually landed. The failure itself is still recorded via trackError.
+    if (judgeHook && result.status === "failed") {
+      console.log(`[judge] ${key}: node failed (infra/API error) — judges skipped, no score recorded`);
+    } else if (judgeHook) {
       try {
         await judgeHook({ configKey: key, cfg, input: prompt, output, tracker });
       } catch (e) {
