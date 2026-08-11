@@ -1,71 +1,70 @@
-# phase1-resource-factory
+# AutoFactory GitHub Action
 
-The Phase 1 GitHub Action. On a pull request it resolves the agent graph from
-LaunchDarkly, walks it through the selected provider, and applies an approval
-decision — posting a summary comment back to the PR.
+The GitHub Action turns a pull request into a release-ready change. It resolves the Agent
+Graph from LaunchDarkly, executes each agent, enforces approval gates, commits approved work,
+and reports the result on the PR.
 
-Execution is provider-agnostic (see [ADR 0005](../../docs/adr/0005-provider-seam-local-anthropic-execution.md)
-and [ADR 0006](../../docs/adr/0006-cursor-sdk-provider.md)): the
-`auto-factory-ai-provider` LaunchDarkly flag selects the backend. The **default is a
-local Anthropic tool-use loop** (`@auto-factory/shared`'s `AnthropicAgentRunner` +
-sandbox tools); the alternatives are LaunchDarkly-hosted **Vega** and **Cursor**
-agents (`CursorAgentRunner` via `@cursor/sdk`; needs `CURSOR_API_KEY` and the
-checkout+`npm ci` workflow variant, not the bare `uses:` form). Either way the LD AI
-SDK resolves the configs/graph, the per-agent model is read from the AI config, and
-generation metrics + a `gen_ai` LLM-observability span are recorded natively.
+This is the primary end-to-end Build entry point.
 
-Judges attached to an agent's AI config in LaunchDarkly (see
-[ADR 0007](../../docs/adr/0007-judges-for-coding-agents.md)) are executed by the
-action after that node completes — scored against the agent's actual git diff —
-on the Anthropic and Cursor providers; Vega skips them with a log note.
+## Use it
 
-## Layout
+Follow the [setup guide](../../REFERENCE.md#2-add-the-build-workflow) or copy a workflow:
 
-This package is flat — `src/` + `action.yml`:
+- `bootstrap/github-action-template/auto-factory.yml` for Anthropic or Vega
+- `bootstrap/github-action-template/auto-factory-cursor.yml` for Cursor
 
-| File | Purpose |
-|------|---------|
-| `src/action.ts` | Action entrypoint: map inputs → env, init the LD SDKs, resolve provider + graph, walk, decide, comment |
-| `src/graphWalker.ts` | Walk the `AgentGraphDefinition`: dispatch each node via `AgentRunner`, follow edges by handoff conditions |
-| `src/approval.ts` | `decideApproval` (yolo/middle/manual) + `interpretWalk` (read verdict/risk from agent tags) |
-| `src/prContext.ts` | Assemble PR context (number/title/body/repo) from the Actions environment |
-| `src/comment.ts` | Post the run summary as a PR comment |
-| `action.yml` | The input contract (see below) |
+The `auto-factory-ai-provider` flag selects the runner. Agent instructions, Tools, graph
+routing, and per-agent models still come from LaunchDarkly.
 
-The agent graph itself (research-planner → flag-implementer → metrics-author →
-flag-testing → code-reviewer) lives in LaunchDarkly, not here — see
-`config/agentcontrol/graphs/auto-factory.json` for its shape.
+## What a run does
 
-## Handoff semantics
+1. Build the pull request context.
+2. Resolve provider, Agent Configs, Tools, and Agent Graph.
+3. Walk the graph and enforce its handoff conditions.
+4. Pause before any step that requires human approval.
+5. Commit allowed agent edits to the PR branch.
+6. Run Judges against the agents' actual diffs.
+7. Post the verdict, evidence, and next action to the PR.
 
-Each graph edge carries a freeform `handoff` object. The walker honors:
+Vega does not run the local Judge hook. Anthropic and Cursor do.
 
-- `require_tags` — take the edge only if ALL listed `{key: value}` tags are present.
-- `skip_if_tags` — do NOT take the edge if ALL listed tags match (e.g. research sets
-  `{skip_flagging: "true"}` → the flagging edge is skipped, short-circuiting the chain).
-- `max_turns` — cap on agent turns for the target node.
-- `request_type` — Vega persona for the target node (informational on Anthropic).
+## Handoff conditions
 
-## Approval modes (default: yolo)
+Each graph edge can define:
 
-Read from `APPROVAL_MODE` (env / action input) today; a per-repo LaunchDarkly
-flag is planned. A rejected review never auto-applies regardless of mode.
+| Field | Meaning |
+|---|---|
+| `require_tags` | Continue only when every tag matches |
+| `skip_if_tags` | Skip the edge when every tag matches |
+| `max_turns` | Limit the target agent's turns |
+| `request_type` | Provide a provider-specific execution hint |
 
-- **yolo** — auto-apply everything the review approves.
-- **middle** — auto-apply unless `risk_level` is `high` (then require a human).
-- **manual** — every approved change still requires a human.
+The graph is stored in `config/agentcontrol/graphs/`, not in this package.
 
-## The action bundle
+## Approval gates
 
-`runs.main` points at `dist/action.bundle.js` (esbuild). **Any change under `src/`
-must be followed by a rebuild and a commit of the bundle** — CI fails on drift:
+LaunchDarkly flags control whether gates apply, how much risk triggers them, and which agent
+steps require approval. The action stops before the gated step and posts an
+`action_required` check. Add the requested `af-approve:<nodeKey>` label to continue.
+
+A rejected review remains a review result. It is distinct from an approval pause or runtime
+failure.
+
+## Change the action
+
+| File | Responsibility |
+|---|---|
+| `src/action.ts` | Initialize the run and report the outcome |
+| `src/graphWalker.ts` | Execute graph nodes and handoffs |
+| `src/approval.ts` | Interpret risk, verdicts, and gates |
+| `src/prContext.ts` | Build pull request context |
+| `src/comment.ts` | Publish the PR summary |
+| `action.yml` | Define public action inputs |
+
+After changing `src/`, rebuild the committed action bundle:
 
 ```bash
 npm run bundle -w @auto-factory/phase1-resource-factory
 ```
 
-## Input contract
-
-See `action.yml` for the full list. Inputs are exposed to the code as
-`INPUT_<NAME>` and mapped to plain env vars in `mapActionInputs`; keep
-`action.yml`, `mapActionInputs`, and the repo `.env.example` consistent.
+Keep `action.yml`, input mapping, workflow templates, and `.env.example` aligned.

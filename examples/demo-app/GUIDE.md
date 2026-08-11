@@ -1,78 +1,80 @@
-# Demo app
+# Demo application
 
-A minimal monorepo demo for the full Auto-Factory flow: a **JS frontend** and a
-**Python backend**, deployed as two independent Railway services.
+This small application makes the complete Build → Deploy → Release flow visible. It has a
+Node.js frontend, a Python backend, and a feature that can be released across both services.
 
-> **What this is:** a reference/starting point. The Phase 1 action targets *whatever
-> repo installs the workflow* (`bootstrap/github-action-template/auto-factory.yml`) —
-> not this in-repo copy specifically. Use it to see the shape of an app the pipeline
-> works on; the live demo runs against a separate app repo wired with that template.
+Use it as an example application shape. AutoFactory can run against any repository that
+installs an entry point.
 
-```
+```text
 demo-app/
-├── frontend/        Node/Express — GET /api/status, serves a page
-├── backend/         Python/Flask — GET /api/status, GET /api/greeting (flag-gated),
-│                    optional Sentry baseline (errors+tracing+logging) +
-│                    launchdarklyContext (ADR 0014 / 0015)
-└── .release-flags/  release intent checked in alongside guarded code
+├── frontend/        Node.js service and web page
+├── backend/         Python API with flag and optional Sentry instrumentation
+└── .release-flags/  Release manifests carried with the code
 ```
 
-## The status contract (Phase 2)
+## What the demo proves
 
-Each service exposes `GET /api/status` → `{ "service": "...", "version": "<deployed SHA>" }`.
-Beacon's fullstack check reads the **other** service's `version` to confirm both sides have
-deployed the same `.release-flags/` file before releasing.
+1. **Build:** agents can add a flag, metrics, instrumentation, tests, and a manifest.
+2. **Deploy:** frontend and backend can deploy independently while the behavior stays off.
+3. **Release:** Beacon can wait for the required services, then start a guarded release.
 
-`version` comes from `RAILWAY_GIT_COMMIT_SHA` at deploy time.
+The committed example uses `new-greeting`. New runs derive their own flag key from the
+change.
 
-## How it ties together
+## Run it locally
 
-1. **Phase 1** — open a PR that adds a feature behind a flag; the agents create the flag
-   + metrics and wire it in. (The committed example uses `new-greeting`, but agents derive
-   a flag key per-PR from the change — don't expect that exact key on your own PRs.)
-   Optional Sentry path: serve the metrics author's `sentry` variation (LD targeting)
-   and it calls `query_sentry` for an estate picture, prefers shared `sentry-errors-*`
-   LD metrics as the error killswitch, and instruments `launchdarklyContext` for the
-   LD↔Sentry integration. Latency still needs LD-backed metrics (`otel*` / `track()`),
-   not Sentry Explore aggregates alone.
-2. A `.release-flags/<flag-key>.json` lands (see `pr-1.json` for the shape) declaring the
-   flag + scope + rollout (the Sentry path additionally attaches `sentry-errors-binary`).
-3. **Phase 2** — on deploy, the Notifier pings Beacon, which discovers the new release flag and
-   starts a guarded rollout via LaunchDarkly. On auto-revert, Beacon can start Seer Autofix
-   (`BEACON_SEER_AUTOFIX=true`).
+Start the backend:
 
-## Dual-export (why `otel*` needs LD, not only Sentry)
+```bash
+pip install -r backend/requirements.txt
+python backend/app.py
+```
 
-Sentry’s OpenTelemetry path is **ingest-only** (spans/logs into Sentry). There is no
-product path for Sentry to stream stored spans out to LaunchDarkly’s OTLP endpoint
-(ADR 0015).
+Start the frontend:
 
-This demo initializes Sentry (errors, tracing, logging) when `SENTRY_DSN` is set. That
-feeds Sentry APM / issues and — with `launchdarklyContext` — the official error→LD
-metrics. It does **not** by itself create LaunchDarkly `otel*` autogens or knowledge-graph
-spans.
+```bash
+cd frontend
+npm install
+npm start
+```
 
-To fill LD hosted o11y (and thus `otel*` / `kind=trace` guardrails):
+The backend listens on port `8000`; the frontend listens on port `3000`.
 
-1. Keep Sentry as above, **and**
-2. Also send the same app spans to LaunchDarkly (LD observability SDK **or** Collector
-   fan-out: OTLP → Sentry exporter **and** LD OTLP).
+Set `LD_SDK_KEY` to evaluate the real flag. Without it, the feature defaults off. Set
+`SENTRY_DSN` to enable optional errors, tracing, and logging.
 
-Without step 2, Metrics Author should prefer feature-scoped `track()` for latency and
-note the dual-export gap when `query_sentry` shows traffic but LD o11y is empty.
+## Connect deployment to release
 
-## Running locally
+Each service exposes:
 
-- Backend: `pip install -r backend/requirements.txt && python backend/app.py` (`:8000`)
-- Frontend: `cd frontend && npm install && npm start` (`:3000`)
-- Set `LD_SDK_KEY` to evaluate the flag for real; without it, flags default to `false`.
-- Optional: set `SENTRY_DSN` so errors (including `GET /api/boom`) carry `launchdarklyContext`
-  for the LaunchDarkly↔Sentry metrics integration. Session replay stays browser-only
-  (this Flask API skips it).
+```http
+GET /api/status
 
-## Deploying (Railway)
+{"service":"<name>","version":"<deployed-sha>"}
+```
 
-Create two services from this repo (root `frontend/` and `backend/`). Railway auto-detects Node
-and Python. Add a post-deploy step running the Notifier (`auto-factory-notify`) per service.
-Account/service setup is environment-specific (your Railway account, service creation, and the
-actual deploy) — the app code + status endpoints here are a scaffold, not a verified deploy.
+Beacon uses this status contract to confirm that every service required by a full-stack
+manifest has deployed the change. Railway supplies the SHA through
+`RAILWAY_GIT_COMMIT_SHA`.
+
+To deploy the example on Railway:
+
+1. Create one service rooted at `frontend/`.
+2. Create one service rooted at `backend/`.
+3. Add `auto-factory-notify` as a post-deploy step for each service.
+
+The code and status endpoints are a scaffold. Railway account and service configuration are
+environment-specific.
+
+## Understand the Sentry path
+
+Sentry can provide application errors, traces, logs, and error-backed LaunchDarkly metrics.
+It does not forward stored OpenTelemetry data to LaunchDarkly.
+
+If you need LaunchDarkly trace metrics or knowledge-graph service dependencies, send the
+same application spans to LaunchDarkly through its observability SDK or an OpenTelemetry
+Collector fan-out. Without that path, use feature-scoped `track()` events for latency.
+
+See [ADR 0014](../../docs/adr/0014-sentry-guardrails-and-agent-monitoring.md) and
+[ADR 0015](../../docs/adr/0015-sentry-estate-and-dual-export.md) for the integration design.
