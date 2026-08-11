@@ -25,6 +25,7 @@ import {
   findLatestRelease,
   isReleaseFinished,
   targetConnection,
+  variationLineageIndex,
 } from "@auto-factory/shared";
 import express, { type Express, type Request, type Response } from "express";
 import { type BeaconConfig, loadBeaconConfig } from "./config.js";
@@ -48,6 +49,13 @@ interface FlagOutcome {
    * silently clear the entry.
    */
   sourceFile: string;
+  /**
+   * The variation this manifest asked for, as read on THIS evaluation (absent = "the lineage
+   * tip"). REPORTING METADATA, documented at `PendingEntry.targetVariation`: it is what makes one
+   * flag's several manifests distinguishable in a log, and it is never read back as a fact —
+   * served-vs-target is recomputed from LaunchDarkly inside `triggerRelease` every time.
+   */
+  targetVariation?: string;
   scope: string;
   action: "released" | "held" | "noop" | "already_running" | "skipped" | "waiting" | "error";
   detail?: unknown;
@@ -72,6 +80,45 @@ export interface BeaconDeps {
   /** Hook fired when a release is started (or found already running); the
    *  default monitors it to a terminal state. Injectable for tests. */
   onReleaseStarted?: (flagKey: string, environmentKey: string) => void | Promise<unknown>;
+}
+
+/**
+ * Reporting metadata, spread into an outcome or a ledger write. Omitted when absent, because
+ * absent MEANS something specific — "the lineage tip" (trigger.ts: `flag.targetVariation ??
+ * latestVariationValue(...)`) — and a literal `undefined` in the ledger file would read as a
+ * missing value instead.
+ */
+const targetOf = (t: string | undefined): { targetVariation?: string } =>
+  t === undefined ? {} : { targetVariation: t };
+
+/**
+ * Where a manifest's target sits in the vN lineage, for ORDERING ONLY.
+ *
+ * Highest first, because for one flag the newest manifest is the one furthest forward, and it is
+ * the one the lineage guard would bless — evaluate an older one first and it takes the single
+ * per-flag action slot, deferring the release that should have happened. Map insertion order
+ * ("oldest wins") was exactly backwards.
+ *
+ * ABSENT is the TIP, not the bottom: trigger.ts resolves a missing `targetVariation` to the
+ * lineage tip, so ranking it lowest would invert the whole fix. A target that is not in the
+ * lineage at all (`control`, a hand-named variation) ranks below every vN — it cannot be a
+ * forward move from a lineage-served flag, and `trigger.ts` refuses it anyway.
+ */
+const TIP_RANK = Number.MAX_SAFE_INTEGER;
+const targetRank = (targetVariation: string | undefined): number =>
+  targetVariation === undefined ? TIP_RANK : (variationLineageIndex(targetVariation) ?? -1);
+
+/**
+ * Highest target variation first. STABLE (Array.prototype.sort is, per spec), so manifests with
+ * equal rank keep the order they arrived in — discovery's filename order, or the ledger's.
+ */
+function highestTargetFirst<T>(items: T[], target: (item: T) => string | undefined): T[] {
+  return [...items].sort((a, b) => targetRank(target(b)) - targetRank(target(a)));
+}
+
+/** Methods that WROTE to LaunchDarkly. Only these may claim the per-flag action slot. */
+function performedAWrite(method: string): boolean {
+  return method === "progressive" || method === "guarded" || method === "immediate" || method === "prerequisites";
 }
 
 /** Constant-time secret comparison (hashed first to equalize lengths). */
@@ -190,7 +237,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     // recoverable by a human; re-releasing a reverted flag is not.
     let guardUnverifiable = false;
     /**
-     * Flags already acted on in THIS notification.
+     * Flags this notification has WRITTEN to LaunchDarkly for.
      *
      * The ledger is keyed by manifest ADDRESS, which is right for remembering work — but the
      * TARGET of an action is `(flagKey, environment)`, because only one variation of a flag can
@@ -203,6 +250,19 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
      * The second manifest is deferred with a NON-FINAL outcome, deliberately. Reporting
      * `already_running` would be final, and a final outcome clears the ledger entry — which
      * discarded the newer manifest's unreleased work and reported it as success.
+     *
+     * ONLY A WRITE CLAIMS THE SLOT, and that is the whole point of the set. It used to be
+     * claimed before `triggerRelease` was even called, so a manifest that wrote NOTHING — `held`
+     * on a future `notBefore`, `noop` because a newer variation superseded it — still consumed
+     * the flag's only slot and deferred every other manifest for that flag. In the documented
+     * steady state (several never-deleted manifests per flag, the ledger keeping the unreleased
+     * ones alive) that deadlocked: the same non-writing manifest claimed the slot on every
+     * deploy, forever, and the releasable one was deferred forever. Zero releases, reported as
+     * two ordinary outcomes.
+     *
+     * `already_running` deliberately does NOT claim it either: it wrote nothing, and a second
+     * manifest's own idempotency read sees the very same active release, which is the correct
+     * answer for it too.
      */
     const actedOnFlag = new Set<string>();
 
@@ -214,7 +274,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
      * guard and the trigger are subtle enough that two copies would disagree within a
      * release or two.
      */
-    const processFlag = async (flag: DiscoveredFlag): Promise<FlagOutcome> => {
+    const evaluateManifest = async (flag: DiscoveredFlag): Promise<FlagOutcome> => {
       const scope = flag.scope ?? "frontend";
       const decision = decideScope(scope, service.side);
 
@@ -264,22 +324,21 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       }
       try {
         if (actedOnFlag.has(flag.flagKey)) {
-          // Another manifest for this flag already acted this round. Defer rather than
+          // Another manifest for this flag already WROTE this round. Defer rather than
           // discard: the ledger keeps this entry and the next deploy re-evaluates it, by
-          // which time the lineage-regression guard can see what actually got served.
+          // which time the lineage guard can see what actually got served.
           console.warn(
             `[beacon] DEFERRED: '${flag.sourceFile}' also targets '${flag.flagKey}', which another manifest ` +
-              `already acted on in this notification. Left pending for the next deploy.`,
+              `already released in this notification. Left pending for the next deploy.`,
           );
           return {
             flag: flag.flagKey,
             sourceFile: flag.sourceFile,
             scope,
             action: "held",
-            detail: `deferred — another manifest acted on '${flag.flagKey}' in this notification; still pending`,
+            detail: `deferred — another manifest released '${flag.flagKey}' in this notification; still pending`,
           };
         }
-        actedOnFlag.add(flag.flagKey);
         // Idempotency: a re-delivered notification must not double-trigger.
         //
         // FAIL CLOSED. This was `.catch(() => null)`, which answered the question "does
@@ -351,6 +410,10 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           }
         }
         const result = await triggerRelease(ld, flag, n.environment);
+        // THE SLOT IS CLAIMED HERE, not before the trigger — see `actedOnFlag`. A `held` or
+        // `noop` return wrote nothing, so it must leave the flag available to the manifest that
+        // can actually release it, in this same notification.
+        if (performedAWrite(result.method)) actedOnFlag.add(flag.flagKey);
         // Only staged rollouts get release monitoring: "held"/"noop" started
         // nothing, "prerequisites"/"immediate" have no automated release to watch.
         if (result.method === "progressive" || result.method === "guarded") {
@@ -408,6 +471,17 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     };
 
     /**
+     * `evaluateManifest`, plus the manifest's target variation stamped onto whatever it returned.
+     *
+     * One place rather than ten return sites, and REPORTING ONLY — nothing downstream reads it
+     * back as a fact (see `FlagOutcome.targetVariation`).
+     */
+    const processFlag = async (flag: DiscoveredFlag): Promise<FlagOutcome> => ({
+      ...(await evaluateManifest(flag)),
+      ...targetOf(flag.targetVariation),
+    });
+
+    /**
      * Re-evaluate one LEDGER entry: a flag whose release was left unfinished by an earlier
      * deploy. Discovery cannot surface it (its manifest exists at both SHAs), so this is the
      * only path that reaches it.
@@ -420,6 +494,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         return {
           flag: entry.flagKey,
           sourceFile: entry.sourceFile,
+          ...targetOf(entry.targetVariation),
           scope: "ledger",
           action: "error",
           viaLedger: true,
@@ -438,6 +513,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         return {
           flag: entry.flagKey,
           sourceFile: entry.sourceFile,
+          ...targetOf(entry.targetVariation),
           scope: "ledger",
           action: "error",
           viaLedger: true,
@@ -451,6 +527,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         return {
           flag: entry.flagKey,
           sourceFile: entry.sourceFile,
+          ...targetOf(entry.targetVariation),
           scope: "ledger",
           action: "skipped",
           viaLedger: true,
@@ -487,27 +564,39 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         return {
           flag: actingOn,
           sourceFile: entry.sourceFile,
+          ...targetOf(parsed.targetVariation),
           scope: "ledger",
           action: "error",
           viaLedger: true,
           detail: `could not read release history — NOT re-triggering, still pending: ${String(e)}`,
         };
       }
-      if (latest && isReleaseFinished(latest.status)) {
-        if (latest.status === "completed") {
-          // Finished while nobody watched. This is the observation the ledger exists for:
-          // repoint the children that were pinned to the previous variation.
-          console.log(`[beacon] ledger: ${tag} — release ${latest.id} COMPLETED while unwatched; repointing children`);
-          await repointDependentPrerequisites(ld, actingOn, n.environment);
-          return {
-            flag: actingOn,
-            sourceFile: entry.sourceFile,
-            scope: "ledger",
-            action: "noop",
-            viaLedger: true,
-            detail: `release ${latest.id} completed while unwatched — dependent flags repointed, no longer pending`,
-          };
-        }
+      // ONLY the non-completed terminal statuses gate re-evaluation here, and the asymmetry is
+      // the point: this question is asked about a FLAG, while the ledger remembers a MANIFEST,
+      // and one flag routinely has several manifests wanting different variations.
+      //
+      // A `completed` branch used to live here, treating "some release of this flag finished" as
+      // "this entry's work is done" — returning a final `noop` that cleared the entry. So a
+      // manifest asking for v2 was discarded because v1's release completed, and reported as a
+      // success. It is also REDUNDANT: `triggerRelease` answers the same question properly, per
+      // manifest, from what the environment serves right now — served === target → `noop`
+      // (final), target behind served → `noop` (final, superseded), target ahead → it releases,
+      // which is the case the deleted branch got wrong. The useful side effect survives too:
+      // a `noop` result repoints dependent prerequisites in `evaluateManifest` above, so a
+      // release that finished unwatched still reaches its children.
+      //
+      // `reverted`/`monitoring_stopped` stays flag-level and stays conservative: a guardrail
+      // rejecting one variation blocks re-triggering ANY manifest for that flag until a human
+      // decides. Arguably too broad — v2 is different work from a reverted v1 — but the error is
+      // in the blocking direction, which is the safe one.
+      //
+      // What deleting the branch NARROWS, stated so nobody rediscovers it as a bug: repointing
+      // after an unwatched completion now needs an entry that actually REACHES `triggerRelease`,
+      // so a manifest still held by its own `releaseIntent` no longer repoints on the way past.
+      // That coverage was accidental — it required some unrelated manifest for the same flag to
+      // happen to be pending, and a flag with nothing pending never got it at all. The reliable
+      // paths are release monitoring (monitor.ts) and the `noop` result above.
+      if (latest && isReleaseFinished(latest.status) && latest.status !== "completed") {
         console.warn(
           `[beacon] ledger: ${tag} — newest release ${latest.id} is '${latest.status}'. NOT re-triggering: a ` +
             `reverted release means a guardrail rolled it back, and re-releasing would undo that. A human must ` +
@@ -516,6 +605,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         return {
           flag: actingOn,
           sourceFile: entry.sourceFile,
+          ...targetOf(parsed.targetVariation),
           scope: "ledger",
           action: "error",
           viaLedger: true,
@@ -529,7 +619,11 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       return { ...outcome, viaLedger: true };
     };
 
-    for (const flag of discovered) {
+    // HIGHEST TARGET VARIATION FIRST, in both passes — see `highestTargetFirst`. Only one
+    // variation of a flag can be releasing at a time, so whichever manifest is evaluated first
+    // decides what production gets; filename order and Map insertion order both mean "oldest
+    // wins", which for a lineage is exactly backwards.
+    for (const flag of highestTargetFirst(discovered, (f) => f.targetVariation)) {
       outcomes.push(await processFlag(flag));
     }
 
@@ -542,11 +636,20 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     // same-manifest duplicate slipped through whenever the flagKey had been corrected.
     // Same-flag collisions are handled by `actedOnFlag` above, which is the right axis for it.
     const handledThisRound = new Set(discovered.map((f) => f.sourceFile));
-    const pendingEntries = pending.list(n.service, n.environment).filter((e) => !handledThisRound.has(e.sourceFile));
+    const pendingEntries = highestTargetFirst(
+      pending.list(n.service, n.environment).filter((e) => !handledThisRound.has(e.sourceFile)),
+      // The REMEMBERED target, which is only an ordering hint: `reEvaluate` re-reads the manifest
+      // before acting, so a stale value costs at most a suboptimal order, never a wrong decision.
+      (e) => e.targetVariation,
+    );
     if (pendingEntries.length > 0) {
       console.log(
-        `[beacon] ledger: ${pendingEntries.length} unfinished flag(s) from earlier deploys → ` +
-          pendingEntries.map((e) => `${e.flagKey}=${e.lastAction}`).join(", "),
+        `[beacon] ledger: ${pendingEntries.length} unfinished manifest(s) from earlier deploys → ` +
+          // The MANIFEST, then the flag and the variation it wants. Naming only the flag rendered
+          // four manifests for one flag as four identical entries.
+          pendingEntries
+            .map((e) => `${e.sourceFile} [${e.flagKey}→${e.targetVariation ?? "tip"}]=${e.lastAction}`)
+            .join(", "),
       );
     }
     for (const entry of pendingEntries) {
@@ -562,6 +665,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         environment: n.environment,
         sha: n.sha,
         flagKey: o.flag,
+        ...targetOf(o.targetVariation),
         sourceFile: o.sourceFile,
         action: o.action,
         ...(o.detail !== undefined ? { detail: typeof o.detail === "string" ? o.detail : JSON.stringify(o.detail) } : {}),
@@ -570,7 +674,14 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     }
 
     if (outcomes.length) {
-      console.log(`[beacon] outcomes: ${outcomes.map((o) => `${o.flag}=${o.action}`).join(", ")}`);
+      // Identified by MANIFEST, because the flag key is not unique: several manifests per flag is
+      // the documented steady state, so `f=held, f=held` named neither the work nor which PR to
+      // fix. The address is the identity everywhere else in Beacon; this line was the exception.
+      console.log(
+        `[beacon] outcomes: ${outcomes
+          .map((o) => `${o.sourceFile} [${o.flag}→${o.targetVariation ?? "tip"}]=${o.action}`)
+          .join(", ")}`,
+      );
     }
 
     return {

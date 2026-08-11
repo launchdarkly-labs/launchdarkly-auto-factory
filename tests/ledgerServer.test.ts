@@ -99,9 +99,15 @@ function fakeLd(patches: unknown[], o: LdOpts = {}): LdClient {
         ok: true,
         data: {
           variations: [on, off],
-          environments: { production: { on: o.served === "on" } },
+          // The targeting a real boolean flag carries, so `served === target` is RESOLVABLE:
+          // without a fallthrough, `servedVariation` answered undefined even for an on flag and
+          // the boolean noop guard could never fire in these tests.
+          environments: { production: { on: o.served === "on", offVariation: 1, fallthrough: { variation: 0 } } },
         },
       };
+    },
+    async getDependentFlags(): Promise<{ status: number; ok: boolean; data: unknown }> {
+      return { status: 200, ok: true, data: { items: [] } };
     },
     async patchFlagSemantic(flagKey: string, env: string, instructions: unknown[]): Promise<unknown> {
       patches.push({ flagKey, env, instructions });
@@ -248,20 +254,43 @@ describe("ledger: the guard that makes automatic re-evaluation safe", () => {
     assert.equal(patches.length, before, "still nothing started");
   });
 
-  it("notices a release that COMPLETED unwatched, and repoints its children", async () => {
-    // The other observation the ledger exists for: monitoring stopped at its deadline,
-    // a human resumed the release, and it finished with nobody watching.
+  it("notices a release that COMPLETED unwatched — via the trigger, not a flag-level shortcut", async () => {
+    // The other observation the ledger exists for: monitoring stopped at its deadline, a human
+    // resumed the release, and it finished with nobody watching.
+    //
+    // The ledger used to answer this ITSELF (`latest.status === "completed"` → final noop →
+    // clear), which was a FLAG-level answer to a MANIFEST-level question: it discarded a manifest
+    // asking for v2 because v1's release had completed, and called it success. That branch is
+    // gone, and nothing is lost — `triggerRelease` reaches the same conclusion from what the
+    // environment actually serves, per manifest, and `noop` still repoints the children.
     const patches: unknown[] = [];
+    let manifest: unknown = HELD_MANIFEST;
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return ["pr-1.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return manifest;
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    // `served: "on"` is what a completed release LOOKS like: the environment serves the target.
     const h = await harness(
-      ghAlways(HELD_MANIFEST),
-      fakeLd(patches, { served: "off", releases: [{ id: "rel-1", status: "completed" }] }),
+      gh,
+      fakeLd(patches, { served: "on", releases: [{ id: "rel-1", status: "completed" }] }),
       patches,
     );
     await h.post("sha1");
+    assert.equal(h.pending.list("demo-backend", "production").length, 1, "held on an unintelligible notBefore");
+
+    manifest = GOOD_MANIFEST; // the human fixes the intent; the release finished meanwhile
     const second = await h.post("sha2");
     const o = second.json.outcomes.find((x: any) => x.flag === "enable-one");
     assert.equal(o.action, "noop");
-    assert.match(String(o.detail), /completed while unwatched/);
+    assert.match(JSON.stringify(o.detail), /already serves true/, "the conclusion comes from served-vs-target");
+    assert.deepEqual(patches, [], "THE DISCRIMINATOR: a completed release is not re-released");
     assert.deepEqual(h.pending.list("demo-backend", "production"), [], "finished ⇒ no longer pending");
   });
 
