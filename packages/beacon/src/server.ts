@@ -679,10 +679,47 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       // iteration awaiting approval (the documented steady state). The child stays dark
       // indefinitely.
       //
+      // ONLY WHILE NOTHING IS RUNNING — and this is a DIFFERENT question from the one above, which
+      // is the defect. `latest?.status === "completed"` is a fact about a MOMENT IN THE PAST, while
+      // `repoint.ts` computes the destination from the parent's LIVE fallthrough. Mid-rollout that
+      // fallthrough is a weighted rollout, so `repoint.ts` takes its HEAVIEST arm: at stage 1 that
+      // is the ORIGINAL variation at 80%, so children are repointed onto the variation the release
+      // is ramping AWAY from, and at a guarded release's 50/50 stage the destination is decided by
+      // LaunchDarkly's arm order. `monitor.ts` has the identical gate-vs-destination shape and is
+      // fenced behind `!active` after five `findActiveRelease` attempts, and `evaluateManifest`'s
+      // `noop`/`immediate` repoint is fenced by its own idempotency read (an active release answers
+      // `already_running` long before `triggerRelease` runs). This caller had no such precondition
+      // and fired BEFORE `findActiveRelease` was ever reached, which is what made it newly
+      // reachable rather than a variant of the pre-existing family.
+      //
+      // A FAILED READ SKIPS THE REPOINT rather than assuming nothing is running. The repoint is a
+      // write, and the gate's whole content is "the fallthrough has stopped moving" — which an
+      // unreadable listing does not establish. Skipping costs a repoint that the next deploy
+      // performs; guessing costs production traffic.
+      //
       // Idempotent by contract (`repoint.ts` skips already-pointed children and never throws), so
       // the `noop`/`immediate` repoint inside `evaluateManifest` doing it again costs one read.
       if (latest?.status === "completed") {
-        await repointDependentPrerequisites(ld, actingOn, n.environment);
+        // `undefined` ONLY from the catch — `findActiveRelease` itself returns a release or null —
+        // so the three states stay distinguishable: running, nothing running, and unreadable.
+        let running: AutomatedRelease | null | undefined;
+        try {
+          running = await findActiveRelease(ld, actingOn, n.environment);
+        } catch (e) {
+          console.warn(
+            `[beacon] ledger: ${tag} — newest release ${latest.id} is 'completed', but whether one is still ` +
+              `running could not be read; NOT repointing '${actingOn}' children, because the destination is ` +
+              `the LIVE fallthrough and a running release is still moving it: ${String(e)}`,
+          );
+        }
+        if (running === null) {
+          await repointDependentPrerequisites(ld, actingOn, n.environment);
+        } else if (running) {
+          console.log(
+            `[beacon] ledger: ${tag} — release ${running.id} is still '${running.status}' on '${actingOn}'; ` +
+              `NOT repointing children until it stops moving the fallthrough`,
+          );
+        }
       }
 
       console.log(`[beacon] ledger: re-evaluating ${tag}`);

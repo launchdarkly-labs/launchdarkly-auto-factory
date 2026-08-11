@@ -107,6 +107,16 @@ interface MvState {
   parents?: string[];
   /** Make the automated-releases listing throw, for the fail-closed early return. */
   releasesThrow?: boolean;
+  /**
+   * Make ONLY the "is anything running?" read throw, leaving the history read working.
+   *
+   * The two are told apart by their page size, which is the documented difference:
+   * `findLatestRelease` asks for `limit=1` (the newest item, terminal or not) while
+   * `findActiveRelease` deliberately does NOT — it takes `limit=20`, because the newest release
+   * may be terminal while an older one is still active. Needed to reach the case where the
+   * ledger's repoint gate cannot be evaluated but the terminal-history guard can.
+   */
+  activeListingThrows?: boolean;
 }
 
 const mvState = (o: Partial<MvState> = {}): MvState => ({
@@ -131,6 +141,9 @@ function fakeMvLd(state: MvState, patches: Patch[]): LdClient {
     async request(opts: { path: string }): Promise<{ status: number; ok: boolean; data: unknown }> {
       if (opts.path.includes("/automated-releases")) {
         if (state.releasesThrow) throw new Error("connection reset");
+        if (state.activeListingThrows && opts.path.includes("limit=20")) {
+          throw new Error("connection reset (the active-release listing only)");
+        }
         return { status: 200, ok: true, data: { items: state.releases } };
       }
       // 200 with empty fields is what a live environment with no policy returns; a 404 would
@@ -706,6 +719,114 @@ describe("a release that completed unwatched still repoints its children", () =>
     assert.equal(h.starts()[0]?.originalVariationId, "id-v1", "the iteration moves users off what is served");
     assert.equal(h.starts()[0]?.targetVariationId, "id-v2");
     assert.deepEqual(h.pending.list("demo-backend", "production"), [], "released ⇒ no longer pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The repoint's GATE and its DESTINATION are about different moments.
+//
+// The gate is `findLatestRelease(...).status === "completed"` — a fact about the past. The
+// destination is the parent's LIVE fallthrough, read inside `repoint.ts`. While a release is
+// running those disagree, and the disagreement writes to production: mid-rollout the
+// fallthrough still resolves to the ORIGINAL variation (the heaviest arm at stage 1; decided by
+// LaunchDarkly's arm order at a guarded release's 50/50 stage), so children get pulled onto the
+// variation the release is ramping AWAY from.
+//
+// `monitor.ts` has the identical shape and is fenced behind `!active` after five
+// `findActiveRelease` attempts. `evaluateManifest`'s `noop`/`immediate` repoint is fenced by its
+// own idempotency read. This caller had no such precondition and fired BEFORE
+// `findActiveRelease` was ever reached.
+//
+// The shape below is the one that needs no eventual consistency to reach: the flag is ON serving
+// `control`, its newest automated release is `completed`, a child is pinned to `v1`, and the
+// flag's one ledger entry is held by its own intent. `trigger.ts` itself recommends this state
+// ("revert the release, or serve the variation directly"), and serving a variation directly
+// leaves `findLatestRelease` still reporting `completed`.
+// ---------------------------------------------------------------------------
+describe("the ledger repoints only once the release has stopped moving", () => {
+  /** Rollback shape: on, serving `control`, newest release `completed`, child pinned to v1. */
+  const rolledBack = (releases: Array<{ id: string; status: string }>): MvState =>
+    mvState({
+      on: true,
+      served: "control",
+      releases,
+      children: { "enable-child": { pinned: "v1" } },
+    });
+
+  const heldByIntent = () =>
+    ghWith([`pr-41.json`], { [path(41)]: manifest("v2", { releaseIntent: { action: "hold" } }) });
+
+  it("does NOT repoint while a release is still running on that flag", async () => {
+    // PREVENTS: repointing `enable-child` from `v1` to `control` on a read of the fallthrough that
+    // the running release is still moving. The child is DARK while pinned to a variation the parent
+    // does not serve, so this repoint takes it live for 100% of traffic — and aims it at the
+    // variation the release in flight is ramping away from.
+    //
+    // Note the listing shape: newest-first, so the completed release is `items[0]` (what
+    // `findLatestRelease` returns, limit=1) while an older one is still active — the case
+    // `findActiveRelease`'s "no limit=1" comment exists for.
+    const h = await harness(
+      heldByIntent(),
+      rolledBack([{ id: "rel-1", status: "completed" }, { id: "rel-2", status: "in_progress" }]),
+    );
+    h.seed(41, "v2");
+
+    const r = await h.post("sha1", "sha0");
+    assert.equal(r.json.discovered, 0, "only the ledger can reach this manifest");
+    assert.equal(
+      h.patches.find((p) => p.flagKey === "enable-child"),
+      undefined,
+      "THE DISCRIMINATOR: no child was moved while the fallthrough was still in motion",
+    );
+    assert.deepEqual(h.patches, [], "and nothing else was written either");
+    assert.equal(
+      outcomeFor(r.json, 41).action,
+      "already_running",
+      "the very next step already knew a release was running — the repoint just ran first",
+    );
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(41)],
+      "kept, so the repoint happens on a later deploy once the release ends",
+    );
+  });
+
+  it("still repoints when NOTHING is running — the gate is exactly `!active`", async () => {
+    // The control arm, and the reason it is written on the rollback shape rather than a healthy
+    // one: with nothing running this repoint DOES fire, and it still aims at the live fallthrough
+    // (`control`). That residual gate-vs-destination mismatch is the PRE-EXISTING family —
+    // `monitor.ts` shares it — and is deliberately not closed here. What is pinned is that the new
+    // gate narrows the repoint by ACTIVENESS ONLY, so removing it or widening it both fail a test.
+    const h = await harness(heldByIntent(), rolledBack([{ id: "rel-1", status: "completed" }]));
+    h.seed(41, "v2");
+
+    const r = await h.post("sha1", "sha0");
+    const childPatch = h.patches.find((p) => p.flagKey === "enable-child");
+    assert.ok(childPatch, "THE DISCRIMINATOR: an unwatched completion still reaches its children");
+    assert.equal(childPatch.instructions[1]?.variationId, "id-control");
+    assert.equal(outcomeFor(r.json, 41).action, "held", "its own intent still holds it — repointing is not releasing");
+  });
+
+  it("SKIPS the repoint when it cannot tell whether a release is running", async () => {
+    // Fail CLOSED on the side effect. The history read succeeds and says `completed`, so the old
+    // code repointed; only the "is anything running?" read fails. An unreadable listing does not
+    // establish that the fallthrough has stopped moving, and the repoint is a WRITE — so it is
+    // skipped, which costs a repoint the next deploy performs.
+    const state = rolledBack([{ id: "rel-1", status: "completed" }]);
+    state.activeListingThrows = true;
+    const h = await harness(heldByIntent(), state);
+    h.seed(41, "v2");
+
+    const r = await h.post("sha1", "sha0");
+    assert.deepEqual(h.patches, [], "THE DISCRIMINATOR: no child moved on a read we could not make");
+    const o = outcomeFor(r.json, 41);
+    assert.equal(o.action, "error", "and the manifest's own idempotency read fails closed for the same reason");
+    assert.match(String(o.detail), /idempotency check failed/);
+    assert.equal(r.status, 503, "nothing was started, so a retry cannot duplicate a release");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(41)],
+    );
   });
 });
 
