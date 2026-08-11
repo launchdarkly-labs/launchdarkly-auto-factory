@@ -516,10 +516,30 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // patch. Leaving the slot open then lets a SIBLING manifest for the same flag release
         // a variation BEHIND the one that may now be live, and neither lineage guard can stop
         // it — mid-rollout `servedVariation` still answers `control`, so `servedIndex` is
-        // undefined and both backwards guards fall through. Claiming the slot defers the
-        // sibling NON-FINALLY (it stays in the ledger and is re-evaluated on the next deploy,
-        // by which time the releases listing shows what actually happened), so the cost of
-        // being wrong here is a delay; the cost of the other direction is a rollout backwards.
+        // undefined and both backwards guards fall through.
+        //
+        // CLAIMING IT UNCONDITIONALLY COSTS A DELAY, AND HERE IS WHY — the claim is only
+        // defensible because of what `triggerRelease` no longer throws. Its surviving throws are
+        // of two kinds:
+        //
+        //  - MAY HAVE WRITTEN, and TRANSIENT: anything out of `patchFlagSemantic` /
+        //    `startRelease` / the `getFlag` read. The next deploy re-evaluates (the entry is
+        //    non-final in the ledger) and by then the releases listing says what actually
+        //    happened, so the deferred sibling loses one deploy, not its release.
+        //  - PRE-WRITE and PER-FLAG: no true/false pair on a boolean flag, no vN lineage on a
+        //    flag whose manifest named no target, no resolvable served variation. Every sibling
+        //    manifest for that flag hits the same throw on the same read, so NONE of them could
+        //    have released — claiming the slot starves nobody, because there is nobody to starve.
+        //
+        // What is deliberately NOT in either list is a DETERMINISTIC PER-MANIFEST pre-write
+        // throw, and that is the whole basis of "a delay": such a throw recurs identically on
+        // every deploy, so claiming the slot on its behalf starves a releasable sibling
+        // PERMANENTLY. There was exactly one — "this manifest names a variation the flag does not
+        // have", which `targetRank` also happened to evaluate FIRST — and it is answered `held` at
+        // source in `trigger.ts` rather than patched around here. If a new pre-write, manifest-
+        // specific refusal is ever added, it belongs there too, not in this catch.
+        //
+        // The cost of the other direction is a rollout backwards, which no later deploy undoes.
         actedOnFlag.add(flag.flagKey);
         // ACKS 200, and this STRANDS the flag. Deliberate, and the reverse of the guard
         // above — the asymmetry is the point.
@@ -671,13 +691,22 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       // own intent, which was therefore its own trigger.
       //
       // Without this, every path that returns before `triggerRelease` reaches its LD read loses
-      // it: intent `hold`/`manual`, a future `notBefore`, `segments`, an unintelligible intent,
-      // `waiting`, readiness `unknown`, the idempotency read failure, the `actedOnFlag` deferral,
-      // and — being final, so it is the LAST chance ever — scope `skipped` and manifest-absent.
-      // The reachable failure is the one the ledger exists for: Beacon restarts mid-rollout, no
-      // deploy arrives before the release completes, and the flag's only pending manifest is an
-      // iteration awaiting approval (the documented steady state). The child stays dark
-      // indefinitely.
+      // it: intent `hold`/`manual`, a future `notBefore`, `segments`, an unintelligible intent, a
+      // target the flag has no variation for, `waiting`, readiness `unknown`, the idempotency read
+      // failure, the `actedOnFlag` deferral, and — being final, so it is genuinely the LAST chance
+      // ever — scope `skipped`. The reachable failure is the one the ledger exists for: Beacon
+      // restarts mid-rollout, no deploy arrives before the release completes, and the flag's only
+      // pending manifest is an iteration awaiting approval (the documented steady state). The child
+      // stays dark indefinitely.
+      //
+      // NOT manifest-absent, and that is measured rather than assumed: the absence check lives in
+      // the pass ABOVE, before `reEvaluate` is called at all, so a withdrawn manifest never reaches
+      // this repoint and — being final — never will. Deliberate, not an oversight. A fresh read
+      // that finds no manifest leaves us with no idea which flag it named; the only candidate left
+      // is the REMEMBERED `entry.flagKey`, and feeding remembered content into a guard is exactly
+      // the content-as-identity mistake these rounds took out of the ledger. A missed repoint is
+      // recoverable by any later deploy carrying any manifest for that flag, and by release
+      // monitoring; a repoint aimed at the wrong flag is not.
       //
       // ONLY WHILE NOTHING IS RUNNING — and this is a DIFFERENT question from the one above, which
       // is the defect. `latest?.status === "completed"` is a fact about a MOMENT IN THE PAST, while
