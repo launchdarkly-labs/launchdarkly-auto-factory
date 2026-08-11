@@ -72,7 +72,9 @@ export interface TriggerResult {
    * The release method used, or an intent outcome:
    *  - "held" — NOT FINAL, so the ledger keeps re-checking it: releaseIntent said hold/manual,
    *    a future notBefore, a not-yet-executable ask like segments, an unintelligible intent
-   *    (fail-closed), or a target that would leave the vN lineage altogether.
+   *    (fail-closed), a target the flag HAS NO VARIATION for, or a target that would leave the vN
+   *    lineage altogether. Every one of these is a human's decision, and NONE of them writes — so
+   *    they must not claim the flag's action slot in `server.ts`.
    *  - "prerequisites" — flag turned on behind LD prerequisites; it releases when its parents do.
    *  - "noop" — FINAL: there is nothing left for this manifest to release. Either the target is
    *    already what the environment serves (a re-deploy after the release completed), or a NEWER
@@ -193,13 +195,48 @@ export async function triggerRelease(
     }
   } else {
     // Multivariate lineage: target = manifest targetVariation, else the tip.
+    //
+    // ABSENT means "the tip", and the tip is derived from THIS FLAG's own variations — so a flag
+    // with no vN lineage at all defeats every manifest for it identically. That is a PER-FLAG
+    // error and it stays a throw. An EMPTY string is NOT absent (`??` catches only
+    // null/undefined): it is a target this one manifest names and the flag does not have, which
+    // is the held case just below.
     const targetValue = flag.targetVariation ?? latestVariationValue(variations.map((v) => v.value));
-    if (!targetValue) {
+    if (targetValue === undefined) {
       throw new Error(`multivariate flag '${flag.flagKey}' has no vN lineage variation to release`);
     }
     const t = variations.find((v) => v.value === targetValue);
     if (!t) {
-      throw new Error(`'${flag.flagKey}' has no variation '${targetValue}' (manifest targetVariation?)`);
+      // HELD, NOT THROWN — and this was a PERMANENT loss of a release, not a delay.
+      //
+      // `evaluateManifest`'s catch claims the flag's per-notification action slot for ANY throw,
+      // and that is right for the throws it was written for: `startRelease` awaits `res.text()`
+      // AFTER LaunchDarkly applied the patch, so a lost response is "we do not know whether we
+      // wrote" and must fail closed. This throw is none of those things — it is DETERMINISTIC,
+      // PRE-WRITE and PER-MANIFEST. So it threw, claimed the slot, and starved the sibling that
+      // could have released; and because `server.ts`'s `targetRank` evaluates the manifest naming
+      // the HIGHER variation first, the manifest naming a MISSING higher variation went first
+      // every time. Flag has control/v1, pr-41 asks v2, pr-40 asks v1 ⇒ zero releases, on that
+      // deploy and every later one, with pr-40's own report claiming another manifest had
+      // released the flag.
+      //
+      // Reachable without a contrived fixture: `write_manifest` (sandboxTools) validates
+      // `targetVariation` against /^v\d+$/ but never against the flag's actual variations, so a
+      // failed `addVariation`, a skipped implementer step or a loop-back rerun writes exactly
+      // this — and `.release-flags/` is hand-editable in git.
+      //
+      // STRUCTURALLY IDENTICAL to the off-the-lineage refusal below: a human named a variation
+      // that does not exist, only a human can say what was meant, and `held` is not final, so the
+      // ledger re-checks it once they do.
+      return {
+        flagKey: flag.flagKey,
+        method: "held",
+        note:
+          `this manifest asks for '${targetValue}' but '${flag.flagKey}' has no such variation (has: ` +
+          `${variations.map((v) => String(v.value)).join(", ")}) — HELD for a human: either the variation ` +
+          `was never added to the flag or the manifest's targetVariation is wrong. NOTHING WAS WRITTEN, so ` +
+          `a sibling manifest for this flag can still release in this same notification.`,
+      };
     }
     targetVar = t;
     // Original = what the environment serves today (control on a dark flag;

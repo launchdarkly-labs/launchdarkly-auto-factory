@@ -312,6 +312,58 @@ describe("a manifest that writes nothing must not starve one that can release", 
 });
 
 // ---------------------------------------------------------------------------
+// A manifest naming a variation LaunchDarkly does not have. It used to THROW, and a throw
+// claims the flag's action slot unconditionally — correctly, for the throws that motivated
+// that rule: `startRelease` awaits `res.text()` AFTER the patch is applied, so a lost
+// response is "we do not know whether we wrote".
+//
+// This one is different in every respect that matters: PRE-WRITE, DETERMINISTIC, and
+// PER-MANIFEST. So the slot claim was not a delay but a permanent loss — and `targetRank`
+// evaluates the HIGHER target first, which is the missing one.
+// ---------------------------------------------------------------------------
+describe("a manifest naming a nonexistent variation is HELD, not thrown", () => {
+  it("does not starve the sibling that can release, on this deploy or any later one", async () => {
+    // PREVENTS: zero releases, forever. The flag has control/v1 only. pr-41 asks for v2, which
+    // does not exist; pr-40 asks for v1 and is releasable right now. Ordered highest-first, pr-41
+    // goes FIRST, threw, and the catch claimed the flag's slot — so pr-40 was deferred with a
+    // report saying "another manifest released 'checkout-flow' in this notification", which had
+    // not happened. Deterministic, so every later deploy repeated it identically.
+    //
+    // Reachable without a contrived fixture: `write_manifest` validates targetVariation against
+    // /^v\d+$/ but never against the flag's real variations, so a failed addVariation, a skipped
+    // implementer step or a loop-back rerun writes exactly this manifest — and `.release-flags/`
+    // is hand-editable in git.
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
+      mvState({ values: ["control", "v1"] }),
+    );
+
+    const r = await h.post("sha1");
+    assert.equal(h.starts().length, 1, "THE DISCRIMINATOR: exactly one release, where there used to be none");
+    assert.equal(h.starts()[0]?.targetVariationId, "id-v1", "and it is the SIBLING's target");
+
+    const fortyOne = outcomeFor(r.json, 41);
+    assert.equal(fortyOne.action, "held", "a human has to say what v2 was meant to be");
+    assert.match(JSON.stringify(fortyOne.detail), /no such variation/);
+
+    const forty = outcomeFor(r.json, 40);
+    assert.equal(forty.action, "released");
+    assert.doesNotMatch(
+      JSON.stringify(forty.detail),
+      /another manifest/,
+      "and it is no longer told that a release it never got had already happened",
+    );
+
+    // pr-41 stays tracked (held is not final) so the fix takes effect on a later deploy; pr-40 is
+    // done.
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(41)],
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // THREE WRITE STATES, NOT TWO: wrote, did not write, and DON'T KNOW. "Don't know" used to be
 // filed with "did not write", because the action slot was claimed only on the success return.
 // ---------------------------------------------------------------------------

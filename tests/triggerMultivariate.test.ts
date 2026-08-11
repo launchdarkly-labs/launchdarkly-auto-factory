@@ -94,9 +94,46 @@ describe("triggerRelease — multivariate variation releases", () => {
     assert.equal(patches.length, 0);
   });
 
-  it("a targetVariation the flag lacks is an error, not a silent whole-flag release", async () => {
-    const { ld } = fakeLd({ "enable-x": mvFlag(["control", "v1"], { on: false, offVariation: 0 }) });
-    await assert.rejects(() => triggerRelease(ld, discovered({ targetVariation: "v9" }), "production"), /no variation 'v9'/);
+  it("a targetVariation the flag lacks is HELD — never a silent whole-flag release, and never a throw", async () => {
+    // The original thesis survives: naming a variation the flag does not have must NOT fall
+    // through into releasing something else. What changed is the SHAPE of the refusal.
+    //
+    // It used to throw. `evaluateManifest`'s catch claims the flag's action slot for any throw
+    // (rightly — a throw out of `startRelease` may follow a patch LaunchDarkly already applied),
+    // but this one is DETERMINISTIC, PRE-WRITE and PER-MANIFEST, so the claim was permanent
+    // rather than a delay: it recurred on every deploy and `server.ts`'s "highest target first"
+    // ordering ran it before the sibling that could release. See the sibling-starvation test in
+    // ledgerLineage.test.ts for the end-to-end shape.
+    //
+    // `held` is the same answer as the off-the-lineage refusal three lines below it in
+    // trigger.ts: a human named something that does not exist, only a human can say what was
+    // meant, and `held` is not final, so the ledger re-checks it once they fix it.
+    const { ld, patches } = fakeLd({ "enable-x": mvFlag(["control", "v1"], { on: false, offVariation: 0 }) });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "v9" }), "production");
+    assert.equal(r.method, "held", "THE DISCRIMINATOR: held, so it does not claim the flag's action slot");
+    assert.match(String(r.note), /no such variation/);
+    assert.match(String(r.note), /'v9'/, "the note names what was asked for");
+    assert.match(String(r.note), /control, v1/, "and what the flag actually has, so the fix is obvious");
+    assert.deepEqual(patches, [], "nothing released, which was the original point of this test");
+  });
+
+  it("an EMPTY targetVariation is that same held refusal, not the flag-level throw", async () => {
+    // `flag.targetVariation ?? tip` uses `??`, so an empty string is NOT absent — it is a target
+    // this one manifest names and the flag does not have. As `!targetValue` it fell into the
+    // per-FLAG "no vN lineage" throw and starved siblings exactly like the case above; the flag
+    // here plainly HAS a lineage, which is what makes the misclassification visible.
+    const { ld, patches } = fakeLd({ "enable-x": mvFlag(["control", "v1"], { on: false, offVariation: 0 }) });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "" }), "production");
+    assert.equal(r.method, "held", "THE DISCRIMINATOR: a per-manifest refusal, not a thrown flag-level error");
+    assert.deepEqual(patches, []);
+  });
+
+  it("a flag with NO vN lineage still THROWS when the manifest named no target — that is per-flag", async () => {
+    // The throw that must NOT be converted. Nothing about this is manifest-specific: there is no
+    // lineage to release, so every manifest for this flag fails the same way on the same read and
+    // there is no sibling to starve. Converting it would hide a real error as a hold.
+    const { ld } = fakeLd({ "enable-x": mvFlag(["control", "experiment-a"], { on: false, offVariation: 0 }) });
+    await assert.rejects(() => triggerRelease(ld, discovered(), "production"), /no vN lineage variation/);
   });
 
   it("intent prerequisites on a MULTIVARIATE parent pin what its targeting points at", async () => {
