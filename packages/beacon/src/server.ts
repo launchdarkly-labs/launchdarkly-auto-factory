@@ -518,26 +518,57 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // it — mid-rollout `servedVariation` still answers `control`, so `servedIndex` is
         // undefined and both backwards guards fall through.
         //
-        // CLAIMING IT UNCONDITIONALLY COSTS A DELAY, AND HERE IS WHY — the claim is only
-        // defensible because of what `triggerRelease` no longer throws. Its surviving throws are
-        // of two kinds:
+        // CLAIMING IT UNCONDITIONALLY COSTS A DELAY RATHER THAN A RELEASE, AND HERE IS WHY — the
+        // claim is only defensible because of what `triggerRelease` no longer throws. The dividing
+        // line is NOT pre-write vs post-write and never was; it is whether a throw recurs
+        // identically for THIS ONE MANIFEST on every deploy. Such a throw makes the slot claim
+        // permanent, and permanent starvation is a lost release rather than a delayed one.
         //
-        //  - MAY HAVE WRITTEN, and TRANSIENT: anything out of `patchFlagSemantic` /
-        //    `startRelease` / the `getFlag` read. The next deploy re-evaluates (the entry is
-        //    non-final in the ledger) and by then the releases listing says what actually
-        //    happened, so the deferred sibling loses one deploy, not its release.
-        //  - PRE-WRITE and PER-FLAG: no true/false pair on a boolean flag, no vN lineage on a
-        //    flag whose manifest named no target, no resolvable served variation. Every sibling
-        //    manifest for that flag hits the same throw on the same read, so NONE of them could
-        //    have released — claiming the slot starves nobody, because there is nobody to starve.
+        // What still reaches here, and why each is survivable:
         //
-        // What is deliberately NOT in either list is a DETERMINISTIC PER-MANIFEST pre-write
-        // throw, and that is the whole basis of "a delay": such a throw recurs identically on
-        // every deploy, so claiming the slot on its behalf starves a releasable sibling
-        // PERMANENTLY. There was exactly one — "this manifest names a variation the flag does not
-        // have", which `targetRank` also happened to evaluate FIRST — and it is answered `held` at
-        // source in `trigger.ts` rather than patched around here. If a new pre-write, manifest-
-        // specific refusal is ever added, it belongs there too, not in this catch.
+        //  - MAY HAVE WRITTEN, and TRANSIENT: a 5xx, a network failure, a truncated body — the
+        //    `await res.text()` case above — plus HTTP 408, where a timed-out request may still have
+        //    been processed. The next deploy re-evaluates (the entry is non-final in the ledger) and
+        //    by then the releases listing says what actually happened, so the deferred sibling loses
+        //    one deploy, not its release.
+        //  - REFUSED, BUT STILL TRANSIENT: HTTP 429. LaunchDarkly declined it, so nothing was
+        //    written — but `LdClient.request` had already spent its own backoff budget, and the cause
+        //    is load, not the manifest. Kept in this bucket ON PURPOSE (`contentRefusalStatus`
+        //    excludes it): reporting a spent rate-limit budget as "a human must fix this manifest"
+        //    would describe a transient condition as a human problem.
+        //  - PRE-WRITE and PER-FLAG: no true/false pair on a boolean flag, no vN lineage on a flag
+        //    whose manifest named no target, no resolvable served variation, or a failed `getFlag`
+        //    read. Every sibling manifest for that flag hits the same throw on the same read, so
+        //    NONE of them could have released — claiming the slot starves nobody.
+        //  - DETERMINISTIC BUT GLOBAL: HTTP 401/403. Beacon's credentials, identical for every
+        //    manifest of every flag, so again there is nobody to starve — and the file to fix is the
+        //    deployment's environment, not `releasePlan`.
+        //
+        // WHAT IS DELIBERATELY NOT IN THAT LIST is a deterministic PER-MANIFEST throw, and the
+        // earlier claim that only one such throw had ever existed was FALSE. A throw driven by
+        // manifest CONTENT is deterministic too, and the content reaches LaunchDarkly unvalidated:
+        // `startRelease`'s instruction body carries `releasePlan.stages`, `metricKeys`,
+        // `metricGroupKeys` and `randomizationUnit` straight through, and before this round neither
+        // `write_manifest` nor Beacon checked any of them. The reachable instance was a 100% guarded
+        // stage — LaunchDarkly caps guarded stages at 50% (see trigger.ts) — a permanent 400 that
+        // `targetRank` evaluated FIRST, so the releasable sibling was starved on every deploy and
+        // told "another manifest released this flag", which had not happened.
+        //
+        // Both per-manifest refusals are now answered `held` at source in `trigger.ts` rather than
+        // patched around here: "this manifest names a variation the flag does not have", and any
+        // client-error rejection of the release-start patch (`contentRefusalStatus`, which closes
+        // the whole class — a missing metric, a bad randomization unit, anything LD refuses).
+        // `write_manifest` also validates `stages` now, but that is defence in depth, not the
+        // guarantee: `.release-flags/` is hand-editable in git and the other three fields are still
+        // unchecked before they reach LaunchDarkly.
+        //
+        // SO THE RESIDUAL IS: whatever LaunchDarkly rejects with a NON-client error (transient, and
+        // it may have written), plus one known gap — only the RELEASE-START patch is classified. The
+        // `prerequisites` release's `addPrerequisite` patch is built from `releaseIntent`, so a 4xx
+        // there (a circular prerequisite, a depth limit) is deterministic and per-manifest and does
+        // still claim the slot. Left as a known gap rather than widened without a reproduction: it
+        // needs an intent naming a real, readable parent that LaunchDarkly then refuses to attach.
+        // If a new pre-write, manifest-specific refusal is added, it belongs in `trigger.ts` too.
         //
         // The cost of the other direction is a rollout backwards, which no later deploy undoes.
         actedOnFlag.add(flag.flagKey);

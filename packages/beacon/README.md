@@ -95,9 +95,24 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
   that does reach the trigger is deferred **non-finally**, so the ledger re-checks it. A
   trigger that **threw** claims the slot as well, because there are three states and not two:
   `startRelease` awaits the response *after* LaunchDarkly applied the patch, so a lost response
-  is "we do not know". That claim only costs the sibling a delay because every throw left in
-  `triggerRelease` is either transient or **per-flag** — a deterministic per-manifest refusal
-  returns `held` instead (next bullet but one).
+  is "we do not know".
+- **That claim costs the sibling a delay only while no throw is deterministic AND
+  per-manifest.** The dividing line is not pre-write vs post-write: a throw driven by manifest
+  **content** is deterministic too, and recurs on every deploy, which makes the slot claim
+  permanent and the sibling's release lost rather than late. `startRelease`'s instruction body
+  carries `releasePlan.stages`, `metricKeys`, `metricGroupKeys` and `randomizationUnit` straight
+  through to LaunchDarkly, and *neither* `write_manifest` *nor* Beacon validated any of them —
+  so a 100% guarded stage (LD caps guarded stages at 50%) was a permanent 400 that
+  `targetRank` evaluated **first**. Both per-manifest refusals now return `held` at source in
+  `trigger.ts`: a target the flag has no variation for, and any **client-error rejection of the
+  release-start patch**, which closes the class rather than the instance. What is left for the
+  catch is what LaunchDarkly rejects with a *non*-client error (transient, and it may have
+  written), a rate limit (429, deliberately kept transient rather than reported as a human
+  problem), a **per-flag** pre-write throw, and a **global** credential failure (401/403) —
+  none of which can starve a sibling, because every sibling hits them identically.
+  Known gap: only the release-start patch is classified, so a 4xx on the `prerequisites`
+  release's `addPrerequisite` patch (built from `releaseIntent`) is still deterministic,
+  per-manifest, and still claims the slot.
 - **A manifest whose target is BEHIND what the environment serves is moot**, not held: a
   newer variation superseded it, so it resolves as a final `noop` and stops being tracked.
   Holding it would wait forever for a release that must never happen.
@@ -112,6 +127,13 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
   ranks the manifest naming the *missing* higher variation ahead of the releasable one.
   `write_manifest` checks `targetVariation` against `/^v\d+$/` but never against the flag's
   real variations.
+- **A release instruction LaunchDarkly REJECTS with a client error is held for a human**, named
+  with LaunchDarkly's own message. A 4xx means LD answered and the patch did **not** apply, so
+  write-certainty is knowable from the error and nothing was written — the sibling can still
+  release in this same notification. 429 and 408 are excluded (a spent rate-limit budget is
+  transient; a timed-out request may have been processed) and so are 401/403, which are Beacon's
+  credentials rather than the manifest's content. Classified on `LdApiError.status`, never on
+  message text.
 
 > **Known limitation: mutual exclusion is per-notification, not per-flag.** The slot
 > above is a set inside one request. `config/services.yaml` registers **four
@@ -201,6 +223,16 @@ other service's deploy notification to re-evaluate.
 > its destination is the parent's *live* fallthrough, so during a rollout it would follow the
 > heaviest arm — the variation being ramped *away* from — and pull children onto it. If that
 > read fails the repoint is skipped, not guessed.
+>
+> **And a repoint never moves a child BACKWARDS** (`repoint.ts`, all three callers). "Live"
+> includes states a human deliberately put the flag into, and serving an earlier variation
+> directly is the rollback this project recommends — after which `findLatestRelease` still
+> reports the old release as `completed`, so every gate above is satisfied and the destination
+> is now `control`. A child pinned behind an unmet prerequisite is **dark**, so repointing it
+> to what the parent now serves *meets* that prerequisite and takes the child live at 100% with
+> no rollout, caused by a rollback. A child pinned to `vN` is therefore left alone when the
+> destination ranks lower, or has left the lineage entirely; `control` → `v1` and `v1` → `v2`
+> are unaffected.
 > `BEACON_PENDING_FILE` sets the ledger path (default `beacon-pending.json`).
 >
 > **The notification itself is never redelivered**, so alert on `notify: ACTION REQUIRED`.
