@@ -75,8 +75,38 @@ const manifest = (targetVariation?: string, extra: Record<string, unknown> = {})
  */
 function ghWith(files: string[], manifests: Record<string, unknown>): GitHubClient {
   return {
+    /**
+     * The SAME listing at every sha, which is the shape discovery can never re-surface — and the
+     * reason a test that wants to exercise the LEDGER has to silence it. Discovery diffs this listing
+     * between two shas, so a fixed listing means "nothing added", except on the first-ever deploy
+     * where there is no previous sha and everything counts as new. A second `post()` on the same
+     * harness therefore still runs the DISCOVERED pass over both manifests, which let one test claim
+     * it was proving something about a held ledger entry when the discovered pass produced the same
+     * outcomes on its own. Use `ghAt` when that distinction matters.
+     */
     async listDir(): Promise<string[]> {
       return files;
+    },
+    async getFileJson(_repo: unknown, p: string): Promise<unknown> {
+      return manifests[p] ?? null;
+    },
+    async fileExists(): Promise<boolean> {
+      return true;
+    },
+  } as unknown as GitHubClient;
+}
+
+/**
+ * Like `ghWith`, but the directory listing is per-sha — so a sha whose listing is EMPTY reaches the
+ * pending pass and nothing else. That is the only way to show an outcome came from the ledger rather
+ * than from re-discovery; without it, `assert(released)` on a second deploy proves nothing about the
+ * ledger at all, which a reviewer demonstrated by reverting such a test to a fresh empty-ledger
+ * harness and watching every assertion still pass.
+ */
+function ghAt(listings: Record<string, string[]>, manifests: Record<string, unknown>): GitHubClient {
+  return {
+    async listDir(_repo: unknown, _dir: string, ref: string): Promise<string[]> {
+      return listings[ref] ?? [];
     },
     async getFileJson(_repo: unknown, p: string): Promise<unknown> {
       return manifests[p] ?? null;
@@ -124,6 +154,13 @@ interface MvState {
    * ledger's repoint gate cannot be evaluated but the terminal-history guard can.
    */
   activeListingThrows?: boolean;
+  /**
+   * The FLAG's release policy method, as LaunchDarkly's release-settings endpoint reports it. Exists
+   * because `method` is `ov.releaseMethod ?? policy.releaseMethod ?? inferred` — so the shape of the
+   * patch Beacon sends is not always something the manifest asked for, and one operator note was
+   * false for exactly that case.
+   */
+  policyMethod?: string;
 }
 
 const mvState = (o: Partial<MvState> = {}): MvState => ({
@@ -156,7 +193,11 @@ function fakeMvLd(state: MvState, patches: Patch[]): LdClient {
       // 200 with empty fields is what a live environment with no policy returns; a 404 would
       // be reported as UNREADABLE and add noise to every note these tests read.
       if (opts.path.includes("/release-settings")) {
-        return { status: 200, ok: true, data: { releaseMethod: "", releasePolicyKey: "" } };
+        return {
+          status: 200,
+          ok: true,
+          data: { releaseMethod: state.policyMethod ?? "", releasePolicyKey: "" },
+        };
       }
       return { status: 200, ok: true, data: { items: [] } };
     },
@@ -621,13 +662,12 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     assert.match(note, /flag is archived/, "carrying LaunchDarkly's own message");
     // AND THE NOTE POINTS AT THE RIGHT TWO THINGS, in the right order. None of the VALUES in this
     // patch came from the manifest — the variation id is one LaunchDarkly reported — so the flag and
-    // the environment come first. But one field of this file DID choose this instruction, and an
-    // earlier version of this note said to look "rather than at any field of this file", which left an
-    // author with a refusal they could actually act on and no way to know it: `releaseMethod:
-    // "immediate"` is what asks for a direct fallthrough change instead of a staged release, and
-    // dropping it is the remedy `sandboxTools` already teaches.
+    // the environment come first. In THIS fixture one field of the file did choose the instruction, and
+    // round 4's note said to look "rather than at any field of this file", which left an author with a
+    // refusal they could act on and no way to know it. The next test is the other half: the same patch
+    // selected by the FLAG's policy, where naming a field of the file is simply false.
     assert.match(note, /look at the FLAG and the ENVIRONMENT first/, "the flag and environment come first");
-    assert.match(note, /releaseMethod "immediate" is what asks for a direct/, "THE DISCRIMINATOR: the routing field is named");
+    assert.match(note, /releaseMethod "immediate" asks for a direct/, "THE DISCRIMINATOR: the routing field is named when there IS one");
     assert.doesNotMatch(
       note,
       /stages|metricKeys|metricGroupKeys|randomizationUnit|releaseIntent/,
@@ -640,6 +680,30 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     );
   });
 
+  it("and when the FLAG'S POLICY chose that shape, the note does not blame a field of the file", async () => {
+    // PREVENTS SENDING AN AUTHOR AFTER A FIELD THEY NEVER WROTE. `method` resolves as
+    // `ov.releaseMethod ?? policy.releaseMethod ?? inferred`, and `normalizeMethod` maps any policy
+    // value containing "immediate" to `immediate` — so this patch is reachable with NO releasePlan in
+    // the manifest at all. Round 5 replaced a true-but-unhelpful sentence ("rather than at any field of
+    // this file") with a confident false one naming `releasePlan.releaseMethod`, which in this fixture
+    // does not exist and cannot be dropped. `sandboxTools` documents this very precedence, so the repo
+    // carried its own counterexample.
+    const h = await harness(
+      ghWith([`pr-60.json`], { [path(60)]: manifest("v2") }),
+      mvState({ policyMethod: "immediate-release", patchRejects: rejectImmediate(400, "flag is archived") }),
+    );
+
+    const r = await h.post("sha1");
+    const sixty = outcomeFor(r.json, 60);
+    assert.equal(sixty.action, "held", "still held — the classification does not depend on who chose the shape");
+    const note = String(sixty.detail.note);
+    assert.match(note, /did NOT ask for an immediate release/, "THE DISCRIMINATOR: the file is not blamed");
+    assert.match(note, /FLAG'S RELEASE POLICY in LaunchDarkly selected that shape/, "and the real chooser is named");
+    assert.match(note, /the policy is where to change it/, "with somewhere to go");
+    assert.doesNotMatch(note, /releaseMethod "immediate" asks for a direct/, "no field of this file is named");
+    assert.doesNotMatch(note, /this file's author controls/, "and nothing is claimed to be in the author's hands");
+  });
+
   it("but it TAKES THE FLAG'S SLOT: a sibling wanting an OLDER variation must not roll out", async () => {
     // THE OWNER'S REPRODUCTION, and the arm that encodes their decision. It must fail if this patch
     // ever goes back to leaving the slot free.
@@ -650,19 +714,30 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     // production while the newer manifest sat held. `server.ts` calls that direction unrecoverable:
     // no later deploy undoes a rollout backwards.
     //
-    // Freeing the slot buys nothing in exchange, which is what makes the narrowing sound rather than
-    // merely convenient: nothing in this patch's body came from pr-50, so there is no refusal here
-    // that could have singled it out while pr-51 succeeded. The sibling is DELAYED one deploy, not
-    // denied — `held` is non-final and both entries stay in the ledger.
+    // WHAT MAKES THE NARROWING SOUND IS THE ASYMMETRY, NOT AN ABSENCE OF COST. This comment used to
+    // say freeing the slot "buys nothing in exchange", and to state the §6 relation backwards ("no
+    // refusal that could have singled pr-50 out while pr-51 succeeded" — §6's loss is the other way
+    // round: pr-50 refused while a SIBLING could have succeeded). Both were falsified by the fixture
+    // directly below them, which asserts nothing released precisely because pr-51's staged patch is
+    // not matched by `rejectImmediate` and would have gone through. The next test pins that loss as a
+    // known gap. What is true here: pr-51 is DELAYED — `held` is non-final, both entries stay in the
+    // ledger, and it releases as soon as a human fixes the flag — whereas the rollout a free slot
+    // permits is not undone by anything.
     //
     // The targets are DIVERGENT on purpose. With both manifests on v2 this test passed either way:
     // one release happened and it was v2's, whichever manifest produced it.
     const state = mvState({ patchRejects: rejectImmediate(400, "flag is archived") });
+    // `ghAt`, not `ghWith`: the listing is EMPTY at sha2, so the second deploy discovers nothing and
+    // the outcomes below can only come from the ledger. With a fixed listing the discovered pass
+    // re-processes both manifests on every sha, and the continuation asserted nothing it claimed to.
     const h = await harness(
-      ghWith([`pr-50.json`, `pr-51.json`], {
-        [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }),
-        [path(51)]: manifest("v1"),
-      }),
+      ghAt(
+        { sha1: [`pr-50.json`, `pr-51.json`], sha2: [] },
+        {
+          [path(50)]: manifest("v2", { releasePlan: { releaseMethod: "immediate" } }),
+          [path(51)]: manifest("v1"),
+        },
+      ),
       state,
     );
 
@@ -689,11 +764,12 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
       [path(50), path(51)],
     );
 
-    // THE SAME HARNESS, CONTINUED — not a new one. The first version of this arm built a fresh harness
-    // with an EMPTY ledger, so it re-discovered both manifests as new and proved nothing about the held
-    // entry: v1 was then withheld by an ordinary write claim, not by anything this test is about. The
-    // point is that the DEFERRED sibling and the HELD entry both survive into the next deploy, so
-    // mutate the refusal on the live state and post again.
+    // THE SAME HARNESS, AND A SHA THAT DISCOVERS NOTHING. Two earlier versions of this continuation
+    // proved nothing: the first built a fresh harness with an empty ledger, and the second reused this
+    // harness but kept `ghWith`'s fixed listing, so the DISCOVERED pass re-processed both manifests and
+    // produced these same outcomes without the ledger contributing anything. A reviewer showed that by
+    // reverting the arm and watching all three assertions still pass. With `sha2`'s listing empty, the
+    // pending pass is the only path that can produce them.
     state.patchRejects = undefined;
     const r2 = await h.post("sha2");
     assert.equal(outcomeFor(r2.json, 50).action, "released", "the held entry re-evaluates and pr-50 releases");

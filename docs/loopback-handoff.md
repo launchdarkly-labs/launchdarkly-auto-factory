@@ -1,7 +1,14 @@
 # `loopback-support` — working notes for whoever picks this up
 
-**Status as of 2026-08-11:** 81 commits ahead of `main`, 76 files, +14448/−404. **674/674 tests**,
-`npm run typecheck` and `npm run check:configs` clean. **46 commits unpushed.** HEAD is `3324b40`.
+**Status as of 2026-08-11 (round 6):** 84 commits ahead of `main`, 78 files, +15709/−449.
+**687/687 tests**, and `npm run typecheck`, `npm run check:configs` and `npm run check:public` all
+clean. HEAD is `36b6282`, and **the branch is fully pushed** (`origin/loopback-support` == HEAD, 0
+ahead / 0 behind). **No PR exists yet**, and the graph is still not provisioned — both remain the
+owner's call.
+
+This header was stale for two rounds (it claimed `3324b40`, 674 tests and "46 commits unpushed"
+after two rounds had been committed and pushed), which is worth more than the numbers: a reader
+checking whether the working notes are current starts here.
 
 This file exists because the git log and `docs/loop-seam.md` carry the architecture and the
 reasoning, but three things live nowhere durable: **the open findings**, **the decisions and why
@@ -24,11 +31,12 @@ branch merges.
 - **Do not provision the graph.** `npm run bridge -- upgrade` is held until the branch is peer
   reviewed and approved. The walker executes the graph **LaunchDarkly serves**, which has neither
   loop edge until that runs — so a live run shows no looping and looks broken.
-- **Nothing has been pushed** since the branch went 46 commits ahead; pushing and opening the PR
-  are the owner's call.
-- **No PR exists yet.** A draft PR body was kept in a session scratchpad and is now **stale and
-  gone** (it described 51 commits / 619 tests). Regenerate it from the git log rather than
-  hunting for it.
+- **The branch IS pushed** — rounds 1–5 were committed and pushed on the owner's explicit
+  instruction, so `origin/loopback-support` matches HEAD. What is still the owner's call is
+  **opening the PR**, and provisioning the graph after review.
+- **No PR exists yet** (`gh pr list --head loopback-support --state all` is empty). A draft PR body
+  was kept in a session scratchpad and is now **stale and gone** (it described 51 commits / 619
+  tests). Regenerate it from the git log rather than hunting for it.
 
 ## 3. How verification silently lies here — read before trusting any green suite
 
@@ -60,9 +68,18 @@ Six distinct traps, each of which has produced a wrong conclusion in this branch
 **The discipline that works:** sabotage the mechanism, `npx tsc --build --force`, run the full
 suite, and confirm the *predicted* test failed.
 
-## 4. Open findings — not fixed, ranked
+## 4. Findings §4.1–§4.6 — ALL IMPLEMENTED (rounds 1–6). Kept as the record of what changed and why
 
-From an adversarial review of `3324b40` (round 19). All verified against LaunchDarkly's docs.
+From an adversarial review of `3324b40` (round 19). All verified against LaunchDarkly's docs. **Every
+item below is now done**, across six review rounds; the sections are retained because they state the
+failure scenarios, and a future reader needs those more than a checklist. The structural item §4.6
+was done first, as §7 said to: the taxonomy has one home (`PATCH_FAILURE_TAXONOMY` in
+`packages/beacon/src/trigger.ts`) and `tests/taxonomyHome.test.ts` fails if another file restates it.
+
+What the rounds after §4.6 mostly found was not new defects in the code but **more copies of the
+claims being corrected** — three of four, then three of five, then four more sites of a clause
+already withdrawn. The lesson is in §3 and in that test: when correcting a claim, grep for every
+occurrence of it and count the set before declaring the fix done.
 
 ### 4.1 BLOCKER (prose, not code) — "400 ⇒ manifest content" is false, and unfixable by code
 
@@ -179,20 +196,24 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
   condition is a value, not a comment — `PatchSite.carriesManifestContent` in
   `packages/beacon/src/trigger.ts`, which `heldOnContentRefusal` reads and
   `TriggerResult.claimsSlotWithoutWriting` carries into the outcome — and
-  `tests/taxonomyHome.test.ts` pins that exactly one patch is in each state, so the exception cannot
-  spread without a test failing.
+  `tests/taxonomyHome.test.ts` pins the split exactly — ONE patch carries no manifest content, TWO
+  do — so the exception cannot spread without a test failing.
 
-  **Its accepted cost, in the owner's words, recorded as a known gap rather than closed** (the same
-  treatment as the 403 gap in `PATCH_FAILURE_TAXONOMY`, and pinned the same way by
-  `tests/ledgerLineage.test.ts`):
+  **Its accepted cost, in the owner's words, recorded as a known gap rather than closed** — the same
+  TREATMENT as the 403 gap in `PATCH_FAILURE_TAXONOMY`, though pinned differently: that one by a
+  table-shape assertion in `tests/taxonomyHome.test.ts`, this one by a behavioural reproduction in
+  `tests/ledgerLineage.test.ts`:
 
   > a sibling targeting the same or a later variation by a different method would have succeeded,
   > and defers while the refusal stands.
 
   Two arguments once offered for the narrowing were false and are withdrawn: that every sibling
   would be refused identically, and that there was no reachable loss on the sibling's side. The
-  narrowing rests only on the asymmetry of the two failures — a deferred sibling recovers on the
-  next deploy, a rollout backwards does not recover at all.
+  narrowing rests only on the asymmetry of RECOVERABILITY: a deferred sibling releases as soon as a
+  human fixes the flag, so what it loses is deploys, however many that takes — **not** "the next
+  deploy", which is the third form this claim has taken and is contradicted by the residual four
+  lines above and by the test that runs it across three deploys. A rollout backwards recovers by
+  nothing.
 - **Never move a lineage backwards**, and never repoint a child onto a variation behind what it is
   pinned to.
 - **`held` is non-final; `noop` is final.** A superseded manifest is *moot*, not held — that is what
@@ -200,6 +221,18 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
 
 ## 7. Suggested next steps
 
-1. Fix §4.1–4.5, and do §4.6 **first** so the taxonomy has one home before it is edited again.
-2. One more adversarial review, then regenerate the PR body from the git log.
-3. Push, open the PR, get human review. **Then** provision the graph.
+§4.1–§4.6 are done and the branch is pushed, so what is left is review and release:
+
+1. **Regenerate the PR body from the git log** (84 commits). The old draft is gone; do not hunt for it.
+2. **Open the PR and get human review.** This is the owner's call, not an agent's.
+3. **Then** provision the graph (`npm run bridge -- upgrade`) — still held until after approval, for
+   the reason in §2: the walker executes the graph LaunchDarkly serves, which has neither loop edge
+   until that runs.
+
+Still open, and none of it blocking: the items in §5 (each deferred by decision), the two gaps
+recorded rather than closed (the permissions row in `PATCH_FAILURE_TAXONOMY`, and the sibling cost
+of the §6 narrowing in `PATCH_SITES`), and two lint tuning risks recorded in
+`tests/taxonomyHome.test.ts` — its ungated phrases include ordinary English (`patch site`) and
+LaunchDarkly RBAC vocabulary (`role action`), so an honest future comment can trip it. That is the
+misfire class the test itself warns gets a lint deleted; if it happens, gate the term rather than
+deleting the check.

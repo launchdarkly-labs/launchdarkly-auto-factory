@@ -318,7 +318,12 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
      * `already_running` would be final, and a final outcome clears the ledger entry — which
      * discarded the newer manifest's unreleased work and reported it as success.
      *
-     * ONLY A WRITE CLAIMS THE SLOT, and that is the whole point of the set. It used to be
+     * A WRITE CLAIMS THE SLOT, and that is the whole point of the set — but "ONLY a write", which
+     * this paragraph asserted until round 6, is no longer the rule and was found by counting the
+     * copies rather than by reading the diff. There is one non-writing claimant, `held` at the patch
+     * whose body carries no manifest values, by an owner-authorised narrowing of §6; see the
+     * `claimsSlotWithoutWriting` branch in `evaluateManifest` and its declaration in `trigger.ts`.
+     * The history below is what the rule was written for and is unchanged by that exception. It used to be
      * claimed before `triggerRelease` was even called, so a manifest that wrote NOTHING — `held`
      * on a future `notBefore`, `noop` because a newer variation superseded it — still consumed
      * the flag's only slot and deferred every other manifest for that flag. In the documented
@@ -509,14 +514,23 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         if (performedAWrite(result.method)) actedOnFlag.add(flag.flagKey);
         else if (result.claimsSlotWithoutWriting) {
           // THE ONE EXCEPTION, AND IT IS A DELIBERATE NARROWING OF §6 BY THE REPO OWNER — not a bug
-          // being tolerated. §6 said a manifest that writes nothing must not take the flag's action
-          // slot, because a refusal that repeats for one manifest forever would cost a releasable
-          // sibling its release on every deploy. That reasoning needs the refusal to be capable of
-          // singling out one manifest. At one of the patches `triggerRelease` sends it cannot be —
-          // nothing in that body comes from the manifest — so the loss §6 guards against is
-          // unreachable there, while the loss that a free slot permits is not: the sibling's own
-          // idempotency read sees nothing running and rolls out a DIFFERENT variation, which is the
-          // direction the log below calls unrecoverable.
+          // being tolerated, and NOT a case where §6's loss cannot happen. Read the next paragraph
+          // before touching this branch.
+          //
+          // §6 said a manifest that writes nothing must not take the flag's action slot, because a
+          // refusal that repeats for one manifest forever would cost a releasable sibling its release
+          // on every deploy. THAT LOSS IS REACHABLE HERE, and it is an accepted cost rather than an
+          // avoided one: a sibling wanting the same or a later variation by a different method sends a
+          // different patch, was never refused, and defers for as long as this refusal stands. The
+          // owner recorded it as a known gap; `tests/ledgerLineage.test.ts` pins it, and an earlier
+          // version of this comment asserted it away.
+          //
+          // What justifies the exception is not the absence of that loss but the ASYMMETRY OF
+          // RECOVERABILITY. A deferred sibling releases as soon as a human fixes the flag, and nothing
+          // is lost but deploys. A free slot instead lets the sibling's own idempotency read see
+          // nothing running and roll out a DIFFERENT — possibly OLDER — variation, which the log below
+          // calls unrecoverable and no later deploy undoes. Deleting this branch trades a recoverable
+          // delay for an unrecoverable rollout.
           //
           // `trigger.ts` decides this from the patch, not from the status, and hands back the reason
           // rather than a flag — LOGGED, because a slot claimed by something other than a write must
@@ -578,7 +592,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // `docs/loop-seam.md` each used to re-derive it independently — four copies, eleven
         // corrections, and every correction updated three of them. So this comment states no part of
         // it: not a status, not a status name, not the vocabulary the argument turns on.
-        // `tests/ledgerLineage.test.ts` fails if any of that reappears here, in numerals or in
+        // `tests/taxonomyHome.test.ts` fails if any of that reappears here, in numerals or in
         // paraphrase, because paraphrase was the hole the first version of that test left.
         //
         // WHAT THIS FILE OWNS is the write-state rule, and only two things reach here that the
@@ -597,8 +611,10 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // Everything else is a refusal LaunchDarkly answered, and `trigger.ts` answers those at
         // source — returning `held` where it can, and throwing where it deliberately will not
         // classify. If a new refusal of that kind is found, it belongs there, not patched around
-        // here. The residual, including one shape that is recorded rather than solved, is in the
-        // table.
+        // here. The residual is recorded in two places, not one: the permissions shape that no bucket
+        // fits is a row of `PATCH_FAILURE_TAXONOMY`, and the sibling loss this file's slot claim
+        // accepts is in `PATCH_SITES` — a distinction worth keeping, because the first is about a
+        // status and the second is about a patch.
         //
         // The cost of the other direction is a rollout backwards, which no later deploy undoes.
         actedOnFlag.add(flag.flagKey);

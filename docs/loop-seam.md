@@ -105,7 +105,7 @@ deploy, independently of discovery.
 | `error`, idempotency guard unverifiable | the read that would prove no release is running failed | 503 (a refusal, not a retry — nothing redelivers it) **plus a ledger entry**, so the next deploy re-checks |
 | `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | **ledger**, and it is *diagnosed* as unverified rather than reported as "not deployed" |
 | `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **ledger**, guarded by the terminal-status check below. And it **claims the flag's action slot**, because a throw is not "did not write" but "we do not know": `startRelease` awaits the response *after* the patch is applied, so a sibling manifest must not release a different variation of that flag in the same notification. Whether that claim costs the deferred sibling a **delay** or its release turns on the SHAPE of every failure `triggerRelease` still lets through, which `PATCH_FAILURE_TAXONOMY` (`trigger.ts`) settles per status — see the row below, and note that this property was once asserted here falsely |
-| `held`, LaunchDarkly **refused** a patch with an allowlisted status | LaunchDarkly answered, and its answer is that the patch did not apply — so nothing was written. NOT "on content grounds", which this row used to say: one allowlisted status has a second cause that is nothing to do with the manifest, and one of the patches carries no manifest content at all | **ledger** (`held` is not final), reported with LaunchDarkly's own message. Whether the flag's action slot is left free for a sibling DEPENDS ON WHICH PATCH was refused, and at one of them it is not — this row asserted the free slot unconditionally while the runtime note for that patch said the opposite. The rule, the one exception, and the cost the owner accepted for it are in `trigger.ts` (`PatchSite`, `TriggerResult.claimsSlotWithoutWriting`), not restated here. **WHICH REFUSALS QUALIFY, AND WHY, ARE NOT IN THIS DOCUMENT.** They are one table — `PATCH_FAILURE_TAXONOMY` in `packages/beacon/src/trigger.ts` — carrying every status Beacon classifies, what it does and does not prove, how wide it is, whether anything was written, what an operator note may therefore claim, and which gaps are knowingly open; the classifier's behaviour is *derived* from that table rather than described beside it. This row, `packages/beacon/README.md`, the catch in `server.ts` and the classifier each used to re-derive that argument independently. Four copies, eleven corrections, and every correction fixed three of them — so the copies are gone rather than annotated, and `tests/ledgerLineage.test.ts` fails if this row starts stating the argument again, in numerals or in paraphrase. What belongs here is only the SHAPE: a refusal LaunchDarkly answers definitively is not a lost response, so `held` is available at all, and `held` is non-final, so the ledger re-reads the manifest at the current sha and the fix takes effect on any later deploy. **Residual:** the table names it, including the case where an allowlisted refusal was never about the manifest at all, and the one permissions shape that is recorded rather than solved. |
+| `held`, LaunchDarkly **refused** a patch with an allowlisted status | LaunchDarkly answered, and its answer is that the patch did not apply — so nothing was written. NOT "on content grounds", which this row used to say: one allowlisted status has a second cause that is nothing to do with the manifest, and one of the patches carries no manifest content at all | **ledger** (`held` is not final), reported with LaunchDarkly's own message. Whether the flag's action slot is left free for a sibling DEPENDS ON WHICH PATCH was refused, and at one of them it is not — this row asserted the free slot unconditionally while the runtime note for that patch said the opposite. The rule, the one exception, and the cost the owner accepted for it are in `trigger.ts` (`PatchSite`, `TriggerResult.claimsSlotWithoutWriting`), not restated here. **WHICH REFUSALS QUALIFY, AND WHY, ARE NOT IN THIS DOCUMENT.** They are one table — `PATCH_FAILURE_TAXONOMY` in `packages/beacon/src/trigger.ts` — carrying every status Beacon classifies, what it does and does not prove, how wide it is, whether anything was written, what an operator note may therefore claim, and which gaps are knowingly open; the classifier's behaviour is *derived* from that table rather than described beside it. This row, `packages/beacon/README.md`, the catch in `server.ts` and the classifier each used to re-derive that argument independently. Four copies, eleven corrections, and every correction fixed three of them — so the copies are gone rather than annotated, and `tests/taxonomyHome.test.ts` fails if this row starts stating the argument again, in numerals or in paraphrase. What belongs here is only the SHAPE: a refusal LaunchDarkly answers definitively is not a lost response, so `held` is available at all, and `held` is non-final, so the ledger re-reads the manifest at the current sha and the fix takes effect on any later deploy. **Residual:** the table names it, including the case where an allowlisted refusal was never about the manifest at all, and the one permissions shape that is recorded rather than solved. |
 | `already_running` | a release is under way for **some** variation of this flag, which does not mean THIS manifest's variation released | **not** in the Notifier's attention set (a redelivery mid-rollout needs nobody) but **kept in the ledger**, so the manifest gets another look once that release ends. It used to be final, which cleared the entry and reported the discarded work as success |
 | release completed while unwatched (paused-then-resumed, or after the 24h window) | monitoring stopped at its deadline | **the ledger repoints the flag's children as it goes past** — for any entry of that flag whose manifest still reads, including one held by its own intent, and **only once a `findActiveRelease` read says nothing is running on that flag** (the repoint's destination is the parent's LIVE fallthrough, so mid-rollout it aims at the heaviest arm, i.e. the variation the release is ramping *away* from; an unreadable listing skips the repoint rather than guessing; and a child pinned to `vN` is **never** moved to an earlier variation or off the lineage, which is the rollback case — a human serving `control` directly leaves `findLatestRelease` still reporting `completed`, so every gate here passes and repointing a *dark* child onto `control` would satisfy its prerequisite and take it live at 100%) — and separately `triggerRelease` decides this manifest's own outcome from served-vs-target (`noop` when they match, and a `noop` repoints as well). The two are deliberately split: "some release of this flag completed" is a fact about the FLAG and is allowed to repoint; it is not an answer to "is THIS manifest done?" |
 | newest release was **reverted** or **monitoring_stopped** | a guardrail rolled it back, or it ended without completing | **never re-triggered while that is still true.** One check answers it for both write paths (`terminalHistoryRefusal`): the ledger pass, and a re-POST of an already-processed sha. It is **recomputed on every deploy**, so the `needsHuman` report clears by itself once a human completes the release, starts a new one, or the flag moves on — the stored field is last-known reporting, not a latch. A NEW sha still releases, because fix-and-redeploy is the way out of a revert. Deliberately flag-level: a rejected v1 also blocks a manifest wanting v2, which errs in the blocking direction |
@@ -270,14 +270,19 @@ Three consequences, each of which reported success while losing work:
   so the entry lived forever, and a non-writing return used to claim the flag's per-notification
   action slot — so an already-superseded manifest deferred the releasable one on **every**
   deploy. Permanent deadlock, zero releases. It is now a final `noop` ("superseded"), and the
-  slot is claimed only by a method that actually patched LaunchDarkly — or by one that *may*
-  have, see below.
+  slot is claimed by a method that actually patched LaunchDarkly, by one that *may* have (see
+  below) — and, since round 4, by one narrow non-writing case: a `held` refusal of the patch whose
+  body carries no manifest values, which is an owner-authorised narrowing of §6 with a recorded
+  cost. The rule and the exception live in `trigger.ts` (`PatchSite`,
+  `TriggerResult.claimsSlotWithoutWriting`); this document deliberately does not re-derive them,
+  having twice stated the unconditional version while the code did something else.
 
 Two rules fall out, both in `server.ts`: **highest target variation first** in both passes (an
 absent `targetVariation` means the lineage tip, so it sorts highest — ranking it last inverts
 the fix; the pending pass ranks on the target read from the manifest *now*, not the remembered
-one, because the order decides which manifest releases), and **only a write claims the slot —
-plus a write we cannot rule out.** There are three states, not two: wrote, did not write, and
+one, because the order decides which manifest releases), and **a write claims the slot — plus a
+write we cannot rule out, plus the one narrow non-writing case described above.** There are three
+write states, not two: wrote, did not write, and
 don't know. A `triggerRelease` that threw is the third — the patch may have landed and the
 response been lost — and filing it with "did not write" let a sibling release a variation
 *behind* the one that may now be live, invisibly, because mid-rollout the fallthrough still
@@ -363,17 +368,22 @@ pulled them across the seam), but it is the right lens for prioritising what com
 Beacon lacks precisely what Phase 1 has: a durable record saying "this isn't finished, re-check
 it."
 
-## Recommended order
+## Recommended order — and what this branch then did
+
+This section was written before the work started and its tail went stale, in the direction that
+matters: it said all three were deliberately not done, while item 1 was built on this very branch
+and the Gap 2 heading above already says so ("now largely closed"). Corrected rather than deleted,
+because the ORDER is still the recommendation and the reasoning behind it is still why.
 
 1. **The re-evaluation ledger** (gap 2) — makes every fail-closed improvement safe, and is the
    direct analogue of the resume journal already built on the cheaper side of the seam.
+   **SHIPPED on this branch** (`pending.ts`, commit `fb1bccf`); see the Gap 2 section above for what
+   it does and does not close (it is webhook-gated, and that is the timer decision, still deferred).
 2. **Carry walk outcomes into the manifest** (gap 3) — small, independent, and the first time a
-   loop outcome would influence a release.
+   loop outcome would influence a release. **Not done**, and still the cheapest of the remaining two.
 3. **Rollout-failure remediation** (gap 1) — the ambitious one, and it depends on gap 2 anyway,
    since a remediation run needs release evidence to cross the seam in the other direction.
+   **Not done**, and a new phase rather than an engineering gap: it carries a product decision
+   (what authority does an agent have when production regresses?).
 
-## Deliberately not done on this branch
-
-All three. The loop work is complete and reviewed; these are the shape of what comes after, and
-gap 1 in particular is a new phase with a product decision attached (what authority does an
-agent have when production regresses?) rather than an engineering gap.
+So: gaps 1 and 3 are the shape of what comes after. The loop work itself is complete and reviewed.

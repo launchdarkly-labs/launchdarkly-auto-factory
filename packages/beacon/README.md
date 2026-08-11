@@ -90,8 +90,9 @@ variation of a flag can be releasing at a time. Beacon's rules for that:
 - **Highest target variation acts first**, in both the discovered and the pending pass.
   An absent `targetVariation` means the lineage tip, so it sorts highest. Filename order
   and ledger insertion order both mean "oldest first", which for a lineage is backwards.
-- **Only a write claims the flag's action slot — plus a write we cannot rule out, plus one
-  narrow exception.** A `held` or `noop` manifest wrote nothing and generally must not defer one
+- **A write claims the flag's action slot — plus a write we cannot rule out, plus one narrow
+  non-writing exception.** ("Only a write" was the rule until round 4 and is quoted below as what
+  changed.) A `held` or `noop` manifest wrote nothing and generally must not defer one
   that can release; a second manifest that does reach the trigger is deferred **non-finally**, so
   the ledger re-checks it. A trigger that **threw** claims the slot as well, because there are
   three states and not two: `startRelease` awaits the response *after* LaunchDarkly applied the
@@ -158,5 +159,5 @@ This file, `docs/loop-seam.md` and the catch in `src/server.ts` each used to re-
 in their own words. Eleven prose corrections on this branch each fixed **three of the four copies**,
 and the missed copy was reliably the one an auditor reads first. So the copies are gone rather than
 annotated: this section is a pointer and states no part of the argument, and
-`tests/ledgerLineage.test.ts` fails if any of the three sites starts stating one again — including in
+`tests/taxonomyHome.test.ts` fails if any of the three sites starts stating one again — including in
 paraphrase, which is the hole the first version of that test left open.

@@ -156,8 +156,10 @@ export interface PatchFailureClass {
  * per-notification action slot (`server.ts`), and a claimed slot costs a sibling manifest a DELAY —
  * unless the throw is BOTH deterministic AND per-manifest, which makes the claim permanent and the
  * sibling's release lost rather than late. That is why every row below carries `recurs` and
- * `blastRadius` as well as `outcome`, and why exactly one row is allowed to be both (403 — a
- * recorded GAP, not a solved case).
+ * `blastRadius` as well as `outcome`, and why exactly one ROW of this table is allowed to be both
+ * (403 — a recorded GAP, not a solved case). Not the only such shape in Beacon: the slot claim at the
+ * patch carrying no manifest content accepts another, which is recorded in `PATCH_SITES` because it
+ * is a property of a patch rather than of a status.
  *
  * A STATUS ABSENT FROM THIS MAP KEEPS THROWING: every other 4xx and all 5xx. That is the point of
  * an allowlist. A status LaunchDarkly does not document here is one we have no basis to call a
@@ -208,10 +210,13 @@ export const PATCH_FAILURE_TAXONOMY: ReadonlyMap<number, PatchFailureClass> = ne
       // UNKNOWN, for the same reason the 400 row is — and this row was falsified by a change made one
       // row above it, in the same diff, which is this branch's signature defect arriving from a new
       // direction. It said `per-manifest`. But this status can arrive at ANY of the three patches, and
-      // `PATCH_SITES.immediate.carriesManifestContent === false` asserts that no refusal of that body
-      // can be about one manifest rather than another. A blast radius stated per STATUS cannot be right
-      // when the same status means different things at different patches; the honest per-status answer
-      // is that it depends on the site, which the site property already records.
+      // `PATCH_SITES.immediate.carriesManifestContent === false` says no refusal of THAT BODY can tell
+      // one `immediate` manifest from another (a narrower claim than "about one manifest": a sibling
+      // using a different method sends a different body). Either way a blast radius stated per STATUS
+      // cannot be right when the same status reaches patches of different kinds, so `blastRadius` is
+      // meaningful only for rows that THROW — where the catch has no idea which patch it came from and
+      // the value is all it has. For a `held` row it is `unknown` by definition, and the test enforces
+      // that rather than trusting it.
       blastRadius: "unknown",
       wrote: "no",
       why:
@@ -367,8 +372,9 @@ export const PATCH_FAILURE_TAXONOMY: ReadonlyMap<number, PatchFailureClass> = ne
  * manifest — is the best available answer.
  *
  * DERIVED from `PATCH_FAILURE_TAXONOMY` rather than written twice, so the allowlist and the reasons
- * for it cannot drift apart. `tests/ledgerLineage.test.ts` pins both the derivation and the
- * membership.
+ * for it cannot drift apart. `tests/taxonomyHome.test.ts` pins both the derivation and the
+ * membership — the lint and the table's own invariants moved into that file in round 3, and four
+ * pointers went on naming `ledgerLineage.test.ts` for two rounds after they stopped being true.
  */
 export const CONTENT_REJECTION_STATUSES: ReadonlySet<number> = new Set(
   [...PATCH_FAILURE_TAXONOMY].filter(([, c]) => c.outcome === "held").map(([status]) => status),
@@ -417,7 +423,7 @@ function ldMessage(responseBody: unknown): string {
  * WHY THIS IS A VALUE AND NOT A COMMENT. Handoff §6 said flatly: "a manifest that writes nothing must
  * not take the flag's action slot", and the repo owner has NARROWED it —
  *
- *   §6 today:  a manifest that writes nothing must not take the flag's action slot.
+ *   §6 as it stood:  a manifest that writes nothing must not take the flag's action slot.
  *   Narrowed:  …except where the refusal cannot be specific to one manifest, in which case no
  *              sibling may act either.
  *
@@ -426,7 +432,9 @@ function ldMessage(responseBody: unknown): string {
  * on — "can a refusal here single out one manifest?" — is `carriesManifestContent`, and
  * `heldOnContentRefusal` DERIVES the slot claim from it. There is no way to hold-and-claim at a site
  * whose body carries manifest content, and no way to forget the claim at the site whose body does
- * not. `tests/taxonomyHome.test.ts` pins that exactly one site is in each state.
+ * not. `tests/taxonomyHome.test.ts` pins the split exactly: ONE site carries no manifest content and
+ * TWO do. ("One in each state" was the earlier wording and is arithmetically wrong for three sites
+ * and two states — it also read as though the exception were half the surface rather than a third.)
  */
 export interface PatchSite {
   readonly id: "prerequisites" | "immediate" | "release-start";
@@ -474,7 +482,8 @@ export interface PatchSite {
  * one's: "every sibling would be refused identically" (a staged sibling sends no fallthrough
  * instruction, so a refusal of a direct fallthrough change need not reach it) and "no reachable loss on
  * the sibling's side" (the paragraph above is that loss). The narrowing survives them; the reasoning
- * for it is now the asymmetry of the two failures, not the absence of one.
+ * for it is the asymmetry of RECOVERABILITY — a deferred sibling releases when a human fixes the flag,
+ * a rollout backwards is undone by nothing — not the absence of a loss.
  *
  * So: `held` (non-final, re-checked next deploy, operator told where to look) AND the slot claimed.
  */
@@ -956,9 +965,10 @@ export async function triggerRelease(
   // gave it `held`, and `held` freed the slot — so the reproduction in `PATCH_SITES` became live: the
   // refused `immediate` manifest holds, its sibling's idempotency read sees nothing running, and an
   // OLDER variation rolls out to production. "Nothing was written" was true and the inference drawn
-  // from it was not. §6's protection is not needed here (no refusal of this body can single out one
-  // manifest) and the rollout it permits is unrecoverable, so the owner narrowed §6 for exactly this
-  // case. The narrowing lives in `PatchSite.carriesManifestContent`, which
+  // from it was not. §6's protection is still WANTED here — the loss it guards against is reachable,
+  // and `PATCH_SITES` records it as an accepted gap — but the rollout a free slot permits is
+  // unrecoverable while a deferred sibling is not, so the owner narrowed §6 for exactly this case on
+  // that asymmetry. The narrowing lives in `PatchSite.carriesManifestContent`, which
   // `heldOnContentRefusal` reads — not in this comment, so that it cannot be lost by editing prose.
   if (method === "immediate") {
     try {
@@ -979,11 +989,24 @@ export async function triggerRelease(
         "this manifest's immediate release instruction",
         `none of the VALUES in that instruction came from the manifest — it turns '${flag.flagKey}' on ` +
           `in '${environmentKey}' and points its fallthrough at a variation id LaunchDarkly itself ` +
-          `reported — so look at the FLAG and the ENVIRONMENT first. But ONE field of this file chose ` +
-          `this instruction: releasePlan.releaseMethod "immediate" is what asks for a direct ` +
-          `fallthrough change instead of a staged release. If LaunchDarkly is refusing that shape of ` +
-          `change specifically, dropping "immediate" so the release goes out as a staged rollout is the ` +
-          `fix, and it is the one this file's author controls.`,
+          `reported — so look at the FLAG and the ENVIRONMENT first. ` +
+          // WHO ASKED FOR THIS SHAPE OF PATCH IS NOT ALWAYS THIS FILE, and a previous version of this
+          // note asserted that it was. `method` resolves as `ov.releaseMethod ?? policy.releaseMethod
+          // ?? inferred`, and `normalizeMethod` maps any policy value containing "immediate" to
+          // `immediate` — so a manifest with no `releasePlan` at all reaches this patch on the
+          // strength of the FLAG's release policy, and telling that author to drop a field they never
+          // wrote sends them looking for something that does not exist. `ov` is
+          // `releasePlan ?? releaseOverrides`, so the legacy key is covered by reading `ov` rather
+          // than naming `releasePlan`.
+          (ov.releaseMethod === "immediate"
+            ? `One field of this file did choose this instruction, though: releaseMethod "immediate" ` +
+              `asks for a direct fallthrough change instead of a staged release. If LaunchDarkly is ` +
+              `refusing that shape of change specifically, dropping it so the release goes out as a ` +
+              `staged rollout is a fix this file's author controls.`
+            : `Note this manifest did NOT ask for an immediate release: the FLAG'S RELEASE POLICY in ` +
+              `LaunchDarkly selected that shape (a manifest releaseMethod would have overridden it, ` +
+              `and there is none here). So the shape is not this file's to change — the policy is ` +
+              `where to change it.`),
       );
     }
     return { flagKey: flag.flagKey, method, ...(policyNote ? { note: policyNote } : {}) };

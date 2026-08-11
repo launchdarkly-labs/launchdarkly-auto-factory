@@ -445,6 +445,10 @@ describe("write_manifest: releasePlan.stages is the rollout LaunchDarkly will be
       stages: [{ allocation: 100000, durationMillis: 300000 }, { allocation: 50000, durationMillis: 300000 }],
     });
     assert.equal(r.isError, true, r.content);
+    // NOTE FOR ANYONE CITING THIS AS THE AUTHORING-TIME REMEDY: this message only appears when
+    // `stages` is present AND invalid. A stage-free `immediate` manifest never sees it, so "the remedy
+    // `sandboxTools` already teaches" is true only for the stage-carrying case — which is why the
+    // operator note in `trigger.ts` states the remedy itself rather than delegating to this one.
     assert.match(r.content, /IGNORES stages entirely/, "THE DISCRIMINATOR: ignored, not inherited");
     assert.match(r.content, /never reads a stage set/, "and why");
     assert.doesNotMatch(r.content, /inherits the policy/, "so no inheritance is promised");

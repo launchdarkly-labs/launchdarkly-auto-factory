@@ -41,17 +41,19 @@ describe("the taxonomy has exactly one home", () => {
       const row = PATCH_FAILURE_TAXONOMY.get(status);
       assert.equal(row?.wrote, "no", `a held status must PROVE nothing was written (${status})`);
       // AND A HELD ROW'S BLAST RADIUS MUST BE `unknown`, which nothing checked until one of them
-      // drifted. The classifier is status-only, so the SAME status can arrive at any of the three
-      // patches `triggerRelease` sends — and `PATCH_SITES` asserts that one of those bodies contains
-      // no manifest values at all. A per-status radius therefore cannot be stated for a held row: the
-      // honest answer depends on the site, which the site property already records. One row said
-      // `per-manifest` for a whole round after the row above it had been corrected for exactly this,
-      // because the invariant below reads `blastRadius` only on `throws` rows.
+      // drifted. `blastRadius` is MEANINGFUL ONLY FOR ROWS THAT THROW: that is where the catch in
+      // `server.ts` has to decide what claiming the slot costs, with nothing to go on but the status.
+      // A `held` row never reaches that decision, and the same status can arrive at any of the three
+      // patches — one of which carries no manifest values at all — so there is no per-status answer to
+      // give. One row said `per-manifest` for a whole round after the row above it was corrected for
+      // exactly this, because the invariant below reads `blastRadius` only on `throws` rows. Defining
+      // the field as "throwing rows only" and pinning `unknown` elsewhere is cheaper than leaving a
+      // field that means nothing where nobody looks.
       assert.equal(
         row?.blastRadius,
         "unknown",
-        `${status} is held, so it can arrive at any patch — including the one whose body carries no ` +
-          `manifest values. Its blast radius is a property of the SITE, not of the status.`,
+        `${status} is held, so it never reaches the decision blastRadius exists for. The field is ` +
+          `defined only for throwing rows; anything else here is a claim nothing checks.`,
       );
     }
   });
@@ -87,7 +89,14 @@ describe("the taxonomy has exactly one home", () => {
     const starving = [...PATCH_FAILURE_TAXONOMY]
       .filter(([, c]) => c.outcome === "throws" && c.recurs === "deterministic" && c.blastRadius === "per-manifest")
       .map(([status]) => status);
-    assert.deepEqual(starving, [403], "THE DISCRIMINATOR: exactly one known starving shape, and it is written down");
+    assert.deepEqual(
+      starving,
+      [403],
+      "THE DISCRIMINATOR: among THROWING rows, exactly one has this shape and it is written down. Not " +
+        "the only such shape in Beacon — the slot claim at the patch carrying no manifest content " +
+        "accepts a second one, recorded in PATCH_SITES — which is why this message says 'among " +
+        "throwing rows' where it used to say 'exactly one'.",
+    );
     const row = PATCH_FAILURE_TAXONOMY.get(403);
     assert.match(String(row?.why), /GAP/, "and the row says it is a gap");
     assert.match(String(row?.why), /updatePrerequisites/, "naming the role action that makes it reachable");
@@ -113,8 +122,8 @@ describe("the taxonomy has exactly one home", () => {
     //
     // The behavioural arms are in `ledgerLineage.test.ts`: the divergent-target `immediate` test for
     // the exception, and the refused release-start and prerequisites tests for the rule. This one pins
-    // the SHAPE — that exactly one patch is in each state, so a second exception cannot be added
-    // without a test failing and a reviewer asking whose decision it was.
+    // the SHAPE — one patch carrying no manifest content and two carrying it, so a second exception
+    // cannot be added without a test failing and a reviewer asking whose decision it was.
     const sites = Object.values(PATCH_SITES);
     assert.equal(sites.length, 3, "three patches, which was itself a drifting count once");
     assert.deepEqual(
@@ -249,6 +258,13 @@ describe("the taxonomy has exactly one home", () => {
     // vocabulary with no other use here at all; those fire wherever they appear, which is what makes a
     // paste detectable after its numerals have been edited away. Checked across every file in scope:
     // none of the four ungated phrases occurs outside the home.
+    //
+    // TWO OF THE UNGATED ONES ARE TUNING RISKS, recorded now rather than discovered as a surprise.
+    // `patch site` is ordinary English and `role action` is LaunchDarkly's own RBAC vocabulary, so an
+    // honest future comment — "this patch site sends two instructions", "the `updateFallthrough` role
+    // action" — will fail with an accusation that is simply wrong. That is the misfire class this file
+    // warns gets a lint deleted. The right response then is to GATE the term, not to delete the check:
+    // gating costs the paste-detection this split was added for, and deleting costs everything.
     const terms: Array<{ term: RegExp; what: string; gated: boolean }> = [
       { term: /per-manifest/i, what: "how wide a refusal is — a `blastRadius` value", gated: true },
       { term: /starv/i, what: "what a permanent slot claim costs — the `blastRadius` consequence", gated: true },
@@ -301,14 +317,22 @@ describe("the taxonomy has exactly one home", () => {
     // Every name LaunchDarkly's error table gives these statuses, because a name is a restatement as
     // much as a numeral is. The first version listed only the descriptive phrases and omitted the
     // canonical HTTP reason phrases entirely.
-    // `not found` WAS HERE AND IS NOT ANY MORE. It is ordinary English, and it fired on
-    // "if the manifest file is not found in the repo at that sha, its content is dropped from the
-    // ledger and nothing is held open for it" — accurate, innocent prose about discovery, accused of
-    // restating LaunchDarkly's taxonomy. That is precisely the misfire this test warns about two
-    // paragraphs up, so the term is gone; the same status's descriptive name
-    // (`invalid resource identifier`) still covers it, and `method not allowed` covers its neighbour.
+    // `not found` IS BACK, and the reason it was dropped is worth recording because the mistake was
+    // about EVIDENCE. Round 5 removed it citing a misfire on "if the manifest file is not found in the
+    // repo at that sha, its content is dropped from the ledger and nothing is held open for it" — but
+    // that sentence exists nowhere in this repo. It came from a reviewer's probe, which had APPENDED it
+    // to the README to see whether the check would fire. Recording an experiment as an observed event,
+    // and then weakening a guard for it, is the same class of error as the prose drift this whole file
+    // exists to stop.
+    //
+    // The hypothetical risk is real but already handled: the ±120-character window means the phrase
+    // only counts when a verdict sits beside it, and the probe sentence only fired because "content"
+    // and "held" happened to be in the same clause. Against that, a drifted paraphrase is far likelier
+    // to write "not found" than LaunchDarkly's formal "invalid resource identifier", so this is the
+    // entry most likely to catch one. If it ever misfires on prose that is actually in the repo, that
+    // is the moment to reconsider — prospectively, not retrospectively.
     const NAMES =
-      /rate[- ]limit|too many requests|status conflict|concurrent[- ](api )?request|approval is required|approvals?[- ]required|required approvals|method not allowed|invalid resource identifier|forbidden|invalid access token|unauthori[sz]ed|unprocessable|request timeout|invalid request body|bad request/i;
+      /rate[- ]limit|too many requests|status conflict|concurrent[- ](api )?request|approval is required|approvals?[- ]required|required approvals|method not allowed|invalid resource identifier|not found|forbidden|invalid access token|unauthori[sz]ed|unprocessable|request timeout|invalid request body|bad request/i;
     // A status NAME is only a taxonomy claim when it is being CLASSIFIED. "GitHub rate limit" in the
     // readiness check and "rate limiting and outages" in the idempotency guard are neither, so this
     // asks whether a name and a verdict about it are NEAR EACH OTHER.
