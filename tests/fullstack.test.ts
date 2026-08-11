@@ -38,6 +38,7 @@ function cfgWith(frontendStatusUrl: string): BeaconConfig {
     ldEnvironmentKey: "production",
     releaseFlagsDir: ".release-flags/",
     stateFile: "unused.json",
+    pendingFile: "unused-pending.json",
     services: {
       "demo-backend": {
         side: "backend",
@@ -154,6 +155,7 @@ function togglemartCfg(gatewayStatusUrl: string): BeaconConfig {
     ldEnvironmentKey: "production",
     releaseFlagsDir: ".release-flags/",
     stateFile: "unused.json",
+    pendingFile: "unused-pending.json",
     services: {
       "togglemart-frontend": {
         side: "frontend",

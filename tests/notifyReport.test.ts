@@ -12,8 +12,10 @@ import { describeNotifyResult, FINAL_ACTIONS, NON_FINAL_ACTIONS } from "@auto-fa
 //     console.warn beside a green deploy.
 //  2. The larger one, unrelated to failures: Beacon ACKS a notification and reports
 //     per-flag outcomes in the body, so `held`/`waiting`/`error` arrive inside a 200.
-//     Nothing in the shipped configuration retries any of them (the Notifier exits 0;
-//     Railway documents no webhook retry), so those flags strand silently.
+//     Nothing REDELIVERS the notification (the Notifier exits 0; Railway documents no
+//     webhook retry). The ledger (pending.ts) re-checks unfinished flags on the next
+//     deploy, so they are no longer permanent — but nothing happens before then, and a
+//     flag marked needsHuman is never retried at all.
 //
 // The exit code stays 0. What changes is that a human is told.
 // ---------------------------------------------------------------------------
@@ -39,7 +41,8 @@ describe("describeNotifyResult", () => {
     assert.match(text, /enable-two: held/);
     assert.match(text, /enable-three: error/);
     assert.doesNotMatch(text, /enable-one/, "a released flag is not noise for the operator");
-    assert.match(text, /nothing will retry them/);
+    assert.match(text, /re-check them on the\s+next deploy/);
+    assert.match(text, /nothing happens before then/);
   });
 
   it("names the recovery, including why previousSha is needed", () => {
@@ -74,11 +77,12 @@ describe("describeNotifyResult", () => {
     assert.ok(r.lines.length > 0, "silence is indistinguishable from a lost deploy");
   });
 
-  it("a 5xx says plainly that nothing retries it", () => {
+  it("a 5xx says the notification is not redelivered, but the ledger will re-check", () => {
     const r = describeNotifyResult({ ...BASE, status: 503, body: body([{ flag: "f", action: "error" }]) });
     assert.equal(r.attention, true);
     const text = r.lines.join("\n");
-    assert.match(text, /NOTHING RETRIES THIS AUTOMATICALLY/);
+    assert.match(text, /NOT REDELIVERED/);
+    assert.match(text, /re-checks them on the NEXT deploy/);
     assert.match(text, /curl/, "a 5xx is worth retrying, so state how");
   });
 

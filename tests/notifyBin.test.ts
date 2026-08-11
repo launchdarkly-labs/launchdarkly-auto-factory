@@ -84,7 +84,8 @@ describe("auto-factory-notify (the bin)", () => {
     const r = await runNotify(url);
     assert.equal(r.code, 0, "even a Beacon outage must not fail the deploy");
     assert.match(r.stderr, /ACTION REQUIRED/);
-    assert.match(r.stderr, /NOTHING RETRIES THIS AUTOMATICALLY/);
+    assert.match(r.stderr, /NOT REDELIVERED/);
+    assert.match(r.stderr, /re-checks them on the NEXT deploy/);
   });
 
   it("an unreachable Beacon is reported loudly and still exits 0", async () => {

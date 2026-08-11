@@ -53,7 +53,8 @@ Everything Phase 1 (the graph walk) hands to Phase 2 (Beacon) is one file. Verif
 │        ▼                                                                      │
 │   monitorRelease (24h) → completed │ reverted │ ⟨paused?⟩                      │
 │                                                                               │
-│   ✘ NO RESUME: one shot per manifest.                                          │
+│   ✔ LEDGER (pending.ts): unfinished flags re-checked on ANY later deploy        │
+│     — webhook-gated, so nothing happens until some deploy arrives               │
 └───────────────────────────────────────────────────────────────────────────────┘
 
         ╳  NO FEEDBACK EDGE — nothing goes from Phase 2 back to Phase 1
@@ -88,39 +89,36 @@ is already contained: LaunchDarkly reverted the flag, users are on the known-goo
 and a human sees a red release. That is the guarded-rollout value proposition working. Closing
 this gap buys *faster remediation*, not safety.
 
-## Gap 2 — Beacon cannot finish its own work
+## Gap 2 — Beacon could not finish its own work (now largely closed)
 
-Nothing to do with the graph. Beacon acts only on webhooks and decides what to act on by
-diffing filenames, so a manifest gets exactly one evaluation. Any outcome that is not final at
-that moment never gets another.
+Nothing to do with the graph. Beacon acts only on webhooks and decided what to act on by
+diffing filenames, so a manifest got exactly one evaluation and any non-final outcome never got
+another. The **re-evaluation ledger** now gives it one: entries are re-checked on any later
+deploy, independently of discovery.
 
-| Outcome | Why it isn't final | Recovery today |
+| Outcome | Why it isn't final | Recovery now |
 |---|---|---|
-| `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | manual re-POST |
-| `waiting` | the fullstack counterpart **definitively** hasn't deployed — the readiness check is tri-state, so this is now a real verdict rather than a shrug | the other side's deploy notification re-evaluates; if lost, manual re-POST |
-| `error`, idempotency guard unverifiable | the read that would prove no release is running failed | 503 — but see below: **no automatic retry exists**, so manual re-POST |
-| `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | manual re-POST — but it is now *diagnosed* as unverified instead of reported as "not deployed" |
-| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | manual re-POST |
-| paused release resumed late | monitoring stopped at the deadline | manual re-POST → `noop` → children repointed |
-| release completed after the window | same | same |
+| `held` | intent said hold/manual, a future `notBefore`, or segments recorded-not-executed | **ledger re-checks on any later deploy**, re-reading the manifest at the current SHA — so a human's fix takes effect. Re-POST to retry sooner |
+| `waiting` | the fullstack counterpart **definitively** hasn't deployed — the readiness check is tri-state, so this is a real verdict rather than a shrug | the counterpart's own deploy releases it; if that notification is lost, **the ledger catches it** on any later deploy |
+| `error`, idempotency guard unverifiable | the read that would prove no release is running failed | 503 (a refusal, not a retry — nothing redelivers it) **plus a ledger entry**, so the next deploy re-checks |
+| `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | **ledger**, and it is *diagnosed* as unverified rather than reported as "not deployed" |
+| `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **ledger**, guarded by the terminal-status check below |
+| release completed while unwatched (paused-then-resumed, or after the 24h window) | monitoring stopped at its deadline | **ledger notices the `completed` status and repoints the children** — previously reachable only by a re-POST inside the two-deep window |
+| newest release was **reverted** | a guardrail rolled it back | **never re-tried.** Marked `needsHuman`, reported on every deploy. Re-releasing would undo the rollback |
 
-**Recovery is manual, not impossible** — an earlier revision of this doc said "none" for the
-last two rows and was wrong. `repointDependentPrerequisites` runs on a `noop` result
-(`server.ts:200-202`), and `noop` — the environment already serves the target variation — is
-exactly what an externally-completed release looks like. So a re-POST that rediscovers the
-manifest does repoint the children. It also re-reads the manifest **at the current SHA**, so a
-human's edit to fix a `held` release does take effect on re-POST.
+**What is still not closed:** the ledger is webhook-gated, so a `notBefore` date passing does
+nothing until some deploy arrives, and a project that stops deploying stops re-checking. That
+is the timer decision, deferred.
 
-What makes recovery manual-only is that nothing *organic* re-surfaces the manifest: discovery
-is a filename diff, so a file present at both SHAs is never rediscovered, and two-deep history
-(`{ last, prior }`) closes the state-resolved range once another deploy lands. But an explicit
-`previousSha` on the request wins over the store (`state.ts:49`) and reopens any range
-indefinitely. The gap is that this requires a human who knows to do it, and the two 200-acked
-paths above mean nobody is told that they should.
+Manual re-POST still works and is faster: an explicit `previousSha` wins over the store
+(`state.ts:49`) and reopens any range indefinitely. Two revisions of this doc got this wrong in
+opposite directions — first claiming recovery was impossible, then claiming a manifest fix was
+a no-op. Both were about discovery, which genuinely cannot re-surface a file present at both
+SHAs; the ledger is a separate path that does not use discovery at all.
 
-### There is no automatic retry anywhere in Phase 2
+### Redelivery retries nothing — the ledger does
 
-This was checked, and it is the single most important fact on this page. Two paths *answer*
+This was checked, and it is why the ledger exists. Two paths *answer*
 retriably — the idempotency-guard **503**, and a **502 on discovery failure** which does not
 record the SHA so a later notification re-diffs the same range. Neither is retried by anything:
 
@@ -171,11 +169,29 @@ the one this branch made worse, correctly: refusing free-form dates puts more ma
 `held`, and the fail-closed idempotency guard turns a silent double-start into a skip that
 needs redelivery. Every fail-closed improvement adds to a pile that recovers badly.
 
-The fix is a **persisted re-evaluation ledger**: an entry per non-final outcome keyed by
-`(service, environment, flagKey)`, re-evaluated on any webhook *independently of discovery*,
-cleared on a final outcome. What it buys is not the retry mechanism — re-POST already is one —
-but that **no human has to know to invoke it.** Both recoveries above exist and both require
-someone to notice; the ledger is what notices.
+**SHIPPED** (`packages/beacon/src/pending.ts`): a persisted re-evaluation ledger. An entry per
+non-final outcome keyed by `(service, environment, flagKey)`, re-evaluated on any webhook
+*independently of discovery*, cleared on a final outcome. What it buys is not the retry
+mechanism — re-POST already was one — but that **no human has to know to invoke it.**
+
+Two properties matter more than the retry:
+
+- re-evaluation **re-reads the manifest at the current SHA**, so a human's fix to a bad
+  `releaseIntent` takes effect. That used to be a no-op: the file existed at both SHAs, so
+  discovery never looked at it again.
+- a release that **finished while nobody was watching** is noticed, so its dependent child
+  flags get repointed — previously reachable only by a re-POST inside the two-deep window.
+
+The guard that makes it safe to automate: re-evaluation is a WRITE path, and
+`findActiveRelease` excludes terminal statuses, so on its own it would read "nothing running"
+for a release LaunchDarkly already REVERTED and start a second rollout of the variation the
+guardrail just rolled back. So re-evaluation consults `findLatestRelease` first: `completed`
+→ repoint children and clear; `reverted`/`monitoring_stopped` → mark `needsHuman`, report on
+every deploy, never re-trigger; unreadable history → fail closed and stay pending.
+
+**Still WEBHOOK-GATED, deliberately.** Nothing fires on a timer, so a `notBefore` date passing
+causes nothing until some deploy arrives. Closing that would make Beacon a scheduler, against
+its stated design as a translator to LaunchDarkly primitives — deferred as its own decision.
 
 One round-seven defect belonged here rather than to the architecture and is **fixed**: the
 fullstack readiness check no longer fails open, because it is now tri-state (`fullstack.ts`) —

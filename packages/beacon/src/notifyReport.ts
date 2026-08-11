@@ -91,8 +91,10 @@ export function describeNotifyResult(input: {
     // Classify, because the recovery differs and neither fixes itself.
     const kind =
       status >= 500
-        ? `Beacon could not complete the work (HTTP ${status}). NOTHING RETRIES THIS AUTOMATICALLY:` +
-          ` the Notifier cannot fail a deploy, and neither the Notifier nor Railway redelivers.`
+        ? `Beacon could not complete the work (HTTP ${status}). THIS NOTIFICATION IS NOT REDELIVERED:` +
+          ` the Notifier cannot fail a deploy, and Railway documents no webhook retry. Beacon records` +
+          ` unfinished flags and re-checks them on the NEXT deploy, so this is not permanent — but` +
+          ` nothing happens before then.`
         : `Beacon REJECTED the notification (HTTP ${status}) — a configuration problem, not a transient one.` +
           ` Check the service name against config/services.yaml and BEACON_WEBHOOK_SECRET.`;
     lines.push(`notify: ACTION REQUIRED — ${kind}`);
@@ -105,7 +107,8 @@ export function describeNotifyResult(input: {
   if (stranded.length > 0) {
     lines.push(
       `notify: ACTION REQUIRED — Beacon accepted the deploy (HTTP ${status}) but ` +
-        `${stranded.length} of ${all.length} flag(s) did NOT release, and nothing will retry them.`,
+        `${stranded.length} of ${all.length} flag(s) did NOT release. Beacon will re-check them on the ` +
+        `next deploy; nothing happens before then, and a flag marked needsHuman is never retried.`,
     );
     for (const o of stranded) {
       lines.push(`  ${String(o.flag)}: ${String(o.action)} — ${detailText(o.detail)}`);

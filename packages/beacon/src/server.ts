@@ -16,7 +16,16 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import { type AutomatedRelease, LdClient, findActiveRelease, targetConnection } from "@auto-factory/shared";
+import {
+  type AutomatedRelease,
+  type DiscoveredFlag,
+  type ReleaseFlagFile,
+  LdClient,
+  findActiveRelease,
+  findLatestRelease,
+  isReleaseFinished,
+  targetConnection,
+} from "@auto-factory/shared";
 import express, { type Express, type Request, type Response } from "express";
 import { type BeaconConfig, loadBeaconConfig } from "./config.js";
 import { discoverNewReleaseFlags } from "./discovery.js";
@@ -24,6 +33,7 @@ import { otherSideHasFile } from "./fullstack.js";
 import { GitHubClient } from "./github.js";
 import { dedupeMonitors, monitorSettingsFromEnv, monitorTriggeredRelease } from "./monitor.js";
 import { repointDependentPrerequisites } from "./repoint.js";
+import { FilePendingStore, recordOutcome, type PendingEntry, type PendingStore } from "./pending.js";
 import { parseRailwayWebhook } from "./railway.js";
 import { decideScope } from "./scope.js";
 import { FileDeployStateStore, resolvePreviousSha, type DeployStateStore } from "./state.js";
@@ -34,6 +44,10 @@ interface FlagOutcome {
   scope: string;
   action: "released" | "held" | "noop" | "already_running" | "skipped" | "waiting" | "error";
   detail?: unknown;
+  /** True when this outcome came from the re-evaluation ledger, not from discovery. */
+  viaLedger?: boolean;
+  /** True when re-evaluation must not proceed unattended (a reverted release). */
+  needsHuman?: boolean;
 }
 
 interface DeployNotification {
@@ -46,6 +60,8 @@ interface DeployNotification {
 export interface BeaconDeps {
   store?: DeployStateStore;
   gh?: GitHubClient;
+  /** The re-evaluation ledger (unfinished releases). Injectable for tests. */
+  pending?: PendingStore;
   /** Hook fired when a release is started (or found already running); the
    *  default monitors it to a terminal state. Injectable for tests. */
   onReleaseStarted?: (flagKey: string, environmentKey: string) => void | Promise<unknown>;
@@ -70,6 +86,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
   app.use(express.json());
   const gh = deps.gh ?? new GitHubClient(cfg.githubToken);
   const store = deps.store ?? new FileDeployStateStore(cfg.stateFile);
+  const pending = deps.pending ?? new FilePendingStore(cfg.pendingFile);
   const monitorSettings = monitorSettingsFromEnv();
   // Detached on purpose: a guarded release runs for minutes-to-days; the notification
   // response must not wait on it.
@@ -156,13 +173,24 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     // STRANDS with a 200 and a log that asks for a re-POST. A stranded release is
     // recoverable by a human; re-releasing a reverted flag is not.
     let guardUnverifiable = false;
-    for (const flag of discovered) {
+    /** flagKey → manifest path, so the ledger knows what to re-read next time. */
+    const sourceFiles = new Map<string, string>();
+
+    /**
+     * Evaluate ONE manifest, returning its outcome rather than pushing it.
+     *
+     * Returning is what lets the ledger below re-run the IDENTICAL logic instead of a
+     * second copy that drifts — the scope decision, the readiness check, the idempotency
+     * guard and the trigger are subtle enough that two copies would disagree within a
+     * release or two.
+     */
+    const processFlag = async (flag: DiscoveredFlag): Promise<FlagOutcome> => {
+      sourceFiles.set(flag.flagKey, flag.sourceFile);
       const scope = flag.scope ?? "frontend";
       const decision = decideScope(scope, service.side);
 
       if (decision === "skip") {
-        outcomes.push({ flag: flag.flagKey, scope, action: "skipped", detail: "other side handles this scope" });
-        continue;
+        return { flag: flag.flagKey, scope, action: "skipped", detail: "other side handles this scope" };
       }
       if (decision === "check_fullstack") {
         // TRI-STATE (see fullstack.ts). The classifier is kept for the DIAGNOSIS, which
@@ -185,26 +213,23 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
               `will retry it automatically: re-POST /flag-releases for this service once both sides are ` +
               `deployed. Cause: ${readiness.reason}`,
           );
-          outcomes.push({
+          return {
             flag: flag.flagKey,
             scope,
             action: "error",
-            detail: `fullstack readiness could not be VERIFIED (not a verdict on the other side) — release not started, no automatic retry; re-POST to retry: ${readiness.reason}`,
-          });
-          continue;
+            detail: `fullstack readiness could not be VERIFIED (not a verdict on the other side) — release not started; the ledger will re-check on a later deploy, or re-POST to retry now: ${readiness.reason}`,
+          };
         }
         if (readiness.state === "absent") {
-          outcomes.push({ flag: flag.flagKey, scope, action: "waiting", detail: "other service not deployed yet" });
-          // No retry queue in the prototype: a "waiting" flag is released when
-          // the OTHER service's deploy notification arrives and re-evaluates.
-          // If that notification is lost, re-POST this one (same sha/service)
-          // — the state store resolves the same previousSha range again.
+          // The other side's own deploy notification normally releases this; the ledger
+          // now also re-checks it on ANY later deploy, so a lost notification is no longer
+          // permanent. A re-POST still works and is faster.
           console.warn(
             `[beacon] WAITING: flag '${flag.flagKey}' (scope=${scope}, file=${flag.sourceFile}) — ` +
               `service '${n.service}' deployed at ${n.sha} but the other side hasn't yet. ` +
               `If its notification never arrives, re-POST /flag-releases for this service once both are deployed.`,
           );
-          continue;
+          return { flag: flag.flagKey, scope, action: "waiting", detail: "other service not deployed yet" };
         }
       }
       try {
@@ -228,18 +253,16 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
               `NOTHING RETRIES THAT AUTOMATICALLY (the Notifier logs and exits 0; Railway documents no retry): ` +
               `re-POST /flag-releases for this service to retry. Cause: ${String(e)}`,
           );
-          outcomes.push({
+          return {
             flag: flag.flagKey,
             scope,
             action: "error",
-            detail: `idempotency check failed — release NOT started (answered 503; nothing retries this automatically, re-POST to retry): ${String(e)}`,
-          });
-          continue;
+            detail: `idempotency check failed — release NOT started (answered 503; the ledger will re-check on a later deploy, or re-POST to retry now): ${String(e)}`,
+          };
         }
         if (active) {
-          outcomes.push({ flag: flag.flagKey, scope, action: "already_running", detail: { releaseId: active.id } });
           onReleaseStarted(flag.flagKey, n.environment); // re-attach monitoring (e.g. after a Beacon restart)
-          continue;
+          return { flag: flag.flagKey, scope, action: "already_running", detail: { releaseId: active.id } };
         }
         const result = await triggerRelease(ld, flag, n.environment);
         // Only staged rollouts get release monitoring: "held"/"noop" started
@@ -256,21 +279,19 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // resumed by a human, finished after monitoring stopped). Repointing here is the
         // only moment that external completion is visible to Beacon.
         //
-        // PARTIAL by construction, and worth being honest about: discovery is a manifest
-        // DIFF between two SHAs, so a flag whose manifest exists at both is never
-        // rediscovered and never reaches this code. This helps a re-POST of the same sha
-        // range and nothing else; closing the gap needs a ledger of releases we stopped
-        // watching, checked independently of discovery (deferred — see
-        // docs/release-policy-metrics.md). Idempotent: already-pointed children are skipped.
+        // No longer partial in the way it was: discovery is a manifest DIFF, so a flag whose
+        // manifest exists at both SHAs is never rediscovered — but the ledger below now
+        // re-checks unfinished flags independently of discovery, which is what reaches an
+        // externally-completed release. Idempotent: already-pointed children are skipped.
         if (result.method === "immediate" || result.method === "noop") {
           await repointDependentPrerequisites(ld, flag.flagKey, n.environment);
         }
-        outcomes.push({
+        return {
           flag: flag.flagKey,
           scope,
           action: result.method === "held" ? "held" : result.method === "noop" ? "noop" : "released",
           detail: result,
-        });
+        };
       } catch (e) {
         // ACKS 200, and this STRANDS the flag. Deliberate, and the reverse of the guard
         // above — the asymmetry is the point.
@@ -286,17 +307,153 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // Stranding is the lesser failure: a human re-POST recovers it, and the log below
         // asks for one. Undoing a guardrail's rollback unattended does not recover.
         console.warn(
-          `[beacon] release trigger ERROR for '${flag.flagKey}' — release NOT started, and nothing will retry ` +
-            `it automatically; re-POST /flag-releases for this service to retry: ${String(e)}`,
+          `[beacon] release trigger ERROR for '${flag.flagKey}' — release NOT started. The ledger will re-check ` +
+            `it on a later deploy; re-POST /flag-releases to retry now: ${String(e)}`,
         );
-        outcomes.push({
+        return {
           flag: flag.flagKey,
           scope,
           action: "error",
-          detail: `release trigger failed — not started, no automatic retry; re-POST to retry: ${String(e)}`,
-        });
+          detail: `release trigger failed — not started; ledger will re-check on a later deploy, or re-POST to retry now: ${String(e)}`,
+        };
       }
+    };
+
+    /**
+     * Re-evaluate one LEDGER entry: a flag whose release was left unfinished by an earlier
+     * deploy. Discovery cannot surface it (its manifest exists at both SHAs), so this is the
+     * only path that reaches it.
+     */
+    const reEvaluate = async (entry: PendingEntry): Promise<FlagOutcome> => {
+      const tag = `${entry.flagKey} (pending since ${entry.firstSeenSha.slice(0, 8)}, attempt ${entry.attempts + 1})`;
+      sourceFiles.set(entry.flagKey, entry.sourceFile);
+
+      if (entry.needsHuman) {
+        // Reported every time, never retried: see the terminal-status branch below.
+        return {
+          flag: entry.flagKey,
+          scope: "ledger",
+          action: "error",
+          viaLedger: true,
+          needsHuman: true,
+          detail: `NEEDS A HUMAN, not retried: ${entry.lastDetail ?? "(no detail)"}`,
+        };
+      }
+
+      // Re-read the manifest AT THE CURRENT SHA. This is the property that makes a human's
+      // fix take effect — editing a bad `releaseIntent` used to be a no-op, because the file
+      // existed at both SHAs and discovery never looked at it again.
+      let parsed: ReleaseFlagFile | null;
+      try {
+        parsed = await gh.getFileJson<ReleaseFlagFile>(service.repo, entry.sourceFile, n.sha);
+      } catch (e) {
+        return {
+          flag: entry.flagKey,
+          scope: "ledger",
+          action: "error",
+          viaLedger: true,
+          detail: `could not re-read ${entry.sourceFile} at ${n.sha} — still pending: ${String(e)}`,
+        };
+      }
+      if (!parsed?.flagKey) {
+        // The manifest is gone (or no longer a release manifest): the release was withdrawn,
+        // so stop tracking it. `skipped` is final, so recordOutcome clears the entry.
+        console.log(`[beacon] ledger: ${tag} — manifest absent at ${n.sha}, no longer pending`);
+        return {
+          flag: entry.flagKey,
+          scope: "ledger",
+          action: "skipped",
+          viaLedger: true,
+          detail: `manifest ${entry.sourceFile} is absent at ${n.sha} — release withdrawn, dropped from the ledger`,
+        };
+      }
+
+      // THE GUARD THAT MAKES THIS SAFE TO AUTOMATE. Re-evaluation is a write path, and
+      // `findActiveRelease` (inside processFlag) excludes TERMINAL statuses — so on its own it
+      // would answer "nothing running" for a release LaunchDarkly already REVERTED, and
+      // triggerRelease would start a second rollout of the variation the guardrail just rolled
+      // back. Manual re-POST had the same hazard; the ledger would have made it automatic.
+      let latest: AutomatedRelease | null;
+      try {
+        latest = await findLatestRelease(ld, entry.flagKey, n.environment);
+      } catch (e) {
+        // Fail closed: no terminal history means no permission to trigger.
+        return {
+          flag: entry.flagKey,
+          scope: "ledger",
+          action: "error",
+          viaLedger: true,
+          detail: `could not read release history — NOT re-triggering, still pending: ${String(e)}`,
+        };
+      }
+      if (latest && isReleaseFinished(latest.status)) {
+        if (latest.status === "completed") {
+          // Finished while nobody watched. This is the observation the ledger exists for:
+          // repoint the children that were pinned to the previous variation.
+          console.log(`[beacon] ledger: ${tag} — release ${latest.id} COMPLETED while unwatched; repointing children`);
+          await repointDependentPrerequisites(ld, entry.flagKey, n.environment);
+          return {
+            flag: entry.flagKey,
+            scope: "ledger",
+            action: "noop",
+            viaLedger: true,
+            detail: `release ${latest.id} completed while unwatched — dependent flags repointed, no longer pending`,
+          };
+        }
+        console.warn(
+          `[beacon] ledger: ${tag} — newest release ${latest.id} is '${latest.status}'. NOT re-triggering: a ` +
+            `reverted release means a guardrail rolled it back, and re-releasing would undo that. A human must ` +
+            `decide (fix the regression and deploy again, which starts a fresh release).`,
+        );
+        return {
+          flag: entry.flagKey,
+          scope: "ledger",
+          action: "error",
+          viaLedger: true,
+          needsHuman: true,
+          detail: `newest release is '${latest.status}' — NOT re-triggered (that would undo a guardrail rollback); needs a human`,
+        };
+      }
+
+      console.log(`[beacon] ledger: re-evaluating ${tag}`);
+      const outcome = await processFlag({ ...parsed, sourceFile: entry.sourceFile });
+      return { ...outcome, viaLedger: true };
+    };
+
+    for (const flag of discovered) {
+      outcomes.push(await processFlag(flag));
     }
+
+    // The ledger pass: unfinished work from EARLIER deploys, re-checked on this one. Skips
+    // anything discovery already handled this round, so a flag is evaluated at most once.
+    const handledThisRound = new Set(discovered.map((f) => f.flagKey));
+    const pendingEntries = pending.list(n.service, n.environment).filter((e) => !handledThisRound.has(e.flagKey));
+    if (pendingEntries.length > 0) {
+      console.log(
+        `[beacon] ledger: ${pendingEntries.length} unfinished flag(s) from earlier deploys → ` +
+          pendingEntries.map((e) => `${e.flagKey}=${e.lastAction}`).join(", "),
+      );
+    }
+    for (const entry of pendingEntries) {
+      outcomes.push(await reEvaluate(entry));
+    }
+
+    // Fold every outcome back into the ledger: remember what is unfinished, forget what is
+    // done. Runs for discovery outcomes too, so a flag that finally releases stops being
+    // tracked — and one that has just become unfinished starts being.
+    for (const o of outcomes) {
+      recordOutcome(pending, {
+        service: n.service,
+        environment: n.environment,
+        sha: n.sha,
+        flagKey: o.flag,
+        sourceFile: sourceFiles.get(o.flag) ?? "",
+        action: o.action,
+        ...(o.detail !== undefined ? { detail: typeof o.detail === "string" ? o.detail : JSON.stringify(o.detail) } : {}),
+        ...(o.needsHuman ? { needsHuman: true } : {}),
+      });
+    }
+
     if (outcomes.length) {
       console.log(`[beacon] outcomes: ${outcomes.map((o) => `${o.flag}=${o.action}`).join(", ")}`);
     }

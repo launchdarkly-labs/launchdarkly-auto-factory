@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { after, describe, it } from "node:test";
 
-import { MemoryDeployStateStore, createApp, type BeaconConfig, type GitHubClient } from "@auto-factory/beacon";
+import { MemoryDeployStateStore, MemoryPendingStore, createApp, type BeaconConfig, type GitHubClient } from "@auto-factory/beacon";
 import type { LdClient } from "@auto-factory/shared";
 
 const SECRET = "s3cret";
@@ -13,6 +13,7 @@ const cfg: BeaconConfig = {
   ldEnvironmentKey: "production",
   releaseFlagsDir: ".release-flags/",
   stateFile: "unused-by-tests.json",
+  pendingFile: "unused-pending-by-tests.json",
   services: {
     "demo-backend": {
       side: "backend",
@@ -98,6 +99,7 @@ function startHarness(
   const listDirRefs: string[] = [];
   const app = createApp(cfg, fakeLd(activeReleases, patches, ldOpts), {
     store: new MemoryDeployStateStore(),
+    pending: new MemoryPendingStore(),
     gh: fakeGh(listDirRefs),
     onReleaseStarted: (flagKey) => {
       monitored.push(flagKey);
@@ -285,6 +287,7 @@ describe("beacon: fullstack readiness check failure", () => {
     } as unknown as GitHubClient;
     const app = createApp(fullCfg, fakeLd({}, patches), {
       store: new MemoryDeployStateStore(),
+      pending: new MemoryPendingStore(),
       gh,
       onReleaseStarted: (flagKey) => {
       monitored.push(flagKey);
@@ -336,7 +339,10 @@ describe("beacon: fullstack readiness check failure", () => {
     // LaunchDarkly already reverted (round eight, F1), which is worse than a strand a
     // human can fix. The detail must therefore not promise an automatic retry.
     assert.equal(res.status, 200);
-    assert.match(String(outcome.detail), /no automatic retry/);
+    // The ledger re-checks it on a later deploy; the message must say so rather than
+    // claiming nothing will ever retry (it used to, correctly, before the ledger existed).
+    assert.match(String(outcome.detail), /ledger will re-check/);
+    assert.match(String(outcome.detail), /re-POST to retry now/);
     assert.deepEqual(h.patches, [], "no release started on an unverified readiness");
   });
 
@@ -423,8 +429,8 @@ describe("beacon: release trigger failure", () => {
     const outcome = res.json.outcomes[0];
     assert.equal(outcome.action, "error");
     assert.match(String(outcome.detail), /HTTP 502/, "the cause must survive into the outcome");
-    assert.match(String(outcome.detail), /no automatic retry/);
-    assert.match(String(outcome.detail), /re-POST/, "the recovery action must be stated");
+    assert.match(String(outcome.detail), /ledger will re-check/);
+    assert.match(String(outcome.detail), /re-POST to retry now/, "the faster recovery must be stated");
     assert.deepEqual(h.monitored, [], "nothing handed to the monitor for a failed trigger");
   });
 
@@ -463,6 +469,7 @@ describe("beacon: release monitors are deduped per flag/environment", () => {
     // IN FLIGHT, so the injected attach must not settle until we say so.
     const app = createApp(cfg, fakeLd({ "enable-one": "rel-9" }, []), {
       store: new MemoryDeployStateStore(),
+      pending: new MemoryPendingStore(),
       gh: fakeGh([]),
       onReleaseStarted: async (flagKey, environmentKey) => {
         attaches.push(`${flagKey}/${environmentKey}`);

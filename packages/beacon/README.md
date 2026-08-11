@@ -113,10 +113,20 @@ other service's deploy notification to re-evaluate.
 > re-POST `/flag-releases` for the service (same `sha`/`service`) to re-run discovery
 > and release the now-ready flag — the state store re-resolves the same diff range.
 
-> **Nothing retries automatically — alert on `notify: ACTION REQUIRED`.** There is no
-> automatic retry anywhere in Phase 2: the Notifier is non-blocking by contract (a
-> non-2xx is reported and it still exits 0, so it can never fail a deploy), and Railway
-> documents no webhook retry policy. So every recovery ends in a human re-POST.
+> **Unfinished releases are re-checked on the next deploy (the ledger).** `pending.ts`
+> persists an entry per non-final outcome (`held`/`waiting`/`error`) and re-evaluates it on
+> any later deploy notification, independently of discovery — which cannot re-surface a
+> manifest that exists at both SHAs. Re-evaluation re-reads the manifest at the CURRENT sha,
+> so fixing a bad `releaseIntent` and deploying again is enough.
+>
+> It is **webhook-gated**: nothing fires on a timer, so a `notBefore` date passing does
+> nothing until some deploy arrives. A release LaunchDarkly **reverted** is marked
+> `needsHuman` and never re-triggered — re-releasing would undo the guardrail's rollback.
+> `BEACON_PENDING_FILE` sets the ledger path (default `beacon-pending.json`).
+>
+> **The notification itself is never redelivered**, so alert on `notify: ACTION REQUIRED`.
+> The Notifier is non-blocking by contract (a non-2xx is reported and it still exits 0, so
+> it can never fail a deploy), and Railway documents no webhook retry policy.
 >
 > The Notifier prints `notify: ACTION REQUIRED` to **stderr** whenever a human must act,
 > and names the recovery command. **Critically, that includes HTTP 200s**: Beacon acks a

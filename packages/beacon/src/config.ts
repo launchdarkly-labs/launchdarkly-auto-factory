@@ -39,6 +39,8 @@ export interface BeaconConfig {
   releaseFlagsDir: string;
   /** Path of the JSON file the deploy-state store persists to. */
   stateFile: string;
+  /** Path of the JSON file the re-evaluation ledger persists to (pending.ts). */
+  pendingFile: string;
   services: Record<string, ServiceDef>;
 }
 
@@ -70,6 +72,7 @@ export function loadBeaconConfig(repoRoot: string = process.cwd()): BeaconConfig
     ldEnvironmentKey: process.env.LD_ENVIRONMENT_KEY || "production",
     releaseFlagsDir: releaseFlagsDir(releaseSource),
     stateFile: process.env.BEACON_STATE_FILE || "beacon-state.json",
+    pendingFile: process.env.BEACON_PENDING_FILE || "beacon-pending.json",
     services,
   };
 }
