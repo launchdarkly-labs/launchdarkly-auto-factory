@@ -54,16 +54,83 @@ describe("describeNotifyResult", () => {
     // (`terminalHistoryRefusal`), so the refusal lasts exactly as long as its cause and then the
     // entry takes the normal path. Telling an operator otherwise sends them looking for a file to
     // edit, and invites them to distrust the re-check the same sentence promises.
+    //
+    // The outcome carries `needsHuman: true`, which is what server.ts actually emits for a reverted
+    // flag — and is now what makes the paragraph print at all (see the two tests below).
     const r = describeNotifyResult({
       ...BASE,
       status: 200,
-      body: body([{ flag: "f", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "reverted" }]),
+      body: body([
+        { flag: "f", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "reverted", needsHuman: true },
+      ]),
     });
     const text = r.lines.join("\n");
     assert.equal(r.attention, true);
     assert.doesNotMatch(text, /never retried/, "THE DISCRIMINATOR: the deleted latch is not asserted");
-    assert.match(text, /for as long as/, "the refusal is conditional, and the condition is named");
-    assert.match(text, /re-decided on every deploy/);
+    assert.match(text, /re-decided on every deploy/, "the refusal is conditional, and the condition is named");
+  });
+
+  it("prints the needsHuman paragraph ONLY when an outcome actually carries needsHuman", () => {
+    // PREVENTS a paragraph about guardrail rollbacks on a deploy that had none. It used to print for
+    // ANY non-empty stranded list, so the commonest strands — a `waiting` fullstack counterpart, a
+    // future `notBefore` — were reported with an explanation of `reverted`/`monitoring_stopped` that
+    // applied to nothing in the list. An operator reading it looks for a reverted release that does
+    // not exist, and the per-flag lines gave them no way to tell which outcome it was about.
+    const quiet = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "a", sourceFile: ".release-flags/pr-1.json", action: "waiting", detail: "other service not deployed yet" },
+        { flag: "b", sourceFile: ".release-flags/pr-2.json", action: "held", detail: "notBefore 2099-01-01" },
+      ]),
+    });
+    const quietText = quiet.lines.join("\n");
+    assert.equal(quiet.attention, true, "they are still stranded, so a human is still told");
+    assert.match(quietText, /2 of 2 flag\(s\) did NOT release/);
+    assert.doesNotMatch(
+      quietText,
+      /needsHuman/,
+      "THE DISCRIMINATOR: no outcome refused to act, so nothing says one did",
+    );
+    assert.doesNotMatch(quietText, /reverted/, "and no guardrail rollback is described");
+
+    // Same list plus one refused outcome: now the paragraph belongs, and the LINE says which flag.
+    const loud = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "a", sourceFile: ".release-flags/pr-1.json", action: "waiting", detail: "other service not deployed yet" },
+        { flag: "b", sourceFile: ".release-flags/pr-2.json", action: "error", detail: "rel-3 is 'reverted'", needsHuman: true },
+      ]),
+    });
+    const loudText = loud.lines.join("\n");
+    assert.match(loudText, /1 of those is marked needsHuman/);
+    assert.match(loudText, /pr-2\.json b: error \[needsHuman\]/, "the mark is on the line it applies to");
+    assert.doesNotMatch(
+      loudText,
+      /pr-1\.json a: waiting \[needsHuman\]/,
+      "and not on the one it does not",
+    );
+  });
+
+  it("does not tell an operator to wait for a REVERTED release to complete", () => {
+    // PREVENTS advising a wait that can never end. The paragraph named three clearing paths —
+    // "completed, replaced, or the flag moves on" — and for the commonest cause the first is
+    // unreachable: `terminalHistoryRefusal` fires on a release LaunchDarkly REVERTED, and a reverted
+    // release never becomes `completed`. The way out is a NEW release, which is exactly what the
+    // refusal's own detail asks for ("deploy the fix as a new commit").
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([{ flag: "f", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "x", needsHuman: true }]),
+    });
+    const text = r.lines.join("\n");
+    assert.match(text, /new commit/, "THE DISCRIMINATOR: the clearing path named is one that exists");
+    assert.match(
+      text,
+      /never becomes 'completed'/,
+      "and the unreachable one is called out, since the old line invited exactly that wait",
+    );
   });
 
   it("names the recovery, including why previousSha is needed", () => {

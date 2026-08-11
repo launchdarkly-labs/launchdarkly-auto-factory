@@ -45,6 +45,12 @@ interface RawOutcome {
   targetVariation?: unknown;
   action?: unknown;
   detail?: unknown;
+  /**
+   * Set by server.ts when THIS outcome refused to act unattended (the flag's newest release is
+   * terminal without having completed). Read here so the refusal paragraph prints only when some
+   * outcome actually carries it, and so the per-flag line says which one it applies to.
+   */
+  needsHuman?: unknown;
 }
 
 export interface NotifyReport {
@@ -117,22 +123,43 @@ export function describeNotifyResult(input: {
   }
 
   if (stranded.length > 0) {
-    // `needsHuman` USED TO BE A LATCH and this line still described one: "a flag marked
-    // needsHuman is never retried" was read straight off a stored field that nothing could
-    // clear. It is now re-derived on every pass from the flag's newest release
-    // (`terminalHistoryRefusal`), so the honest statement is CONDITIONAL: the refusal lasts
-    // exactly as long as its cause. Saying otherwise sent an operator looking for a ledger file
-    // to hand-edit.
     lines.push(
       `notify: ACTION REQUIRED — Beacon accepted the deploy (HTTP ${status}) but ` +
         `${stranded.length} of ${all.length} flag(s) did NOT release. Beacon will re-check them on the ` +
-        `next deploy; nothing happens before then. A flag reported needsHuman is refused for as long as ` +
-        `its newest release is still terminal-without-completing (reverted / monitoring_stopped) — that ` +
-        `is re-decided on every deploy, so it retries by itself once the release is completed, replaced, ` +
-        `or the flag moves on.`,
+        `next deploy; nothing happens before then.`,
     );
+    // CONDITIONAL, on this deploy's OUTCOMES, because it used to print for every non-empty
+    // stranded list — so a deploy whose only problem was a `waiting` counterpart or a future
+    // `notBefore` got a paragraph about guardrail rollbacks that applied to none of its flags, and
+    // the per-flag lines below never said which flag it was about. An operator reading it against
+    // a `held` outcome looks for a reverted release that does not exist.
+    //
+    // `needsHuman` USED TO BE A LATCH and this paragraph still described one: "never retried" was
+    // read straight off a stored field that nothing could clear. It is now re-derived on every pass
+    // from the flag's newest release (`terminalHistoryRefusal`), so the statement is conditional —
+    // the refusal lasts exactly as long as its cause.
+    //
+    // AND THE CLEARING CONDITION HAS TO BE ACCURATE. It used to name three ways out, one of which
+    // is unreachable for the commonest cause: a REVERTED release never becomes `completed`, so
+    // "once the release is completed" describes only the `monitoring_stopped` half (a human can
+    // resume that one). Waiting for a revert to complete is waiting forever; the way out is a NEW
+    // release, which is what `terminalHistoryRefusal`'s own detail asks for.
+    const refused = stranded.filter((o) => o.needsHuman === true);
+    if (refused.length > 0) {
+      lines.push(
+        `  ${refused.length} of those is marked needsHuman: Beacon will NOT re-trigger it while the ` +
+          `flag's newest release is terminal without having completed (reverted / monitoring_stopped), ` +
+          `because re-releasing would undo a guardrail's rollback. That is re-decided on every deploy, ` +
+          `so it clears by itself as soon as the flag's newest release is no longer in that state — ` +
+          `deploy the fix as a new commit to start a fresh release, or resume a monitoring_stopped one. ` +
+          `A REVERTED release never becomes 'completed', so waiting for completion is not a way out.`,
+      );
+    }
     for (const o of stranded) {
-      lines.push(`  ${label(o)}: ${String(o.action)} — ${detailText(o.detail)}`);
+      // Marked per line, so the paragraph above is attributable. Without this an operator with one
+      // refused flag among four stranded ones could not tell which one it was about.
+      const mark = o.needsHuman === true ? " [needsHuman]" : "";
+      lines.push(`  ${label(o)}: ${String(o.action)}${mark} — ${detailText(o.detail)}`);
     }
     lines.push(rePostHint(beaconUrl, service, sha));
     return { attention: true, lines };
