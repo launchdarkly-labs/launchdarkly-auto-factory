@@ -104,7 +104,7 @@ deploy, independently of discovery.
 | `error`, readiness check unverifiable | the fullstack check could not be finished (status endpoint down, GitHub non-404 error) | **ledger**, and it is *diagnosed* as unverified rather than reported as "not deployed" |
 | `error`, `triggerRelease` threw | LD 5xx or a network failure mid-write | **ledger**, guarded by the terminal-status check below |
 | release completed while unwatched (paused-then-resumed, or after the 24h window) | monitoring stopped at its deadline | **ledger notices the `completed` status and repoints the children** — previously reachable only by a re-POST inside the two-deep window |
-| newest release was **reverted** | a guardrail rolled it back | **never re-tried.** Marked `needsHuman`, reported on every deploy. Re-releasing would undo the rollback |
+| newest release was **reverted** | a guardrail rolled it back | **never re-tried**, on either path. Marked `needsHuman`, reported on every deploy. A re-POST of an already-processed sha is refused for the same reason; a NEW sha still releases, because fix-and-redeploy is the way out of a revert |
 
 **What is still not closed:** the ledger is webhook-gated, so a `notBefore` date passing does
 nothing until some deploy arrives, and a project that stops deploying stops re-checking. That

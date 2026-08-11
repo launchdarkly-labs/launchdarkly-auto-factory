@@ -66,6 +66,11 @@ export class MemoryDeployStateStore implements DeployStateStore {
     const k = key(service, environment);
     const current = this.states.get(k) ?? {};
     if (current.last === sha) return;
+    // Re-processing the PRIOR sha must not rewrite history either. Without this, a re-POST
+    // of an older sha set {last: prior, prior: last} — swapping them — so the NEXT deploy
+    // diffed a range that had already been processed and re-evaluated finished flags. That
+    // is the path by which a manual recovery attempt could re-release a reverted flag.
+    if (current.prior === sha) return;
     this.states.set(k, { last: sha, ...(current.last ? { prior: current.last } : {}) });
   }
 }

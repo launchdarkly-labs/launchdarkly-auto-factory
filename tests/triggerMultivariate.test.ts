@@ -290,3 +290,42 @@ describe("triggerRelease — an unreadable policy is reported, not mistaken for 
     assert.ok(patches.length > 0, "the release was started");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round eight, F7b: BOOLEAN flags had no noop guard.
+//
+// The `served === target ⇒ noop` check lived only in the multivariate branch, so a
+// boolean flag already serving `true` was re-released. That is not harmless: a
+// progressive/guarded release restarts at stage 1, yanking most users back to
+// `false`. Reachable by a re-POST after a completed boolean rollout.
+// ---------------------------------------------------------------------------
+describe("triggerRelease — boolean noop guard", () => {
+  const booleanFlag = (on: boolean, offVariation = 1) => ({
+    key: "legacy-bool",
+    variations: [
+      { _id: "var-true", value: true },
+      { _id: "var-false", value: false },
+    ],
+    environments: {
+      production: { on, offVariation, fallthrough: { variation: 0 } },
+    },
+  });
+  const manifest = { flagKey: "legacy-bool", scope: "backend", sourceFile: ".release-flags/pr-1.json" };
+
+  it("NOOPs when the environment already serves true", async () => {
+    const { ld, patches } = fakeLd({ "legacy-bool": booleanFlag(true) });
+    const result = await triggerRelease(ld, manifest as unknown as DiscoveredFlag, "production");
+    assert.equal(result.method, "noop");
+    assert.match(String(result.note), /already serves true/);
+    assert.deepEqual(patches, [], "THE DISCRIMINATOR: no release restarted at stage 1");
+  });
+
+  it("still releases a dark boolean flag (targeting off)", async () => {
+    // The guard must not block the normal case: merge ≠ release, so an auto-factory flag
+    // is created dark and this is what turning it on looks like.
+    const { ld, patches } = fakeLd({ "legacy-bool": booleanFlag(false) });
+    const result = await triggerRelease(ld, manifest as unknown as DiscoveredFlag, "production");
+    assert.notEqual(result.method, "noop", "a dark flag has something to release");
+    assert.ok(patches.length > 0);
+  });
+});

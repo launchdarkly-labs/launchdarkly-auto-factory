@@ -129,3 +129,43 @@ describe("FileDeployStateStore: unreadable state is not a first run", () => {
     assert.equal(new FileDeployStateStore(file).get("svc", "production")?.last, "sha1");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round eight, F2: re-recording the PRIOR sha must not rewrite history.
+//
+// `record` already no-op'd on `last`, but not on `prior`. So a re-POST of an older
+// sha set {last: prior, prior: last} — swapping them — and the NEXT deploy then
+// diffed a range that had already been processed, re-evaluating finished flags.
+// That is the path by which a manual recovery attempt could re-release a flag whose
+// release was already reverted.
+// ---------------------------------------------------------------------------
+describe("MemoryDeployStateStore: re-recording history", () => {
+  it("re-recording `prior` is a no-op, so the window does not swap", () => {
+    const s = new MemoryDeployStateStore();
+    s.record("svc", "production", "sha1");
+    s.record("svc", "production", "sha2");
+    assert.deepEqual(s.get("svc", "production"), { last: "sha2", prior: "sha1" });
+
+    s.record("svc", "production", "sha1"); // a re-POST of the older sha
+    assert.deepEqual(
+      s.get("svc", "production"),
+      { last: "sha2", prior: "sha1" },
+      "history must be unchanged: swapping makes the next deploy re-diff a processed range",
+    );
+  });
+
+  it("re-recording `last` is still a no-op", () => {
+    const s = new MemoryDeployStateStore();
+    s.record("svc", "production", "sha1");
+    s.record("svc", "production", "sha1");
+    assert.deepEqual(s.get("svc", "production"), { last: "sha1" }, "no phantom prior");
+  });
+
+  it("a genuinely new sha still advances the window", () => {
+    const s = new MemoryDeployStateStore();
+    s.record("svc", "production", "sha1");
+    s.record("svc", "production", "sha2");
+    s.record("svc", "production", "sha3");
+    assert.deepEqual(s.get("svc", "production"), { last: "sha3", prior: "sha2" });
+  });
+});

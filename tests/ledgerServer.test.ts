@@ -277,3 +277,71 @@ describe("ledger: the guard that makes automatic re-evaluation safe", () => {
     assert.ok(throwing.pending.list("demo-backend", "production").length >= 1, "still pending, not forgotten");
   });
 });
+
+describe("re-POST safety: a repeat evaluation of an already-processed sha", () => {
+  it("REFUSES to re-release a flag whose newest release was reverted", async () => {
+    // The manual-recovery half of the same hazard. `findActiveRelease` excludes terminal
+    // statuses, and a revert restores the ORIGINAL variation — so served != target and the
+    // noop guard does not fire either. Without this, a well-meaning re-POST after a
+    // rollback starts a second rollout of the variation the guardrail rejected.
+    const patches: unknown[] = [];
+    const h = await harness(
+      ghAlways(GOOD_MANIFEST),
+      fakeLd(patches, { served: "off", releases: [{ id: "rel-1", status: "reverted" }] }),
+      patches,
+    );
+    await h.post("sha1"); // first evaluation: sha is new
+    const before = patches.length;
+    const repeat = await h.post("sha1"); // the human re-POSTs the same sha
+    const o = repeat.json.outcomes.find((x: any) => x.flag === "enable-one");
+    assert.equal(o.action, "error");
+    assert.equal(o.needsHuman, true);
+    assert.match(String(o.detail), /already processed/);
+    assert.equal(patches.length, before, "THE DISCRIMINATOR: no second release");
+  });
+
+  it("but a NEW sha still releases — fix-and-redeploy is the way out of a revert", async () => {
+    // The guard must not make a reverted flag permanently unreleasable. A new sha is a new
+    // intent, and LaunchDarkly's release object carries no target variation, so the sha is
+    // the only thing that distinguishes the two cases.
+    //
+    // Shape matters here: the dev's fix arrives as a NEW manifest (a new PR), so discovery
+    // surfaces it at sha2. With no new manifest there is nothing to release and nothing in
+    // the ledger either — the first release succeeded, which is why it was cleared.
+    const patches: unknown[] = [];
+    const gh = {
+      async listDir(_repo: unknown, _dir: string, ref: string): Promise<string[]> {
+        return ref === "sha1" ? ["pr-1.json"] : ["pr-1.json", "pr-2.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return GOOD_MANIFEST;
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    const h = await harness(
+      gh,
+      fakeLd(patches, { served: "off", releases: [{ id: "rel-1", status: "reverted" }] }),
+      patches,
+    );
+    await h.post("sha1");
+    const before = patches.length;
+    const fixed = await h.post("sha2"); // the dev fixed the regression and deployed
+    const o = fixed.json.outcomes.find((x: any) => x.flag === "enable-one");
+    assert.ok(o, "the new manifest is discovered at the new sha");
+    assert.equal(o.action, "released", "a new commit must be able to start a fresh release");
+    assert.ok(patches.length > before, "the guard must not make a reverted flag unreleasable forever");
+  });
+
+  it("fails closed when the history cannot be read on a repeat sha", async () => {
+    const patches: unknown[] = [];
+    const h = await harness(ghAlways(GOOD_MANIFEST), fakeLd(patches, { served: "off" }), patches);
+    await h.post("sha1");
+    const throwing = await harness(ghAlways(GOOD_MANIFEST), fakeLd(patches, { releasesThrows: true }), patches);
+    const r = await throwing.post("sha1");
+    // The idempotency guard also cannot read, so this is a 503 either way — the point is
+    // that nothing was written.
+    assert.equal(r.status, 503);
+  });
+});

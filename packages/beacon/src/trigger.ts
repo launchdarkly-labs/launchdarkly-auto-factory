@@ -176,6 +176,18 @@ export async function triggerRelease(
     }
     originalVar = offVar;
     targetVar = onVar;
+    // The noop guard, which for a long time existed ONLY in the multivariate branch below.
+    // A boolean flag already serving `true` has nothing to release, and re-releasing it is
+    // not harmless: a progressive/guarded release restarts at stage 1, which yanks ~80% of
+    // users back to `false`. Reachable via a re-POST after a completed boolean rollout.
+    const servedNow = servedVariation(variations, envCfg);
+    if (servedNow && servedNow._id === targetVar._id) {
+      return {
+        flagKey: flag.flagKey,
+        method: "noop",
+        note: `'${environmentKey}' already serves true — nothing to release (re-deploy after completion?)`,
+      };
+    }
   } else {
     // Multivariate lineage: target = manifest targetVariation, else the tip.
     const targetValue = flag.targetVariation ?? latestVariationValue(variations.map((v) => v.value));

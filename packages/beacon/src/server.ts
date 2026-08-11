@@ -123,6 +123,15 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       n.previousSha,
     );
 
+    // Read BEFORE store.record below overwrites it: is this a sha we already processed?
+    //
+    // It is the discriminator for the guard in processFlag. A NEW sha carries a new intent —
+    // a dev who fixed a regression and deployed again legitimately wants a fresh release —
+    // whereas a repeat evaluation of a sha we have already handled carries none. We cannot
+    // get this from LaunchDarkly: `AutomatedRelease` has no target-variation field, so
+    // "re-release of the same thing" and "release of the fix" are indistinguishable there.
+    const shaAlreadyProcessed = store.get(n.service, n.environment).last === n.sha;
+
     let discovered;
     try {
       discovered = await discoverNewReleaseFlags(gh, service.repo, cfg.releaseFlagsDir, n.sha, previousSha);
@@ -263,6 +272,42 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         if (active) {
           onReleaseStarted(flag.flagKey, n.environment); // re-attach monitoring (e.g. after a Beacon restart)
           return { flag: flag.flagKey, scope, action: "already_running", detail: { releaseId: active.id } };
+        }
+        // A REPEAT evaluation of an already-processed sha must not re-release a flag whose
+        // release LaunchDarkly already reverted. `findActiveRelease` above excludes terminal
+        // statuses, so it answers "nothing running" for a reverted release, and the noop
+        // guard does not fire either — a revert restores the ORIGINAL variation, so
+        // served != target and the trigger proceeds. That undoes a guardrail's rollback.
+        //
+        // Gated on `shaAlreadyProcessed` deliberately: on a new sha this same check would
+        // block the legitimate fix-and-redeploy, which is the normal way out of a revert.
+        if (shaAlreadyProcessed) {
+          let latest: AutomatedRelease | null;
+          try {
+            latest = await findLatestRelease(ld, flag.flagKey, n.environment);
+          } catch (e) {
+            guardUnverifiable = true;
+            return {
+              flag: flag.flagKey,
+              scope,
+              action: "error",
+              detail: `re-evaluating an already-processed sha and the release history could not be read — NOT re-triggering: ${String(e)}`,
+            };
+          }
+          if (latest && isReleaseFinished(latest.status) && latest.status !== "completed") {
+            console.warn(
+              `[beacon] NOT re-releasing '${flag.flagKey}': this sha (${n.sha}) was already processed and the ` +
+                `newest release ${latest.id} is '${latest.status}'. Re-releasing would undo a guardrail's ` +
+                `rollback. Deploy the fix as a new commit to start a fresh release.`,
+            );
+            return {
+              flag: flag.flagKey,
+              scope,
+              action: "error",
+              needsHuman: true,
+              detail: `sha already processed and newest release is '${latest.status}' — NOT re-triggered (that would undo a guardrail rollback); deploy a fix to start a fresh release`,
+            };
+          }
         }
         const result = await triggerRelease(ld, flag, n.environment);
         // Only staged rollouts get release monitoring: "held"/"noop" started
