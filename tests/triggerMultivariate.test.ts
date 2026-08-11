@@ -329,3 +329,58 @@ describe("triggerRelease — boolean noop guard", () => {
     assert.ok(patches.length > 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round ten, finding 1 (HIGH): a release must never move the lineage BACKWARDS.
+//
+// Manifests are one per PR and never deleted, iteration PRs target a new variation
+// of an EXISTING flag, and the re-evaluation ledger keeps an unreleased older
+// manifest alive indefinitely. So: pr-41 targets v1 and is `held`; pr-42 targets v2
+// and releases. A human then flips pr-41's intent hold → auto — the documented way
+// to release held work — and Beacon starts a progressive rollout from v2 back to v1,
+// reported as a successful release.
+//
+// Every other guard misses it. The noop guard needs served === target. findActiveRelease
+// only sees running releases. findLatestRelease sees NOTHING when v2 arrived via an
+// `immediate` or `prerequisites` release, which create no AutomatedRelease record.
+// ---------------------------------------------------------------------------
+describe("triggerRelease — lineage regression guard", () => {
+  const servingV2 = () =>
+    mvFlag(["control", "v1", "v2"], { on: true, offVariation: 0, fallthrough: { variation: 2 } });
+
+  it("HOLDS instead of rolling production back from v2 to v1", async () => {
+    const { ld, patches } = fakeLd({ "enable-x": servingV2() });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "v1" }), "production");
+    assert.equal(r.method, "held");
+    assert.match(String(r.note), /BACKWARDS/);
+    assert.match(String(r.note), /superseded/);
+    assert.deepEqual(patches, [], "THE DISCRIMINATOR: no startAutomatedRelease at all");
+  });
+
+  it("still releases FORWARD along the lineage", async () => {
+    // The guard must not block the normal iteration release.
+    const { ld, patches } = fakeLd({
+      "enable-x": mvFlag(["control", "v1", "v2"], { on: true, offVariation: 0, fallthrough: { variation: 1 } }),
+    });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "v2" }), "production");
+    assert.notEqual(r.method, "held");
+    assert.ok(patches.length > 0);
+  });
+
+  it("still NOOPs when the target is exactly what is served", async () => {
+    const { ld } = fakeLd({ "enable-x": servingV2() });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "v2" }), "production");
+    assert.equal(r.method, "noop", "equal is noop, not a regression");
+  });
+
+  it("does not apply to non-lineage variations", async () => {
+    // control → v1 is forward; a hand-named variation has no lineage index at all, so the
+    // guard must stay out of the way rather than guessing an order.
+    const { ld, patches } = fakeLd({
+      "enable-x": mvFlag(["control", "v1"], { on: true, offVariation: 0, fallthrough: { variation: 0 } }),
+    });
+    const r = await triggerRelease(ld, discovered({ targetVariation: "v1" }), "production");
+    assert.notEqual(r.method, "held");
+    assert.ok(patches.length > 0);
+  });
+});

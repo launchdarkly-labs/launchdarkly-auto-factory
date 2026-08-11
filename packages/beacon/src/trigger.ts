@@ -17,6 +17,7 @@
 import {
   readReleasePolicy,
   latestVariationValue,
+  variationLineageIndex,
   normalizeReleaseIntent,
   notBeforeHolds,
   startRelease,
@@ -206,6 +207,33 @@ export async function triggerRelease(
       throw new Error(`'${flag.flagKey}' has no resolvable current variation in '${environmentKey}'`);
     }
     originalVar = served;
+    // NEVER MOVE THE LINEAGE BACKWARDS.
+    //
+    // A release whose target is OLDER than what the environment already serves is a
+    // regression dressed as a rollout, and every other guard misses it: the noop guard only
+    // fires on served === target; `findActiveRelease` only sees releases that are still
+    // running; and `findLatestRelease` sees nothing at all when the newer variation arrived
+    // via an `immediate` or `prerequisites` release, which create no AutomatedRelease record.
+    //
+    // Reachable in the repo's steady state, not by misconfiguration: manifests are one per
+    // PR and never deleted, iteration PRs target a new variation of an EXISTING flag, and the
+    // re-evaluation ledger keeps an unreleased older manifest alive indefinitely. Flip that
+    // older manifest's intent from `hold` to `auto` — the documented way to release held work
+    // — and without this guard Beacon starts a progressive rollout from v2 back to v1 and
+    // reports it as a successful release.
+    const servedIndex = variationLineageIndex(originalVar.value);
+    const targetIndex = variationLineageIndex(targetVar.value);
+    if (servedIndex !== undefined && targetIndex !== undefined && targetIndex < servedIndex) {
+      return {
+        flagKey: flag.flagKey,
+        method: "held",
+        note:
+          `'${environmentKey}' already serves '${String(originalVar.value)}' and this manifest asks for ` +
+          `'${String(targetVar.value)}' — releasing would move users BACKWARDS along the lineage. Held, not ` +
+          `released: a newer variation superseded this manifest. Delete or update it, or release the newer ` +
+          `one; nothing here can decide that.`,
+      };
+    }
     if (originalVar._id === targetVar._id) {
       return {
         flagKey: flag.flagKey,

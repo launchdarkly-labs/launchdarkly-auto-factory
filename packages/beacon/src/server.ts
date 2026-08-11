@@ -189,6 +189,22 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     // STRANDS with a 200 and a log that asks for a re-POST. A stranded release is
     // recoverable by a human; re-releasing a reverted flag is not.
     let guardUnverifiable = false;
+    /**
+     * Flags already acted on in THIS notification.
+     *
+     * The ledger is keyed by manifest ADDRESS, which is right for remembering work — but the
+     * TARGET of an action is `(flagKey, environment)`, because only one variation of a flag can
+     * be releasing at a time. Keying the memory correctly and leaving the action unguarded let
+     * two manifests naming one flag both reach `triggerRelease` in a single notification: the
+     * releases listing is eventually consistent right after a start (see monitor.ts, which
+     * retries five times for exactly that), so the second could miss the first and start a
+     * SECOND release on the same flag.
+     *
+     * The second manifest is deferred with a NON-FINAL outcome, deliberately. Reporting
+     * `already_running` would be final, and a final outcome clears the ledger entry — which
+     * discarded the newer manifest's unreleased work and reported it as success.
+     */
+    const actedOnFlag = new Set<string>();
 
     /**
      * Evaluate ONE manifest, returning its outcome rather than pushing it.
@@ -247,6 +263,23 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         }
       }
       try {
+        if (actedOnFlag.has(flag.flagKey)) {
+          // Another manifest for this flag already acted this round. Defer rather than
+          // discard: the ledger keeps this entry and the next deploy re-evaluates it, by
+          // which time the lineage-regression guard can see what actually got served.
+          console.warn(
+            `[beacon] DEFERRED: '${flag.sourceFile}' also targets '${flag.flagKey}', which another manifest ` +
+              `already acted on in this notification. Left pending for the next deploy.`,
+          );
+          return {
+            flag: flag.flagKey,
+            sourceFile: flag.sourceFile,
+            scope,
+            action: "held",
+            detail: `deferred — another manifest acted on '${flag.flagKey}' in this notification; still pending`,
+          };
+        }
+        actedOnFlag.add(flag.flagKey);
         // Idempotency: a re-delivered notification must not double-trigger.
         //
         // FAIL CLOSED. This was `.catch(() => null)`, which answered the question "does
@@ -448,9 +481,11 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       try {
         latest = await findLatestRelease(ld, actingOn, n.environment);
       } catch (e) {
-        // Fail closed: no terminal history means no permission to trigger.
+        // Fail closed: no terminal history means no permission to trigger. Reports `actingOn`,
+        // not the remembered key — otherwise the fold-back writes the stale name back and
+        // freezes it there.
         return {
-          flag: entry.flagKey,
+          flag: actingOn,
           sourceFile: entry.sourceFile,
           scope: "ledger",
           action: "error",
@@ -500,8 +535,14 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
 
     // The ledger pass: unfinished work from EARLIER deploys, re-checked on this one. Skips
     // anything discovery already handled this round, so a flag is evaluated at most once.
-    const handledThisRound = new Set(discovered.map((f) => f.flagKey));
-    const pendingEntries = pending.list(n.service, n.environment).filter((e) => !handledThisRound.has(e.flagKey));
+    // Keyed on the manifest ADDRESS, matching the ledger. This was the last flagKey-keyed
+    // identity comparison in Beacon, and it was wrong in both directions: an entry for
+    // pr-41.json was skipped whenever a DIFFERENT manifest naming the same flag was
+    // discovered (so its re-check silently stopped and its `lastSha` froze), while a genuine
+    // same-manifest duplicate slipped through whenever the flagKey had been corrected.
+    // Same-flag collisions are handled by `actedOnFlag` above, which is the right axis for it.
+    const handledThisRound = new Set(discovered.map((f) => f.sourceFile));
+    const pendingEntries = pending.list(n.service, n.environment).filter((e) => !handledThisRound.has(e.sourceFile));
     if (pendingEntries.length > 0) {
       console.log(
         `[beacon] ledger: ${pendingEntries.length} unfinished flag(s) from earlier deploys → ` +

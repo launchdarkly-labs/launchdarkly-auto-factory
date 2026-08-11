@@ -148,6 +148,48 @@ describe("FilePendingStore", () => {
     assert.throws(() => new FilePendingStore(file), /version/);
   });
 
+  it("DERIVES keys on load, so a mis-keyed entry is not immortal", () => {
+    // `list()` filters on fields but `clear()` deletes by derived key, so an entry whose
+    // stored key disagreed with its fields was returned and re-evaluated forever, re-created
+    // as a twin on every upsert, and never deletable — the same silent-stale-twin failure the
+    // version gate prevents, but inside a VALID file. Reachable because these messages invite
+    // hand-editing, and the obvious edit after a rename changes sourceFile and not the key.
+    const dir = tmpDir();
+    const file = join(dir, "pending.json");
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: PENDING_LEDGER_VERSION,
+        entries: {
+          "a-stale-key-that-matches-nothing": {
+            service: "demo-backend",
+            environment: "production",
+            flagKey: "enable-one",
+            sourceFile: ".release-flags/pr-1.json",
+            firstSeenSha: "sha1",
+            lastSha: "sha1",
+            lastAction: "held",
+            attempts: 1,
+          },
+        },
+      }),
+    );
+    const store = new FilePendingStore(file);
+    assert.equal(store.list("demo-backend", "production").length, 1, "the entry is still loaded");
+
+    // A final outcome for that manifest must actually remove it.
+    recordOutcome(store, {
+      service: "demo-backend",
+      environment: "production",
+      sha: "sha2",
+      flagKey: "enable-one",
+      sourceFile: ".release-flags/pr-1.json",
+      action: "released",
+    });
+    assert.deepEqual(store.list("demo-backend", "production"), [], "clear() must reach it");
+    assert.deepEqual(new FilePendingStore(file).list("demo-backend", "production"), [], "and it stays gone");
+  });
+
   it("REFUSES TO START on an unreadable ledger rather than silently forgetting", () => {
     // Starting empty would look identical to "nothing is pending", and every in-flight
     // release would strand with nothing tracking it — a safety net that quietly is not

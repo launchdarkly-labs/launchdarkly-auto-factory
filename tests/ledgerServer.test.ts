@@ -462,3 +462,79 @@ describe("ledger identity: the manifest's address, not its content", () => {
     assert.deepEqual(paths, [".release-flags/pr-1.json", ".release-flags/pr-2.json"]);
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// Round ten, findings 2 and 3: the ledger's identity is the manifest's address, but
+// the TARGET of an action is (flagKey, environment) — only one variation of a flag can
+// be releasing at a time. Keying the memory right and leaving the action unguarded let
+// two manifests naming one flag both reach triggerRelease in one notification.
+//
+// And `handledThisRound` was the last flagKey-keyed comparison left in Beacon, wrong in
+// both directions: it skipped an entry whenever a DIFFERENT manifest naming the same flag
+// was discovered, and failed to skip a genuine duplicate when the flagKey was corrected.
+// ---------------------------------------------------------------------------
+describe("one action per flag per notification", () => {
+  const held = (flagKey: string) => ({
+    flagKey,
+    scope: "backend",
+    releaseIntent: { action: "auto", notBefore: "next tuesday" },
+  });
+
+  it("two manifests naming one flag produce ONE trigger, and the second stays pending", async () => {
+    const patches: unknown[] = [];
+    const gh = {
+      async listDir(): Promise<string[]> {
+        return ["pr-41.json", "pr-42.json"];
+      },
+      async getFileJson(): Promise<unknown> {
+        return { flagKey: "checkout-flow", scope: "backend" }; // both releasable
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    const h = await harness(gh, fakeLd(patches, { served: "off" }), patches);
+    const r = await h.post("sha1");
+
+    const starts = (patches as Array<{ instructions?: Array<{ kind?: string }> }>).filter((p) =>
+      (p.instructions ?? []).some((i) => i.kind === "startAutomatedRelease"),
+    );
+    assert.equal(starts.length, 1, "THE DISCRIMINATOR: never two releases for one flag in one notification");
+
+    const deferred = r.json.outcomes.filter((o: any) => String(o.detail).includes("deferred"));
+    assert.equal(deferred.length, 1, "the second manifest is deferred, not silently dropped");
+    // Non-final, so the ledger keeps it. Reporting `already_running` would be FINAL and would
+    // clear the entry — discarding unreleased work and calling it success.
+    assert.equal(deferred[0].action, "held");
+    const pendingPaths = h.pending.list("demo-backend", "production").map((e) => e.sourceFile);
+    assert.deepEqual(pendingPaths, [".release-flags/pr-42.json"], "the deferred manifest is still tracked");
+  });
+
+  it("a pending entry is NOT skipped because a different manifest names the same flag", async () => {
+    const patches: unknown[] = [];
+    let files = ["pr-41.json"];
+    const gh = {
+      async listDir(_r: unknown, _d: string, ref: string): Promise<string[]> {
+        return ref === "sha1" ? ["pr-41.json"] : files;
+      },
+      async getFileJson(_r: unknown, path: string): Promise<unknown> {
+        return held("checkout-flow"); // both manifests name the same flag, both held
+      },
+      async fileExists(): Promise<boolean> {
+        return true;
+      },
+    } as unknown as GitHubClient;
+    const h = await harness(gh, fakeLd(patches, { served: "off" }), patches);
+
+    await h.post("sha1"); // pr-41 → held → pending
+    files = ["pr-41.json", "pr-42.json"];
+    const second = await h.post("sha2"); // pr-42 discovered, names the SAME flag
+
+    const forPr41 = second.json.outcomes.find((o: any) => o.sourceFile === ".release-flags/pr-41.json");
+    assert.ok(forPr41, "pr-41 must still be re-evaluated — under flagKey keying it vanished from the report");
+    const entry41 = h.pending.list("demo-backend", "production").find((e) => e.sourceFile.includes("pr-41"));
+    assert.equal(entry41?.lastSha, "sha2", "its lastSha must advance; frozen state also defeats a sha-ahead gate");
+    assert.ok((entry41?.attempts ?? 0) >= 2);
+  });
+});

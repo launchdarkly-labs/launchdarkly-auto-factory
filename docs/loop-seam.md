@@ -170,7 +170,9 @@ the one this branch made worse, correctly: refusing free-form dates puts more ma
 needs redelivery. Every fail-closed improvement adds to a pile that recovers badly.
 
 **SHIPPED** (`packages/beacon/src/pending.ts`): a persisted re-evaluation ledger. An entry per
-non-final outcome keyed by `(service, environment, flagKey)`, re-evaluated on any webhook
+non-final outcome keyed by `(service, environment, sourceFile)` — the manifest's ADDRESS, not
+its content, so a corrected `flagKey` cannot leave the safety guard inspecting a different flag
+from the one being triggered — re-evaluated on any webhook
 *independently of discovery*, cleared on a final outcome. What it buys is not the retry
 mechanism — re-POST already was one — but that **no human has to know to invoke it.**
 

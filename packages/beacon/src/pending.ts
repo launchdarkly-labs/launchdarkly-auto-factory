@@ -133,18 +133,29 @@ export class FilePendingStore extends MemoryPendingStore {
       if (raw.version !== PENDING_LEDGER_VERSION) {
         throw new Error(
           `pending-release ledger '${this.file}' is version ${String(raw.version)}, this build expects ` +
-            `${PENDING_LEDGER_VERSION}. Delete the file to start fresh — the flags it tracked will need a ` +
-            `manual re-POST, or will be picked up the next time their manifest changes.`,
+            `${PENDING_LEDGER_VERSION}. Delete the file to start fresh. The flags it tracked then need a ` +
+            `re-POST with an EXPLICIT previousSha (a bare one finds nothing — the manifests exist at both ` +
+            `ends), or will be picked up the next time their manifest changes.`,
         );
       }
-      this.entries = new Map(Object.entries(raw.entries ?? {}));
+      // DERIVE the keys, never trust the stored ones. `list()` filters on fields while
+      // `clear()` deletes by derived key, so an entry whose stored key disagreed with its
+      // fields was immortal: returned and re-evaluated forever, re-created as a twin on every
+      // upsert, and never deletable. That is the same silent-stale-twin failure the version
+      // gate above exists to prevent, reachable inside a valid file — and hand-editing this
+      // file is something the messages here actually invite.
+      this.entries = new Map(
+        Object.values(raw.entries ?? {}).map((e) => [key(e.service, e.environment, e.sourceFile), e]),
+      );
     } catch (e) {
       if ((e as { code?: string }).code !== "ENOENT") {
         throw new Error(
           `pending-release ledger '${this.file}' exists but could not be read — refusing to start ` +
             `without it, because unfinished releases would then strand with nothing tracking them. ` +
-            `Fix or delete the file (deleting it forgets in-flight work; those flags need a manual ` +
-            `re-POST). Cause: ${e instanceof Error ? e.message : String(e)}`,
+            `Fix or delete the file. Deleting it forgets in-flight work, and recovering that needs a ` +
+            `re-POST with an EXPLICIT previousSha — a bare re-POST re-diffs from the recorded sha and ` +
+            `finds nothing, because these manifests exist at both ends (which is why this ledger ` +
+            `exists). Cause: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
     }
