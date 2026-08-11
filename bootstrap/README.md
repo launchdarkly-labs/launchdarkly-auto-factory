@@ -3,7 +3,7 @@
 Bootstrap turns a fresh clone into a working Build stage. It validates credentials,
 provisions LaunchDarkly resources, and supplies templates for the entry point you choose.
 
-Start with the [setup guide](../REFERENCE.md#1-bootstrap-the-factory).
+Start with the [setup guide](../REFERENCE.md#1-bootstrap).
 
 ## What is here
 

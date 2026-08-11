@@ -8,7 +8,7 @@ This is the primary end-to-end Build entry point.
 
 ## Use it
 
-Follow the [setup guide](../../REFERENCE.md#2-connect-the-build-stage) or copy a workflow:
+Follow the [setup guide](../../REFERENCE.md#2-add-the-build-workflow) or copy a workflow:
 
 - `bootstrap/github-action-template/auto-factory.yml` for Anthropic or Vega
 - `bootstrap/github-action-template/auto-factory-cursor.yml` for Cursor
