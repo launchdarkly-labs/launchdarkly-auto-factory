@@ -46,6 +46,26 @@ describe("describeNotifyResult", () => {
     assert.match(text, /nothing happens before then/);
   });
 
+  it("does not tell an operator that a needsHuman flag is never retried", () => {
+    // PREVENTS resurrecting a latch that no longer exists, in the one line an operator reads.
+    // `needsHuman` used to short-circuit `reEvaluate` off a stored field, and nothing in the code
+    // could clear it — hand-editing the ledger file was the only way out, which is what "never
+    // retried" described. It is now RE-DERIVED on every pass from the flag's newest release
+    // (`terminalHistoryRefusal`), so the refusal lasts exactly as long as its cause and then the
+    // entry takes the normal path. Telling an operator otherwise sends them looking for a file to
+    // edit, and invites them to distrust the re-check the same sentence promises.
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([{ flag: "f", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "reverted" }]),
+    });
+    const text = r.lines.join("\n");
+    assert.equal(r.attention, true);
+    assert.doesNotMatch(text, /never retried/, "THE DISCRIMINATOR: the deleted latch is not asserted");
+    assert.match(text, /for as long as/, "the refusal is conditional, and the condition is named");
+    assert.match(text, /re-decided on every deploy/);
+  });
+
   it("names the recovery, including why previousSha is needed", () => {
     const r = describeNotifyResult({ ...BASE, status: 200, body: body([{ flag: "f", action: "waiting" }]) });
     const text = r.lines.join("\n");

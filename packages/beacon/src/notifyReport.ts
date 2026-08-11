@@ -117,10 +117,19 @@ export function describeNotifyResult(input: {
   }
 
   if (stranded.length > 0) {
+    // `needsHuman` USED TO BE A LATCH and this line still described one: "a flag marked
+    // needsHuman is never retried" was read straight off a stored field that nothing could
+    // clear. It is now re-derived on every pass from the flag's newest release
+    // (`terminalHistoryRefusal`), so the honest statement is CONDITIONAL: the refusal lasts
+    // exactly as long as its cause. Saying otherwise sent an operator looking for a ledger file
+    // to hand-edit.
     lines.push(
       `notify: ACTION REQUIRED — Beacon accepted the deploy (HTTP ${status}) but ` +
         `${stranded.length} of ${all.length} flag(s) did NOT release. Beacon will re-check them on the ` +
-        `next deploy; nothing happens before then, and a flag marked needsHuman is never retried.`,
+        `next deploy; nothing happens before then. A flag reported needsHuman is refused for as long as ` +
+        `its newest release is still terminal-without-completing (reverted / monitoring_stopped) — that ` +
+        `is re-decided on every deploy, so it retries by itself once the release is completed, replaced, ` +
+        `or the flag moves on.`,
     );
     for (const o of stranded) {
       lines.push(`  ${label(o)}: ${String(o.action)} — ${detailText(o.detail)}`);
