@@ -47,43 +47,85 @@ const DEFAULT_GUARDED_STAGES: Stage[] = [
 const DEFAULT_RANDOMIZATION_UNIT = "user";
 
 /**
- * 4xx statuses that are NOT a rejection of what we sent, so they must keep throwing.
+ * Statuses that ARE a rejection of the CONTENT we sent, so `held` — a human must edit this
+ * manifest — is the honest answer.
  *
- *  - 429 is a rate limit, and `LdClient.request` already spent its own backoff budget before
- *    surfacing it (RATE_LIMIT_RETRIES). Reporting a spent budget as "a human must fix this
- *    manifest" would be a lie about a transient condition, and the ledger's retry is the right
- *    answer to it.
- *  - 408 is a request timeout: the request may have been received and PROCESSED, so it is the one
- *    4xx where write-certainty is exactly as unknowable as a 5xx. It must stay in the
- *    "we do not know" bucket that claims the flag's action slot.
- *  - 401/403 are Beacon's credentials, not the manifest's content. They are deterministic but
- *    GLOBAL — every manifest for every flag hits them identically, so nobody is starved by the
- *    slot claim, and pointing an operator at `releasePlan` when the API key is wrong sends them
- *    to the wrong file.
+ * AN ALLOWLIST, AND IT USED TO BE A DENYLIST ("any 4xx except {401, 403, 408, 429}"). That
+ * over-claimed, because LaunchDarkly documents exactly six responses on
+ * `PATCH /api/v2/flags/{projectKey}/{featureFlagKey}` — **400, 401, 404, 405, 409, 429** — and
+ * three of them are not about content at all:
+ *
+ *  - **409 "Status conflict"**, which LaunchDarkly's own API overview describes as "The API request
+ *    can not be completed because it conflicts with a concurrent API request" and answers with
+ *    **"Retry your request."** A human editing the flag in the LaunchDarkly UI as our patch lands
+ *    produces one. Calling it content CHANGED PRODUCTION BEHAVIOUR, which is why it is the reason
+ *    this list was inverted: flag `F`, `pr-41`→v2 (ranked first by `targetRank`), `pr-40`→v1. As a
+ *    throw, the slot is claimed, pr-40 defers, and v2 releases on the next deploy. As `held` the
+ *    slot stays OPEN, so pr-40's own idempotency read sees nothing running and **v1 is rolled out
+ *    to production** — a spurious rollout caused by a transient conflict, with v2 landing on top of
+ *    it next deploy, plus an `ACTION REQUIRED` telling the operator to go edit a correct manifest.
+ *  - **405 "Approval is required to make this request"** is a per-ENVIRONMENT setting. Required
+ *    approvals in production is standard enterprise LaunchDarkly configuration and production is
+ *    Beacon's target, so as a content rejection EVERY manifest for EVERY flag is told to fix its
+ *    `releasePlan`.
+ *  - **404 "Invalid resource identifier"** is the flag or the environment, not the release plan. A
+ *    notification carrying a wrong `environment` reported as a per-flag manifest defect, forever.
+ *
+ * WHY EXCLUDING THOSE THREE IS SAFE, which is the argument the whole allowlist rests on. A throw
+ * claims the flag's per-notification action slot (see the catch in `server.ts`), and a claimed slot
+ * costs a sibling manifest a DELAY unless the throw is BOTH deterministic AND per-manifest — that
+ * one shape starves the sibling permanently. 405 and 404 are per-environment or per-flag, so every
+ * manifest for that flag hits them identically and there is no sibling that could have released;
+ * 409 is transient and resolves on the next deploy. All three land in the "delay, not starvation"
+ * bucket `server.ts`'s catch already enumerates.
+ *
+ * AND AN UNKNOWN 4xx KEEPS THROWING — the reason this is an allowlist rather than a longer denylist.
+ * A status LaunchDarkly does not document here is one we have no basis to call a manifest-content
+ * defect, and asserting it anyway sends an operator to edit a correct file while the real cause goes
+ * unreported. The cost of the other direction is bounded at one delayed deploy, so declining to
+ * classify what we do not recognise is the cheaper error.
+ *
+ * ALSO EXCLUDED, each for its own reason:
+ *  - **429 "Rate limited"**: LaunchDarkly declined it, so nothing was written — but
+ *    `LdClient.request` had already spent its own backoff budget (RATE_LIMIT_RETRIES) and the cause
+ *    is load, not the manifest. Reporting a spent budget as "a human must fix this manifest"
+ *    describes a transient condition as a human problem.
+ *  - **408**: appears NOWHERE in LaunchDarkly's v2 spec, so it is not LaunchDarkly behaviour — a
+ *    proxy in front of it can emit one. Kept excluded because a timed-out request may have been
+ *    received and PROCESSED, which makes it the one 4xx where write-certainty is as unknowable as a
+ *    5xx; it belongs in the "we do not know" bucket that claims the slot.
+ *  - **401 "Invalid access token" / 403**: Beacon's credentials, not the manifest's content, and
+ *    pointing an operator at `releasePlan` when the API key is wrong sends them to the wrong file.
+ *    They are PER-FLAG OR PER-ENVIRONMENT AT WORST, NEVER PER-MANIFEST — not "global", which is what
+ *    this comment used to claim and what LaunchDarkly's model does not support: custom-role resource
+ *    specifiers are globbed and environment-scoped (`proj/*:env/*:flag/ops_*` is a documented
+ *    example, and a flag is a child of both a project and an environment). The conclusion survives
+ *    the corrected premise, because per-flag is already a "starves nobody" bucket: LaunchDarkly has
+ *    no separate role action for a guarded versus a progressive release, so two manifests for one
+ *    flag always request the same actions and one cannot be refused while the other succeeds.
  */
-const NOT_A_CONTENT_REJECTION: ReadonlySet<number> = new Set([401, 403, 408, 429]);
+const CONTENT_REJECTION_STATUSES: ReadonlySet<number> = new Set([400]);
 
 /**
- * Did LaunchDarkly REFUSE this patch (as opposed to failing to answer about it)? Returns the
- * status when so.
+ * Did LaunchDarkly REFUSE this patch on the CONTENT we sent (as opposed to failing to answer about
+ * it, or refusing it for a reason that has nothing to do with the manifest)? Returns the status
+ * when so.
  *
  * Classified on the STATUS CODE carried by `LdApiError`, which is what `LdClient.request` throws
  * for every non-2xx — never on the message text, which is LaunchDarkly's to change.
  *
- * WHY THIS IS A DIFFERENT KIND OF FAILURE from everything else `startRelease` can throw. The rule
- * in `server.ts` is that a throw claims the flag's per-notification action slot, because
- * `startRelease` awaits the response AFTER the patch is applied — so a lost response is "we do not
- * know whether we wrote". A client-error status is not a lost response: LaunchDarkly answered, and
- * its answer is that it did not apply the patch. Write-certainty is therefore knowable from the
- * error itself, and the failure is DETERMINISTIC and PER-MANIFEST — the same manifest is refused on
- * every deploy — which is the one shape for which claiming the slot starves a releasable sibling
+ * WHY THIS IS A DIFFERENT KIND OF FAILURE from everything else a patch can throw. The rule in
+ * `server.ts` is that a throw claims the flag's per-notification action slot, because a patch's
+ * response is awaited AFTER LaunchDarkly applied it — so a lost response is "we do not know whether
+ * we wrote". An allowlisted content rejection is not a lost response: LaunchDarkly answered, and its
+ * answer is that it did not apply the patch. Write-certainty is therefore knowable from the error
+ * itself, and the failure is DETERMINISTIC and PER-MANIFEST — the same manifest is refused on every
+ * deploy — which is the one shape for which claiming the slot starves a releasable sibling
  * permanently rather than delaying it.
  */
 function contentRefusalStatus(e: unknown): number | undefined {
   if (!(e instanceof LdApiError)) return undefined;
-  if (e.status < 400 || e.status >= 500) return undefined;
-  if (NOT_A_CONTENT_REJECTION.has(e.status)) return undefined;
-  return e.status;
+  return CONTENT_REJECTION_STATUSES.has(e.status) ? e.status : undefined;
 }
 
 /** LaunchDarkly's own explanation, so an operator can act on it without reading Beacon's logs. */
@@ -98,6 +140,41 @@ function ldMessage(responseBody: unknown): string {
   } catch {
     return String(responseBody);
   }
+}
+
+/**
+ * The `held` result for a patch LaunchDarkly refused on content grounds — or a RETHROW when the
+ * error is anything else (transient, or a write we cannot rule out; see the catch in `server.ts`).
+ *
+ * ONE builder for both patch sites in this file, the release-start patch and the `prerequisites`
+ * release's patch, because the load-bearing claim is identical and must not drift between them:
+ * NOTHING WAS WRITTEN, so a sibling manifest for this flag can still release in this same
+ * notification. That claim is what keeps the flag's action slot free, and it holds for a
+ * MULTI-instruction patch as much as for a single-instruction one because LaunchDarkly documents
+ * that "Semantic patches are not applied partially; either all of the instructions are applied or
+ * none of them are. If any instruction is invalid, the endpoint returns an error and will not change
+ * the resource." A previous round left the `prerequisites` patch unclassified for want of exactly
+ * that guarantee, and treated it as an assumption rather than a documented property.
+ */
+function heldOnContentRefusal(
+  e: unknown,
+  flagKey: string,
+  /** What LaunchDarkly refused, named as an operator would recognise it. */
+  refused: string,
+  /** Where the refused values came from, so the operator knows which field to edit. */
+  whereToLook: string,
+): TriggerResult {
+  const status = contentRefusalStatus(e);
+  if (status === undefined) throw e;
+  return {
+    flagKey,
+    method: "held",
+    note:
+      `LaunchDarkly REJECTED ${refused} (HTTP ${status}): "${ldMessage((e as LdApiError).responseBody)}". ` +
+      `Semantic patches are never applied partially, so the patch did NOT apply: nothing was written, ` +
+      `and a sibling manifest for '${flagKey}' can still release in this same notification. HELD for a ` +
+      `human: ${whereToLook} Fix it and deploy again; this is re-checked on any later deploy.`,
+  };
 }
 
 /**
@@ -518,20 +595,14 @@ export async function triggerRelease(
         : {}),
     });
   } catch (e) {
-    const status = contentRefusalStatus(e);
-    if (status === undefined) throw e; // transient, or a write we cannot rule out — see the catch in server.ts
-    return {
-      flagKey: flag.flagKey,
-      method: "held",
-      note:
-        `LaunchDarkly REJECTED this manifest's ${method} release instruction (HTTP ${status}): ` +
-        `"${ldMessage((e as LdApiError).responseBody)}". The patch was NOT applied, so nothing was ` +
-        `written and a sibling manifest for '${flag.flagKey}' can still release in this same ` +
-        `notification. HELD for a human: the rejected values come from the manifest's releasePlan ` +
-        `(stages, metricKeys, metricGroupKeys, randomizationUnit) or the flag's release policy — a ` +
-        `guarded stage allocation above 50% is the common one. Fix it and deploy again; this is ` +
-        `re-checked on any later deploy.`,
-    };
+    return heldOnContentRefusal(
+      e,
+      flag.flagKey,
+      `this manifest's ${method} release instruction`,
+      `the rejected values come from the manifest's releasePlan (stages, metricKeys, ` +
+        `metricGroupKeys, randomizationUnit) or the flag's release policy — a guarded stage ` +
+        `allocation above 50% is the common one.`,
+    );
   }
 
   const rollbackNote =

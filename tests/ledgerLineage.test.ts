@@ -459,6 +459,118 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     );
   });
 
+  // -------------------------------------------------------------------------
+  // THE CLASSIFIER IS AN ALLOWLIST, NOT A DENYLIST.
+  //
+  // It used to return a refusal for ANY 4xx except {401, 403, 408, 429}. LaunchDarkly documents six
+  // responses on `PATCH /api/v2/flags/{projectKey}/{featureFlagKey}` — 400, 401, 404, 405, 409, 429 —
+  // so that asserted "this manifest's content is wrong" about three statuses that are nothing of the
+  // kind. The 409 case is not merely mislabelled: it CHANGES WHAT PRODUCTION GETS.
+  // -------------------------------------------------------------------------
+  it("a 409 keeps throwing, and the sibling is NOT spuriously released", async () => {
+    // PREVENTS A SPURIOUS ROLLOUT FROM A TRANSIENT CONFLICT — the one item in this round that is a
+    // production-behaviour regression rather than a mislabelled report.
+    //
+    // 409 is "Status conflict": LaunchDarkly's API overview describes it as "conflicts with a
+    // concurrent API request" and its remediation is "Retry your request." A human editing
+    // `checkout-flow` in the LaunchDarkly UI as pr-41's patch lands produces exactly this.
+    //
+    // As a content refusal, pr-41 answers `held` and does NOT claim the flag's action slot — so
+    // pr-40's own idempotency read sees nothing running and v1 IS ROLLED OUT TO PRODUCTION, with v2
+    // landing on top of it on the next deploy, plus an ACTION REQUIRED telling the operator to edit a
+    // manifest that is correct. Throwing claims the slot, pr-40 defers, and v2 releases next deploy:
+    // a delay instead of a wrong rollout. Transient failures belong in the delay bucket.
+    const state = mvState({
+      patchRejects: rejectV2Start(409, "The API request can not be completed because it conflicts with a concurrent API request"),
+    });
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
+      state,
+    );
+
+    const r = await h.post("sha1");
+    assert.equal(
+      h.starts().length,
+      0,
+      "THE DISCRIMINATOR: v1 did NOT roll out behind a conflict on v2 — nothing released on this flag",
+    );
+    const fortyOne = outcomeFor(r.json, 41);
+    assert.equal(fortyOne.action, "error", "a concurrent-edit conflict is transient, not a manifest defect");
+    assert.match(String(fortyOne.detail), /release trigger failed/);
+    assert.match(String(outcomeFor(r.json, 40).detail), /deferred/, "and the slot is claimed, so the sibling waits");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile).sort(),
+      [path(40), path(41)],
+      "both non-final: the next deploy re-evaluates, by which time the conflict has cleared",
+    );
+
+    // The conflict clears (the human's UI edit finished) and v2 — the higher target — releases,
+    // which is the outcome the throw preserved and the `held` classification lost.
+    state.patchRejects = undefined;
+    const second = await h.post("sha2");
+    assert.equal(h.starts().length, 1, "exactly one release across both deploys");
+    assert.equal(h.starts()[0]?.targetVariationId, "id-v2", "THE DISCRIMINATOR: and it is v2, never v1");
+    assert.equal(outcomeFor(second.json, 41).action, "released");
+  });
+
+  it("a 405 'approval is required' keeps throwing — it is per-ENVIRONMENT, not per-manifest", async () => {
+    // PREVENTS telling every manifest for every flag to go fix its releasePlan. 405 on this endpoint
+    // is "Approval is required to make this request", which is a per-environment LaunchDarkly setting.
+    // Required approvals in production is standard enterprise configuration and production is
+    // Beacon's target, so as a content refusal EVERY manifest gets a report naming `releasePlan` —
+    // for a setting that has nothing to do with the manifest and cannot be fixed by editing it.
+    //
+    // Safe to keep throwing precisely BECAUSE it is per-environment: every sibling hits it
+    // identically, so none of them could have released and the slot claim starves nobody.
+    const state = mvState({ patchRejects: rejectV2Start(405, "Approval is required to make this request") });
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
+      state,
+    );
+
+    const r = await h.post("sha1");
+    const fortyOne = outcomeFor(r.json, 41);
+    assert.equal(fortyOne.action, "error", "THE DISCRIMINATOR: an approval requirement is not a manifest defect");
+    assert.doesNotMatch(
+      String(fortyOne.detail),
+      /releasePlan/,
+      "and the operator is NOT sent to edit releasePlan for an environment setting",
+    );
+    assert.equal(h.starts().length, 0);
+  });
+
+  it("a 404 'invalid resource identifier' keeps throwing — it is per-FLAG, not per-manifest", async () => {
+    // PREVENTS reporting a wrong `environment` on the notification as a permanent per-manifest
+    // defect. 404 on this endpoint is "Invalid resource identifier" — the flag or the environment,
+    // never the release plan — so it is per-flag or per-environment and every manifest for that flag
+    // hits it identically. Reported as content, a mistyped environment blamed the manifest forever.
+    const state = mvState({ patchRejects: rejectV2Start(404, "Invalid resource identifier") });
+    const h = await harness(
+      ghWith([`pr-40.json`, `pr-41.json`], { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") }),
+      state,
+    );
+
+    const r = await h.post("sha1");
+    assert.equal(
+      outcomeFor(r.json, 41).action,
+      "error",
+      "THE DISCRIMINATOR: a bad flag/environment identifier is not this manifest's content",
+    );
+    assert.equal(h.starts().length, 0);
+  });
+
+  it("an UNDOCUMENTED 4xx keeps throwing rather than being asserted to be a content defect", async () => {
+    // PREVENTS re-widening this to "any 4xx". 418 is not in LaunchDarkly's documented set for this
+    // endpoint, so there is no basis for calling it a manifest-content defect — and asserting it
+    // anyway sends an operator to edit a correct file while the real cause goes unreported. The cost
+    // of the throw is one delayed deploy, which is the cheaper error.
+    const state = mvState({ patchRejects: rejectV2Start(418, "unexpected") });
+    const h = await harness(ghWith([`pr-41.json`], { [path(41)]: manifest("v2") }), state);
+    const r = await h.post("sha1");
+    assert.equal(outcomeFor(r.json, 41).action, "error", "THE DISCRIMINATOR: unknown ⇒ not classified as content");
+    assert.equal(h.starts().length, 0);
+  });
+
   it("a 429 is NOT reclassified: it stays an error and still claims the slot", async () => {
     // PREVENTS widening the classifier to "any 4xx". A 429 is a rate limit, and `LdClient.request`
     // already spent its own backoff budget before surfacing it — reporting a spent budget as
@@ -492,8 +604,13 @@ describe("a release instruction LaunchDarkly REJECTS is held, not filed as a los
     // The recovery half: `held` is not final, so the ledger keeps re-checking — and re-READS the
     // manifest at the current sha. This is what makes the refusal actionable rather than merely
     // honest, and it is the property a `noop` (final) classification would have destroyed.
+    //
+    // 400, not 422: the classifier is an ALLOWLIST of the statuses LaunchDarkly documents on
+    // `PATCH /api/v2/flags/{proj}/{flag}` (400, 401, 404, 405, 409, 429), and a 422 is not among
+    // them — so it is an unknown 4xx and keeps throwing. A bad randomizationUnit is a 400
+    // ("Invalid request") like any other refusal of the instruction body.
     const state = mvState({
-      patchRejects: rejectV2Start(422, "randomizationUnit 'organisation' is not configured"),
+      patchRejects: rejectV2Start(400, "randomizationUnit 'organisation' is not configured"),
     });
     const h = await harness(ghWith([`pr-41.json`], { [path(41)]: manifest("v2") }), state);
 
