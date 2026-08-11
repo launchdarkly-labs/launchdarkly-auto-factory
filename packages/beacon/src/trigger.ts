@@ -473,12 +473,38 @@ export async function triggerRelease(
       instructions.push({ kind: "addPrerequisite", key: p.flagKey, variationId: parentVar._id });
     }
     instructions.push({ kind: "turnFlagOn" }, { kind: "updateFallthroughVariationOrRollout", variationId: targetVar._id });
-    await ld.patchFlagSemantic(
-      flag.flagKey,
-      environmentKey,
-      instructions,
-      "auto-factory: release via prerequisites (releaseIntent)",
-    );
+    // CLASSIFIED LIKE THE RELEASE-START PATCH, and it was the known gap the previous round
+    // documented instead of fixing. This patch's `addPrerequisite` instructions are built from
+    // `releaseIntent.prerequisites`, which nothing validates against LaunchDarkly: `sandboxTools`
+    // checks only that a key LOOKS like a flag key, and `normalizePrerequisites` accepts any
+    // syntactically valid one. So a manifest naming a CIRCULAR prerequisite — a parent that already
+    // depends on this flag, directly or through a chain — is one LaunchDarkly MUST refuse, and it is
+    // deterministic and per-manifest: as a bare throw it claimed the flag's action slot on every
+    // deploy and starved the sibling that could release, permanently.
+    //
+    // The stated blocker was wanting a rejection LaunchDarkly really returns; a circular
+    // prerequisite is one. And the property that licenses the classifier is now DOCUMENTED rather
+    // than assumed for this multi-instruction patch: semantic patches are never applied partially
+    // (see `heldOnContentRefusal`), so a refusal means the `turnFlagOn` and the fallthrough change
+    // did not land either — nothing was written, and the sibling can still release.
+    try {
+      await ld.patchFlagSemantic(
+        flag.flagKey,
+        environmentKey,
+        instructions,
+        "auto-factory: release via prerequisites (releaseIntent)",
+      );
+    } catch (e) {
+      return heldOnContentRefusal(
+        e,
+        flag.flagKey,
+        "this manifest's prerequisites release instruction",
+        `the rejected values come from the manifest's releaseIntent.prerequisites ` +
+          `[${intent.prerequisites.map((p) => `${p.flagKey}=${p.variation ?? "on"}`).join(", ")}] — a ` +
+          `CIRCULAR prerequisite (a parent that already depends on '${flag.flagKey}', directly or ` +
+          `through a chain) and a dependency-depth limit are the ones LaunchDarkly refuses.`,
+      );
+    }
     return {
       flagKey: flag.flagKey,
       method: "prerequisites",

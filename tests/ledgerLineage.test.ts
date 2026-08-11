@@ -696,6 +696,70 @@ describe("every method that WROTE claims the flag's action slot", () => {
     assert.match(String(outcomeFor(r.json, 51).detail), /deferred/, "deferred non-finally, so it is re-checked");
   });
 
+  it("but a REJECTED prerequisites patch does NOT claim it, and the sibling releases", async () => {
+    // PREVENTS PERMANENT SIBLING STARVATION VIA THE PREREQUISITES PATH — the gap the previous round
+    // found and documented instead of fixing, for want of a rejection LaunchDarkly really returns.
+    // A CIRCULAR prerequisite is one it must refuse, and nothing upstream can prevent it:
+    // `sandboxTools` checks only that a prerequisite key looks like a flag key, and
+    // `normalizePrerequisites` accepts any syntactically valid one.
+    //
+    // Only the RELEASE-START patch was classified, so a 4xx on `addPrerequisite` threw, and the
+    // catch in server.ts claims the flag's slot for any throw. That claim is right for a LOST
+    // RESPONSE and wrong here: this refusal is deterministic and per-manifest, so it recurred on
+    // every deploy and pr-51 was starved forever while being told "another manifest released
+    // 'checkout-flow' in this notification", which had not happened.
+    //
+    // Both manifests ask for v2, so the (stable) sort cannot reorder them and pr-50 — the rejected
+    // one — is evaluated FIRST, which is the ordering that makes the starvation reachable.
+    const state = mvState({
+      parents: ["parent-flag"],
+      patchRejects: (p) =>
+        p.instructions.some((i) => i.kind === "addPrerequisite")
+          ? { status: 400, message: "circular prerequisite: 'parent-flag' already depends on 'checkout-flow'" }
+          : undefined,
+    });
+    const h = await harness(
+      ghWith([`pr-50.json`, `pr-51.json`], {
+        [path(50)]: manifest("v2", {
+          releaseIntent: { prerequisites: [{ flagKey: "parent-flag", variation: "on" }] },
+        }),
+        [path(51)]: manifest("v2"),
+      }),
+      state,
+    );
+
+    const r = await h.post("sha1");
+    assert.equal(h.starts().length, 1, "THE DISCRIMINATOR: exactly one release, where there used to be none");
+    assert.equal(h.starts()[0]?.targetVariationId, "id-v2", "and it is the SIBLING's");
+
+    const fifty = outcomeFor(r.json, 50);
+    assert.equal(fifty.action, "held", "a refused prerequisite needs a human, not a retry");
+    assert.match(
+      JSON.stringify(fifty.detail),
+      /circular prerequisite/,
+      "and it names LAUNCHDARKLY'S OWN message, so the operator knows what to edit",
+    );
+    assert.match(
+      JSON.stringify(fifty.detail),
+      /releaseIntent\.prerequisites/,
+      "and points at releaseIntent, not releasePlan — this patch's values come from the intent",
+    );
+
+    const fiftyOne = outcomeFor(r.json, 51);
+    assert.equal(fiftyOne.action, "released");
+    assert.doesNotMatch(
+      JSON.stringify(fiftyOne.detail),
+      /another manifest/,
+      "and it is no longer told that a release it never got had already happened",
+    );
+
+    // pr-50 stays tracked (held is not final), so a corrected intent takes effect on a later deploy.
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(50)],
+    );
+  });
+
   it("an `immediate` release claims it too", async () => {
     const h = await harness(
       ghWith([`pr-50.json`, `pr-51.json`], {
