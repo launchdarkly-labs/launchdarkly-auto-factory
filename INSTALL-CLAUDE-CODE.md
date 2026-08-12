@@ -14,62 +14,55 @@ you drop into your app repo. Setup is about 10 minutes.
 
 - **Node 20+** (`node --version`)
 - **Claude Code** ([install](https://claude.com/claude-code))
-- A **LaunchDarkly account with two projects**:
-  - a **factory** project — holds the agent configs and graph (the pipeline reads from it)
-  - an **app** project — where the agents create flags and metrics (the pipeline writes to it)
-- A **server SDK key** for the factory project's environment, and an **API access
-  token** with write access to both projects
+- A **LaunchDarkly account** and an **API access token** (`api-…`) with write
+  access — the two projects and the SDK key are created/fetched by setup
 - An **Anthropic API key** — agents execute on the Anthropic API directly, billed
   to this key (separate from your Claude Code subscription)
 
-## 1. Clone, configure, bootstrap (this repo)
+## 1 + 2. Clone and run the guided setup
 
 ```bash
 git clone <this-repo> && cd launchdarkly-auto-factory
 npm install
-cp .env.example .env
+npm run init
 ```
 
-Fill in five values in `.env` (everything else can stay blank):
-
-| Variable | Value |
-|----------|-------|
-| `LD_SDK_KEY` | factory project server SDK key (`sdk-…`) |
-| `LD_API_KEY` | LaunchDarkly API token (`api-…`) with write access to both projects |
-| `LD_PROJECT_KEY` | factory project key |
-| `LD_APP_PROJECT_KEY` | app project key |
-| `ANTHROPIC_API_KEY` | Anthropic API key |
-
-Then:
+`init` asks for the API token and Anthropic key (masked prompts), then: creates
+or confirms the **factory** project (agent configs + graph — the pipeline reads
+from it) and the **app** project (where agents create flags and metrics),
+**fetches** the factory environment's server SDK key, writes `.env`, and
+provisions the agent AI configs, judges, agent graph, and operational flags.
+It's idempotent — re-running resumes, and existing resources are never
+overwritten. Choose provider **anthropic** (default; or `bedrock` with AWS
+credentials set) and front end **claude-code** — it copies the skill into the
+app repo path you give it. Then persist the tooling path:
 
 ```bash
-npm run bootstrap
-```
-
-Bootstrap builds the workspace, runs preflight checks (Node version, LaunchDarkly
-reachability, key authorization), and provisions the agent AI configs, judges,
-agent graph, and operational flags into your factory project. It's idempotent —
-existing resources are never overwritten. When it prompts for a provider, accept
-the default (**anthropic** — the Claude Code path runs on the sandboxed runners:
-Anthropic, or Bedrock if the provider flag serves `bedrock` and AWS credentials
-are set). The "Next steps" it prints are for the GitHub Action front end; for
-Claude Code, continue below instead.
-
-## 2. Install the skill (your app repo)
-
-Copy the skill into your app repo and tell it where this tooling checkout lives:
-
-```bash
-mkdir -p <your-app-repo>/.claude/skills
-cp -R bootstrap/claude-code/skills/autofactory <your-app-repo>/.claude/skills/autofactory
 export AUTOFACTORY_HOME="$(pwd)"    # add to your shell profile to persist
 ```
 
 (If `AUTOFACTORY_HOME` isn't set, Claude Code will ask for the checkout path on
-first run instead.)
+first run instead. You can also run the setup conversationally: open a Claude
+Code session in this repo and type `/autofactory-setup`.)
 
 Commit `.claude/skills/autofactory/` to the app repo if you want every user of
-the repo to have the skill.
+the repo to have the skill. Validate the install any time with `npm run doctor`.
+
+<details>
+<summary>Manual alternative (what init automates)</summary>
+
+Create the two LD projects and an API token + factory-environment server SDK key
+by hand, then `cp .env.example .env` and fill in `LD_SDK_KEY`, `LD_API_KEY`,
+`LD_PROJECT_KEY`, `LD_APP_PROJECT_KEY`, `ANTHROPIC_API_KEY`; run
+`npm run bootstrap` (accept provider **anthropic**; its printed "Next steps" are
+for the GitHub Action — skip them); finally copy the skill:
+
+```bash
+mkdir -p <your-app-repo>/.claude/skills
+cp -R bootstrap/claude-code/skills/autofactory <your-app-repo>/.claude/skills/autofactory
+```
+
+</details>
 
 ## 3. First run
 
@@ -113,10 +106,13 @@ Two committed layers in your app repo (both under `bootstrap/claude-code/` here)
 
 ## Troubleshooting
 
+First move for anything below: `npm run doctor` in the tooling repo — it checks
+all of these (and prints the fix next to each failing check).
+
 | Symptom | Fix |
 |---------|-----|
-| `LD_SDK_KEY is not set` (or similar, exit 2) | The CLI reads `.env` from the tooling repo root — check step 1's five values are filled in there. |
-| `Agent graph 'gha-auto-factory' is disabled or unavailable` | `LD_SDK_KEY` is usually the wrong project's key — it must be the **factory** project's server SDK key, not the app project's. Also confirm `npm run bootstrap` completed. |
+| `LD_SDK_KEY is not set` (or similar, exit 2) | The CLI reads `.env` from the tooling repo root — re-run `npm run init` (or fill the values by hand). |
+| `Agent graph 'gha-auto-factory' is disabled or unavailable` | `LD_SDK_KEY` is usually the wrong project's key — it must be the **factory** project's server SDK key, not the app project's (`npm run doctor` verifies this exactly; `npm run init` fetches the right one). Also confirm provisioning completed. |
 | `nothing to process` (exit 2) | The branch has no commits ahead of the base and no working-tree changes. Make a change first, or pass a different base (`--base <ref>`). |
 | `⚠ knowledge graph: ld-find-code-refs binary not found on PATH` | Harmless — flag→code wrap-point edges are skipped, the run continues. Only appears when the `auto-factory-knowledge-graph` flag is on. To silence: `brew install launchdarkly/tap/ld-find-code-refs`, or grab a binary from [ld-find-code-refs releases](https://github.com/launchdarkly/ld-find-code-refs/releases). |
 | `⚠ LaunchDarkly configs were provisioned from a different repo version` | Your LD configs pre-date this checkout. Run `npm run bridge -- upgrade` from the tooling repo (add `--dry-run` to preview). |

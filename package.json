@@ -19,7 +19,9 @@
     "export:tools": "node scripts/export-tools.mjs",
     "test": "node --import tsx --test tests/*.test.ts",
     "bootstrap": "node bootstrap/create.mjs",
-    "bridge": "node --import tsx packages/config-bridge/src/cli.ts"
+    "bridge": "node --import tsx packages/config-bridge/src/cli.ts",
+    "init": "node --import tsx packages/config-bridge/src/cli.ts init",
+    "doctor": "node --import tsx packages/config-bridge/src/cli.ts doctor"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

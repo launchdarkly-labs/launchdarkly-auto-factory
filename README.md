@@ -70,19 +70,43 @@ own README. For the Claude Code path there is a standalone install guide:
 ### Prerequisites
 
 - Node 20+ for local tooling (the GitHub Action itself runs on Node 24; the Cursor provider requires Node ≥22.13)
-- A LaunchDarkly account with **two projects**:
-  - a **factory** project, which holds the agent configs and graph (the pipeline reads from it)
-  - an **app** project, where the agents create flags and metrics (the pipeline writes to it)
-- A LaunchDarkly server SDK key for the factory project's environment, and an API access
-  token with write access to both projects
+- A LaunchDarkly account and an **API access token** (`api-…`) with write access —
+  everything else on the LD side (the two projects, the SDK key) is created or
+  fetched by the guided setup below
 - An Anthropic API key (the default agent execution backend), AWS credentials with Bedrock model access to run on the Bedrock provider, or a Cursor API key to run on the Cursor provider
-- A GitHub repository for your application
+- A GitHub repository for your application, and the [GitHub CLI](https://cli.github.com)
+  logged in (`gh auth login`) if you want setup to configure it for you
 
-### 1. Provision the agent configs, graph, and operational flags
+### Quick start (guided)
 
 ```bash
 git clone <this repo> && cd launchdarkly-auto-factory
 npm install
+npm run init
+```
+
+`init` asks for the API token and a few choices, then does the rest: creates (or
+confirms) the **factory** project — which holds the agent configs and graph — and
+the **app** project — where agents create flags and metrics; **fetches** the
+factory environment's server SDK key (so it can never be the wrong project's key);
+writes `.env`; provisions the agent configs, judges, graph, tools, and operational
+flags (details below); and wires your chosen front end. For the GitHub Action that
+means setting the app repo's secrets and `LD_APP_PROJECT_KEY` variable via `gh`
+and opening a **setup PR** with the rendered workflows — merge it and open any PR
+to see the chain run. It's idempotent: re-running resumes wherever it stopped, and
+never overwrites existing LD resources or targeting.
+
+Validate an install any time (each failing check prints its fix):
+
+```bash
+npm run doctor          # add: -- --app-repo owner/name for the GitHub-side checks
+```
+
+The steps below document the same setup done **by hand** (or what `init` just did).
+
+### 1. Provision the agent configs, graph, and operational flags
+
+```bash
 cp .env.example .env    # fill in LD_SDK_KEY, LD_API_KEY, LD_PROJECT_KEY, LD_APP_PROJECT_KEY, ANTHROPIC_API_KEY
 npm run bootstrap       # prompts for the execution provider (anthropic, bedrock, or cursor)
 ```
@@ -119,6 +143,8 @@ run warns — in the Actions log and the PR summary comment — and points you b
 tracks which repo version last provisioned the project, not live content.
 
 ### 2. Add the workflow to your app repo
+
+(`npm run init` does all of this via `gh` — secrets, variable, and a setup PR.)
 
 Copy `bootstrap/github-action-template/auto-factory.yml` into your app repo at
 `.github/workflows/auto-factory.yml` and replace `<owner>` with the org or user hosting this
@@ -294,6 +320,7 @@ npm test             # unit + integration tests
 npm run typecheck    # build + tests typecheck
 npm run check:public # guard against committing internal material
 npm run check:configs # validate agent configs/graph consistency (tags, routing, README)
+npm run doctor       # validate a live install (env, LD projects, GitHub app repo)
 ```
 
 Changes to the agent configs, the graph, or operational flags are logged in

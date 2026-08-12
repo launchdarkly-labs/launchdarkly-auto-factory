@@ -136,5 +136,10 @@ console.log(
 
 Provisioned from the committed definitions in config/agentcontrol/ (the canonical
 public copies). The agent instructions are editable in the LaunchDarkly UI afterward;
-the pipeline reads them at run time.`),
+the pipeline reads them at run time.`) +
+    `
+
+Tip: \`npm run init\` automates the manual steps above (app-repo secrets, variable,
+and a setup PR via gh) — and can create the LD projects / fetch the SDK key too.
+Validate any install with \`npm run doctor\`.`,
 );
