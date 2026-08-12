@@ -26,6 +26,7 @@
 import { AnthropicBedrockMantle } from "@anthropic-ai/bedrock-sdk";
 import type { AgentNodeRequest, AgentNodeResult, AgentRunner } from "../agentRunner.js";
 import {
+  ANTHROPIC_TIMEOUT_MS,
   AnthropicAgentRunner,
   type AnthropicAgentRunnerOptions,
   type AnthropicMessagesClient,
@@ -50,9 +51,11 @@ export interface BedrockAgentRunnerOptions
   awsRegion?: string;
 }
 
-/** An `AnthropicBedrockMantle` client, typed to the runner's Messages slice. */
+/** An `AnthropicBedrockMantle` client, typed to the runner's Messages slice.
+ *  Carries the same explicit timeout as the direct client — required for the
+ *  raised MAX_TOKENS (see ANTHROPIC_TIMEOUT_MS). */
 export function createBedrockClient(awsRegion?: string): AnthropicMessagesClient {
-  return new AnthropicBedrockMantle(awsRegion ? { awsRegion } : {});
+  return new AnthropicBedrockMantle({ timeout: ANTHROPIC_TIMEOUT_MS, ...(awsRegion ? { awsRegion } : {}) });
 }
 
 export class BedrockAgentRunner implements AgentRunner {

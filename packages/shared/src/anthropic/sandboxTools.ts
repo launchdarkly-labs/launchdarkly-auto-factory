@@ -1300,8 +1300,11 @@ export class SandboxToolExecutor {
     }
   }
 
-  /** Run a command capturing output + exit code without throwing. */
-  private sh(file: string, args: string[], cwd: string, timeoutMs = 240_000): { code: number; out: string } {
+  /** Run a command capturing output + exit code without throwing. Only the
+   *  test/install commands come through here (git uses runGit); the timeout is
+   *  a runaway backstop, sized so a slow cold dependency install + a real
+   *  suite never hit it. */
+  private sh(file: string, args: string[], cwd: string, timeoutMs = 1_800_000): { code: number; out: string } {
     const r = spawnSync(file, args, { cwd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 });
     const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
     if (r.error) return { code: -1, out: `${out}\n${r.error.message}` };

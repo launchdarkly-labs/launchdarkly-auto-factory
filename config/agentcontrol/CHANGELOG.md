@@ -15,6 +15,30 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-12 (raise runaway backstops)
+
+### ✅ `gha-auto-factory`: all edge `max_turns` → 100
+
+- Raised every edge's `max_turns` (was 8 steward / 20 implementer / 20
+  metrics-author / 20 flag-testing / 30 reviewer) to a uniform **100**, and the
+  runner's no-edge default from 12 to 100. These caps are runaway backstops,
+  not budgets: the old values were low enough for a legitimately long node —
+  especially flag-testing scaffolding a test harness from scratch on a
+  greenfield repo (explore → scaffold → install → fix-and-re-run loop) — to
+  hit the cap mid-task. Worse, a capped node reports `stopped` (not `failed`),
+  the chain continues, and un-pushed work is silently lost.
+- Companion runtime changes (code repo, same day): per-response `max_tokens`
+  4096 → 32000 (a `write_file` carries the whole file in one response; a
+  max_tokens stop exited the tool loop silently as `completed`), judge cap
+  4096 → 16000 (truncation still detected + discarded), `run_tests` subprocess
+  timeout 240s → 30 min, and an explicit 60-min API client timeout (the SDK
+  refuses non-streaming requests above ~21k max_tokens without one).
+- Live update: `gha-auto-factory` on `auto-factory-prototype` PATCHed via
+  `bridge upgrade` (graph handoff drift is part of the owned shape). Other
+  existing projects pick this up on their next `bridge upgrade`.
+
+---
+
 ## 2026-08-07 (Bedrock provider)
 
 ### ✅ `auto-factory-ai-provider`: new `bedrock` variation

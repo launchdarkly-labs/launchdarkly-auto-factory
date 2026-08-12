@@ -93,8 +93,22 @@ export function modeNote(caps: ToolCapabilities): string {
   return lines.join("\n") + TAGGING_NOTE;
 }
 
-const DEFAULT_MAX_TURNS = 12;
-const MAX_TOKENS = 4096;
+// Backstops, not budgets: sized so they only trip on runaway behavior, never
+// on a legitimately long task (e.g. flag-testing scaffolding a test harness
+// from scratch — see the turn-cap loss + silent max_tokens truncation modes,
+// 2026-08-12). A node that hits either of these has gone really wrong.
+const DEFAULT_MAX_TURNS = 100;
+// 32000 = the max output every current Claude model supports (Opus caps at
+// 32k; Sonnet/Haiku go higher). A single write_file carries the whole file in
+// one response, and a max_tokens stop exits the tool loop with the write lost.
+const MAX_TOKENS = 32_000;
+/**
+ * Explicit per-client timeout. Without one, the SDK REFUSES non-streaming
+ * requests whose max_tokens implies >10 minutes at its modeled throughput
+ * (~21k tokens), throwing at request time — so raising MAX_TOKENS past that
+ * requires setting this. 60 min matches the SDK's own non-streaming ceiling.
+ */
+export const ANTHROPIC_TIMEOUT_MS = 3_600_000;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 /**
@@ -286,7 +300,7 @@ export class AnthropicAgentRunner implements AgentRunner {
   private readonly modelId: (name: string | undefined) => string;
 
   constructor(private readonly opts: AnthropicAgentRunnerOptions) {
-    this.client = opts.client ?? new Anthropic(opts.apiKey ? { apiKey: opts.apiKey } : {});
+    this.client = opts.client ?? new Anthropic({ timeout: ANTHROPIC_TIMEOUT_MS, ...(opts.apiKey ? { apiKey: opts.apiKey } : {}) });
     this.providerName = opts.providerName ?? "anthropic";
     this.modelId = opts.modelIdMapper ?? anthropicModelId;
   }
