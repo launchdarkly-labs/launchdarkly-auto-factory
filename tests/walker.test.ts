@@ -570,6 +570,43 @@ describe("walkGraph — loop-back edges", () => {
     }
   });
 
+  it("5c-quater. the malformed-handoff warning cannot be the reason a walk stops", async () => {
+    // `JSON.stringify` throws on a BigInt and on a circular structure. A served graph is
+    // parsed JSON so neither is reachable in production, but a programmatically built
+    // AgentGraphDefinition can hold both — and before `describeRejectedValue`, both crashed
+    // the walk mid-loop, which is strictly worse than the silence the warning replaced.
+    // Reported by review: "a warning that crashes the walker is worse than the silence it
+    // replaced" was literally true for non-JSON inputs.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    for (const [label, bad] of [
+      ["bigint", 2n],
+      ["circular", circular],
+      ["symbol", Symbol("2")],
+    ] as Array<[string, unknown]>) {
+      const g = graphFrom({
+        root: "research",
+        edges: {
+          research: [{ key: "flag" }],
+          flag: [{ key: "review" }],
+          review: [{ key: "flag", handoff: { max_visits: bad } as never }],
+        },
+      });
+      const realWarn = console.warn;
+      console.warn = () => {};
+      let r;
+      try {
+        // Must COMPLETE. The assertion is the absence of a throw, so any rejection here is
+        // the regression — the walk must reach its own termination, not the stringifier's.
+        r = await walkGraph(g, new ScriptedRunner({}), { PR_NUMBER: "1" });
+      } finally {
+        console.warn = realWarn;
+      }
+      assert.ok(r.runs.length > 0, `${label}: the walk ran`);
+      assert.equal(r.loopExhausted?.reason, "run-cap", `${label}: unrecognised, so bounded by the run cap`);
+    }
+  });
+
   it("5c-ter. a SERVED loop_if_judge_below that is not a number stops gating on the judge", async () => {
     // The opposite loss from 5c-bis, which is why the two warnings differ: an ignored
     // threshold does not remove the budget, it removes the QUALITY SIGNAL — the edge fires on

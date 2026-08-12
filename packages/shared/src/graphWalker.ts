@@ -383,6 +383,15 @@ function warnIfOnlyStaleWouldMatch(
  * Deliberately a WARNING and not a coercion. Reading `"2"` as 2 would make the walker
  * accept input the validator rejects, which is a second definition of a loop edge and the
  * very drift being closed here. The walker's job is to NOTICE what the validator refuses.
+ *
+ * DELIBERATELY NOT EVERY silently-ignored field. `max_turns` (`handoffNumber`),
+ * `request_type` (`handoffString`) and `capabilities` (`handoffStringArray`) drift the same
+ * silent way, and are left out because what they lose is the run ENVELOPE — the node falls
+ * back to the entry edge's recorded fields and then to the runner's defaults — which cannot
+ * change loop recognition, termination, or budget reporting. The two fields here are the
+ * ones whose loss is invisible AND alters control flow. Stated because an earlier account
+ * of this change claimed the exclusions were named in a comment when they were not, which
+ * is the same over-claim this file's history is full of.
  */
 const NUMERIC_HANDOFF_FIELDS: ReadonlyArray<{ field: string; lost: string }> = [
   {
@@ -398,6 +407,23 @@ const NUMERIC_HANDOFF_FIELDS: ReadonlyArray<{ field: string; lost: string }> = [
       "is triggered without any quality signal",
   },
 ];
+
+/**
+ * Render a rejected value for the message without ever being the reason the walk stops.
+ *
+ * `JSON.stringify` THROWS on a BigInt and on a circular structure. A served graph arrives as
+ * parsed JSON so neither is reachable in production, but a programmatically built
+ * `AgentGraphDefinition` — tests, and any future harness — can hold both, and a warning that
+ * crashes the walk it is describing is strictly worse than the silence it replaced. `String`
+ * is total for every value that reaches here, including symbols (unlike interpolation).
+ */
+function describeRejectedValue(raw: unknown): string {
+  try {
+    return JSON.stringify(raw) ?? String(raw);
+  } catch {
+    return String(raw);
+  }
+}
 
 /**
  * Warn once per edge+field when a numeric handoff field is present but is not a number.
@@ -418,7 +444,7 @@ function warnIfMalformedNumericHandoff(
     if (warned.has(wk)) continue;
     warned.add(wk);
     console.warn(
-      `[loop] edge ${source} → ${target} has ${field}=${JSON.stringify(raw)}, which is ` +
+      `[loop] edge ${source} → ${target} has ${field}=${describeRejectedValue(raw)}, which is ` +
         `${Array.isArray(raw) ? "an array" : typeof raw} and not a number, so the walker IGNORES it: ${lost}. ` +
         `The committed-config check rejects this, so it came from the SERVED graph — ` +
         `run 'npm run bridge -- upgrade' to restore the committed value.`,

@@ -33676,6 +33676,13 @@ var NUMERIC_HANDOFF_FIELDS = [
     lost: "this edge no longer gates on the judge score \u2014 it fires whenever its tag conditions pass, so rework is triggered without any quality signal"
   }
 ];
+function describeRejectedValue(raw) {
+  try {
+    return JSON.stringify(raw) ?? String(raw);
+  } catch {
+    return String(raw);
+  }
+}
 function warnIfMalformedNumericHandoff(source, target, handoff, warned) {
   for (const { field, lost } of NUMERIC_HANDOFF_FIELDS) {
     const raw = handoff?.[field];
@@ -33685,7 +33692,7 @@ function warnIfMalformedNumericHandoff(source, target, handoff, warned) {
     if (warned.has(wk))
       continue;
     warned.add(wk);
-    console.warn(`[loop] edge ${source} \u2192 ${target} has ${field}=${JSON.stringify(raw)}, which is ${Array.isArray(raw) ? "an array" : typeof raw} and not a number, so the walker IGNORES it: ${lost}. The committed-config check rejects this, so it came from the SERVED graph \u2014 run 'npm run bridge -- upgrade' to restore the committed value.`);
+    console.warn(`[loop] edge ${source} \u2192 ${target} has ${field}=${describeRejectedValue(raw)}, which is ${Array.isArray(raw) ? "an array" : typeof raw} and not a number, so the walker IGNORES it: ${lost}. The committed-config check rejects this, so it came from the SERVED graph \u2014 run 'npm run bridge -- upgrade' to restore the committed value.`);
   }
 }
 function grantedVisits(grants, edge, runsConsumed) {
