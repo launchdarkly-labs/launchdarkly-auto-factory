@@ -252,9 +252,13 @@ declared three edges from one source in the order Z, M, A (edge keys deliberatel
 declared order):
 
 - **The SDK-served graph returned declared order** (Z, M, A), and likewise preserves the committed
-  graph's load-bearing `metrics-author` pair — the loop edge before the forward edge.
+  graph's load-bearing `metrics-author` pair — the loop edge before the forward edge. Two
+  observations, and LaunchDarkly documents no ordering guarantee, so read this as "was faithful
+  both times", not as a property to rely on. The walker RECORDS the served ordering rather than
+  trusting it (§7a.1), which is what makes the system robust if that ever stops holding.
 - **REST GET returned A, M, Z** — the exact reverse. On the real graph REST returned yet another
   arrangement (7 edges, neither declared nor alphabetical). **REST GET order is not dependable.**
+  One counterexample is enough for the conclusion below, so this half needs no more evidence.
 
 Two consequences, and the second is the one that needs the design call:
 
@@ -262,6 +266,15 @@ Two consequences, and the second is the one that needs the design call:
    returns a different order than the committed file for a graph LaunchDarkly created *from that
    file*, so an order-sensitive comparison would report drift on every run, starting immediately.
    The sort is load-bearing.
+
+   **The accepted cost, which the first version of this section did not state:** keeping the sort
+   makes an order-only reorder not just undetectable by the bridge but **unrepairable** by it.
+   `upgrade` skips the write when the sorted shape AND the stamped description both match
+   (`upgrade.ts:213`), so `bridge upgrade` against an LD-side reorder reports zero changes and
+   rewrites nothing; `provision` is create-only. It repairs the order only incidentally, when some
+   *other* committed change moves the config hash and forces a graph rewrite. The reliable fix is
+   the LaunchDarkly UI, or a direct graph write. The walker's warning says exactly this — advice
+   that visibly does nothing teaches the reader to dismiss the warning, which is how a guard dies.
 2. **No REST-based check can guard the ordering invariant at all** — GET's order is a derived view,
    so a real within-source reorder is indistinguishable from LaunchDarkly's own shuffling. The
    invariant in the graph's `$comment` ("the loop edge MUST stay declared BEFORE the forward edge",
@@ -283,11 +296,29 @@ unattended real PRs it is a retry nobody would ever know did not happen.
   a RECORD, not a gate — the walk is still valid, it has just lost a retry — reported on the same
   three surfaces as `loopBudgetSpent` (Action warning, CLI summary, extension log), because the
   failure leaves no other trace: no extra runs, no budget spent, no `loopExhausted`.
-- **The two halves cannot drift**: `check-configs` **6h** asserts the walker still defines
+- **The two halves cannot vanish silently**: `check-configs` **6h** asserts the walker still defines
   `LOOP_EDGE_SHADOWED_RULE`, still calls the recorder, and still puts the result on `WalkResult`.
   Eleven prose corrections in this branch's history each fixed three of four sites; 6h is the cheap
   refusal to make that twelve. It earned itself on the first run, catching the marker moving into a
-  helper.
+  helper. **It is not proof the halves AGREE** — an earlier draft of this line said "cannot drift",
+  which over-claims: 6h is a source-text lint, so it matches commented-out code and cannot tell a
+  live mechanism from a broken one. `tests/loopEdgeOrder.test.ts` is the behavioural proof.
+
+**Two known gaps, recorded rather than closed** (the treatment §6 uses for the 403 row and the
+`immediate` narrowing):
+
+1. **The record is an ORDERING violation, not a proven-dead loop.** If the forward edge ahead of the
+   loop is condition-gated and fails, selection falls through and the loop fires — so a walk can
+   carry `loopEdgeShadowed` *and* a fired loop, and `precededBy` can name an edge that never won.
+   Narrowing the check to unconditional forward edges is the obvious fix and it is **wrong**: the
+   committed graph's only shadowable edge, `metrics-author → flag-testing`, is gated on
+   `needs_tests`, which its source always emits, so narrowing would skip the one edge the guard
+   exists for. Pinned by a test asserting the loop fires AND the record is present.
+2. **`loopEdgeShadowed` is deduped by (source, TARGET), not per edge.** On a served graph
+   `edge.key` IS the target key, so two loop edges from one source to the same target — legal, each
+   with its own conditions — collapse to one record. `edgeCounts` keys traversals the same way,
+   where the cost is larger (a shared budget), so fixing only the record would put two notions of
+   edge identity in one file. Unreachable in the committed graph.
 
 **A trap worth keeping**, because the first implementation had it: the detection CANNOT live inside
 the edge-selection loop. That loop breaks at the first passing edge — which is the forward edge doing

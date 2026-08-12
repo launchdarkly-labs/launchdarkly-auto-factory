@@ -295,12 +295,25 @@ try {
   // the walker but unenforced there — worse than absent, because 6e reads as covering
   // both graphs. (This check earned itself immediately: it caught the marker moving
   // into a helper on the first run.)
-  for (const [needle, missing] of [
-    [/function recordShadowedLoopEdges\(/, "does not define recordShadowedLoopEdges"],
-    [/recordShadowedLoopEdges\(key, node,/, "never calls recordShadowedLoopEdges during the walk"],
-    [/loopEdgeShadowed\.length > 0 \? \{ loopEdgeShadowed \}/, "never puts loopEdgeShadowed on the WalkResult"],
+  //
+  // Patterns are deliberately loose about ARGUMENTS and FORMATTING. The first version
+  // matched `recordShadowedLoopEdges(key, node,` exactly, so renaming a local or a
+  // formatter wrapping the call would have failed the build with the mechanism fully
+  // intact — the same lint-misfire class 7a.1 records for taxonomyHome, where the
+  // documented remedy is to loosen the term rather than delete the check.
+  //
+  // What this canNOT do, stated so nobody reads more into a green build: it is a
+  // source-text lint, so it matches commented-out code and cannot tell a live mechanism
+  // from a broken one. tests/loopEdgeOrder.test.ts is the behavioural proof; 6h only
+  // stops the wiring vanishing silently.
+  const callSites = walkerSrc.split("recordShadowedLoopEdges").length - 1;
+  for (const [ok, missing] of [
+    [/function recordShadowedLoopEdges\s*\(/.test(walkerSrc), "does not define recordShadowedLoopEdges"],
+    // Definition + at least one call: the name appears twice or more.
+    [callSites >= 2, "never calls recordShadowedLoopEdges during the walk"],
+    [/loopEdgeShadowed\.length/.test(walkerSrc), "never puts loopEdgeShadowed on the WalkResult"],
   ]) {
-    if (!needle.test(walkerSrc)) {
+    if (!ok) {
       fail(
         `graphWalker.ts defines LOOP_EDGE_SHADOWED_RULE but ${missing} — a loop edge reordered in LaunchDarkly ` +
           "would then fire nothing and report nothing, while check 6e still passes on the committed file.",

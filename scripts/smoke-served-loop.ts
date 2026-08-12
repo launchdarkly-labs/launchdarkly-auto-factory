@@ -14,13 +14,12 @@
  * Run against a TEST BED project only (LD_PROJECT_KEY), never the control plane:
  *   npm run smoke:loop
  *
- * Expectations, derived from the committed graph (6 nodes, both loop edges
- * `max_visits: 1`) and a reviewer that never approves:
- *   - 10 node runs: the 6-node chain, then one loop back through
- *     implementer → metrics → testing → reviewer.
- *   - loopExhausted.reason === "budget" at autofactory-code-reviewer.
- *   - the reviewer → implementer loop edge recorded in loopBudgetSpent,
- *     1 traversal of 1 allowed, trigger review_approved=false.
+ * The expected trace lives in `EXPECTED_RUNS` and the assertions in `main()`, and is
+ * deliberately NOT restated here. The first version of this header did restate it — "10
+ * node runs", one loopBudgetSpent entry — and went stale the moment the judge hook was
+ * added below it, in the same commit, thirty lines away. Two copies of a trace is the
+ * three-of-four-sites failure this repo keeps re-fixing; one copy cannot drift.
+ *
  * A served graph that resolves differently fails this script with a diff.
  */
 
@@ -49,12 +48,14 @@ const SCRIPT: Record<string, Record<string, string>> = {
 const LOW_JUDGE_SCORE = 0.4;
 
 /**
- * Two loops now fire per walk, both with `max_visits: 1`:
+ * Two loops fire per walk, both with `max_visits: 1`:
  *   - metrics-author retries ITSELF once on the low judge score, then falls through
  *   - code-reviewer sends work back to flag-implementer once, then the walk ends
- * The metrics retry happens on each pass through metrics-author, so the second pass
- * (after rework) retries again — its budget is per edge per walk, and this is the
- * declared traversal count of 1 being spent on the first pass.
+ *
+ * The metrics budget is per EDGE per WALK, not per pass — so it is spent on the FIRST
+ * pass, and the post-rework pass gets no retry at all even though its judge score is
+ * just as low. That is why metrics-author appears three times below and not four, and it
+ * is the substantive fact about this trace: rework does not restore quality budget.
  */
 const EXPECTED_RUNS = [
   "autofactory-research-planner",
@@ -195,8 +196,12 @@ async function main(): Promise<void> {
   check("replayDiverged", walk.replayDiverged, undefined);
   // The re-entered node must inherit the loop edge's envelope, not the original
   // forward edge's — a served handoff that dropped max_turns would show here.
+  // Both inbound edges to the implementer declare max_turns: 20, so this does NOT
+  // discriminate which edge supplied it — it proves only that the field survived the
+  // round trip and re-entry (a served handoff that dropped it would read 12, the
+  // runner's default). The capabilities check below is what proves per-edge provenance.
   check(
-    "flag-implementer maxTurns per entry",
+    "flag-implementer maxTurns per entry (survival, not provenance)",
     runner.seen.filter((s) => s.configKey === "autofactory-flag-implementer").map((s) => s.maxTurns),
     [20, 20],
   );

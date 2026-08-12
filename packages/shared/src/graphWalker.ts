@@ -255,10 +255,22 @@ export interface WalkResult {
   }>;
   /**
    * Loop edges the SERVED graph declared AFTER a non-loop edge from the same source.
-   * Edge selection takes the first passing edge and breaks, so such a loop may never
-   * be reached — dead config that produces a walk which looks perfect: no extra runs,
-   * no loopBudgetSpent, no loopExhausted, and a quality retry that simply never
-   * happened. Informational, never a failure.
+   * This is an ORDERING record, not a proof that the loop is dead — the distinction
+   * matters and the first version of this comment got it wrong:
+   *
+   *  - If the forward edge ahead of it PASSES, the loop is unreachable: dead config
+   *    that produces a walk which looks perfect — no extra runs, no loopBudgetSpent,
+   *    no loopExhausted, and a quality retry that simply never happened.
+   *  - If that forward edge is condition-gated and fails its own conditions, selection
+   *    falls through and the loop fires normally. The record is still correct as an
+   *    ordering violation (6e rejects the ordering unconditionally), but nothing was
+   *    lost on this walk.
+   *
+   * Narrowing this to UNCONDITIONAL forward edges would remove that second case and is
+   * the obvious-looking improvement — do not make it. The committed graph's own
+   * shadowable edge is `metrics-author → flag-testing`, gated on `needs_tests`, a tag
+   * the metrics author always emits: narrowing would make the guard skip the one edge
+   * in the graph it exists to protect. Informational, never a failure.
    *
    * Why it lives here and not only in a log: `check-configs` 6e already rejects this
    * ordering in the COMMITTED graph, so anything this catches is a served-vs-committed
@@ -272,7 +284,11 @@ export interface WalkResult {
     source: string;
     /** The loop edge that may be unreachable (target config key). */
     target: string;
-    /** The non-loop edge declared ahead of it, which selection would take first. */
+    /**
+     * The FIRST non-loop edge declared ahead of it. Selection reaches this edge before
+     * the loop; whether it is actually TAKEN depends on its own handoff conditions, so
+     * this names the edge that orders ahead — not one proven to have won.
+     */
     precededBy: string;
   }>;
 }
@@ -280,9 +296,14 @@ export interface WalkResult {
 /**
  * The ONE statement of the loop-edge ordering rule, referenced by both halves that
  * enforce it: `check-configs` 6e (committed graph, fails the build) and the walker's
- * served-graph record (`WalkResult.loopEdgeShadowed`). check-configs asserts this exact
- * marker still exists here, so the two cannot drift apart — the repo has corrected the
- * same claim in three of four places eleven times, and this is the cheap way not to.
+ * served-graph record (`WalkResult.loopEdgeShadowed`). check-configs 6h asserts this
+ * marker and the walker's wiring still exist, which makes SILENT REMOVAL of the served
+ * half fail the build — the repo has corrected the same claim in three of four places
+ * eleven times, and this is the cheap way not to.
+ *
+ * It is not proof the two agree: 6h is a source-text lint, so it cannot see a mechanism
+ * that is present but broken. `tests/loopEdgeOrder.test.ts` is what actually exercises
+ * the behaviour end to end; 6h only stops the wiring disappearing under a refactor.
  */
 export const LOOP_EDGE_SHADOWED_RULE =
   "a loop edge (max_visits) must be declared BEFORE every non-loop edge from the same source, " +
@@ -308,6 +329,13 @@ function recordShadowedLoopEdges(
       continue;
     }
     if (precededBy === undefined) continue;
+    // Keyed by (source, TARGET), not per edge: on a served graph `edge.key` IS the
+    // target config key, so two loop edges from one source to the same target — legal,
+    // and each carrying its own conditions — collapse to one record. Accepted, and
+    // stated rather than hidden: `edgeCounts` below keys traversals the same way, where
+    // the consequence is larger (a shared budget), so narrowing it here alone would put
+    // two different notions of edge identity in one file. Unreachable in the committed
+    // graph; recorded as a known gap in docs/loopback-handoff.md 7a.1.
     const seenKey = `${nodeKey}→${edge.key}`;
     if (warned.has(seenKey)) continue;
     warned.add(seenKey);
@@ -317,14 +345,24 @@ function recordShadowedLoopEdges(
   }
 }
 
-/** One line per loop edge the served graph may have made unreachable by ordering. */
+/**
+ * One line per loop edge the served graph may have made unreachable by ordering.
+ *
+ * The remediation half is load-bearing and was WRONG in the first version: it advised
+ * `bridge upgrade`, which cannot repair this. `upgrade` compares graphs through
+ * `ownedGraphShape`, which key-sorts edges before comparing — the sort 7a established
+ * must stay — so an order-only difference produces an identical shape and it skips the
+ * write entirely, reporting no changes. Advice that visibly does nothing is worse than
+ * no advice: it teaches the reader to dismiss the warning.
+ */
 export function describeLoopEdgeShadowed(shadowed: NonNullable<WalkResult["loopEdgeShadowed"]>): string[] {
   return shadowed.map(
     (s) =>
       `loop edge ${s.source} → ${s.target} is declared AFTER the forward edge to ${s.precededBy} in the graph ` +
       `LaunchDarkly SERVES, so it may never fire (${LOOP_EDGE_SHADOWED_RULE}). The committed graph is checked ` +
-      `by check-configs 6e, so this is served-vs-committed drift — re-provision with 'bridge upgrade', or fix the ` +
-      `edge order in the LaunchDarkly UI.`,
+      `by check-configs 6e, so this is served-vs-committed drift: fix the edge order in LaunchDarkly. ` +
+      `'bridge upgrade' will NOT repair it — its graph comparison sorts edges by key, so it reports no changes ` +
+      `for an order-only difference (docs/loopback-handoff.md 7a).`,
   );
 }
 
@@ -1195,9 +1233,11 @@ export async function walkGraph(
     // because selection below takes the first passing edge and BREAKS. 6e enforces this
     // on the committed file; nothing enforced it on the graph LaunchDarkly SERVES, and
     // REST GET's edge order is not faithful enough for `bridge upgrade` to do it
-    // (docs/loopback-handoff.md 7a). Recorded, not enforced: the walk is still correct,
-    // it has just silently lost a retry, which is exactly what loopBudgetSpent exists
-    // to make visible.
+    // (docs/loopback-handoff.md 7a). Recorded, not enforced: the walk is correct either
+    // way. What it MAY have lost is a retry — "may", because a condition-gated forward
+    // edge can fail its own conditions and let the loop fire anyway, so what this
+    // records is the ORDERING (which 6e rejects unconditionally), not a dead loop. See
+    // WalkResult.loopEdgeShadowed for why narrowing it to unconditional edges is wrong.
     //
     // A SEPARATE pass over the edges, deliberately: folding this into the selection
     // loop below cannot work, because that loop breaks at the first passing edge — the

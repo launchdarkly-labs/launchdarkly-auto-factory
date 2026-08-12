@@ -94,6 +94,39 @@ describe("served-graph loop edge order", () => {
     assert.match(String(line), /may never fire/);
   });
 
+  it("a GATED forward edge ahead of the loop: the loop still fires, and it is still recorded", async () => {
+    // The record is an ORDERING violation, not a proof the loop is dead. When the
+    // forward edge declared ahead of it fails its own conditions, selection falls
+    // through and the loop fires — so `precededBy` names an edge that did NOT win.
+    //
+    // This is pinned deliberately, because narrowing the check to UNCONDITIONAL forward
+    // edges is the obvious-looking fix for the "false positive" and it would break the
+    // real graph: the committed `metrics-author → flag-testing` edge is gated on
+    // `needs_tests`, which its source always emits, so narrowing would make the guard
+    // skip the only shadowable edge in the graph.
+    const gatedForward: LDGraphEdge = { key: "done", handoff: { require_tags: { ship: "true" } } };
+    const loop: LDGraphEdge = { key: "worker", handoff: { max_visits: 1, require_tags: { needs_rework: "true" } } };
+    const flagValue: LDAgentGraphFlagValue = { root: "worker", edges: { worker: [gatedForward, loop] } };
+    const configs: Record<string, LDAIAgentConfig> = { worker: agentConfig("worker"), done: agentConfig("done") };
+    const graph = new AgentGraphDefinition(
+      flagValue,
+      AgentGraphDefinition.buildNodes(flagValue, configs),
+      true,
+      () => ({}) as unknown as LDGraphTracker,
+    );
+
+    // `ship` is never emitted, so the forward edge cannot pass and the loop is reachable.
+    const r = await walkGraph(graph, alwaysRework(), {});
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["worker", "worker"]);
+    assert.equal(r.loopBudgetSpent?.length, 1, "the loop really did fire and spend its budget");
+    // Recorded anyway: the ordering is what 6e rejects, unconditionally.
+    assert.deepEqual(r.loopEdgeShadowed, [{ source: "worker", target: "worker", precededBy: "done" }]);
+    // ...and the wording must not claim a loss that did not happen.
+    const [line] = describeLoopEdgeShadowed(r.loopEdgeShadowed!);
+    assert.match(String(line), /may never fire/);
+    assert.doesNotMatch(String(line), /bridge upgrade' will repair|re-provision with/);
+  });
+
   it("records once per edge, not once per traversal", async () => {
     // `worker` is re-entered by the forward-first graph only once, so use a graph
     // where the mis-ordered source runs twice: rework via a SECOND loop edge that is

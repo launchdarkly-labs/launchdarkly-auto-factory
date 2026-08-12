@@ -33657,7 +33657,7 @@ function recordShadowedLoopEdges(nodeKey, node, into, warned) {
   }
 }
 function describeLoopEdgeShadowed(shadowed) {
-  return shadowed.map((s) => `loop edge ${s.source} \u2192 ${s.target} is declared AFTER the forward edge to ${s.precededBy} in the graph LaunchDarkly SERVES, so it may never fire (${LOOP_EDGE_SHADOWED_RULE}). The committed graph is checked by check-configs 6e, so this is served-vs-committed drift \u2014 re-provision with 'bridge upgrade', or fix the edge order in the LaunchDarkly UI.`);
+  return shadowed.map((s) => `loop edge ${s.source} \u2192 ${s.target} is declared AFTER the forward edge to ${s.precededBy} in the graph LaunchDarkly SERVES, so it may never fire (${LOOP_EDGE_SHADOWED_RULE}). The committed graph is checked by check-configs 6e, so this is served-vs-committed drift: fix the edge order in LaunchDarkly. 'bridge upgrade' will NOT repair it \u2014 its graph comparison sorts edges by key, so it reports no changes for an order-only difference (docs/loopback-handoff.md 7a).`);
 }
 function describeLoopBudgetSpent(spent) {
   return spent.map((e) => `quality loop ${e.source} \u2192 ${e.target} used all ${e.maxVisits} attempt(s) without converging` + (e.trigger ? ` (${e.trigger})` : "") + " \u2014 the chain continued anyway.");
