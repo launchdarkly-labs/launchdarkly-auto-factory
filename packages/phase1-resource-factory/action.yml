@@ -4,7 +4,7 @@ description: >
   PR needs a feature flag, plans the flag + metrics + tests, and reviews — gated
   by an approval mode. Runs natively on the LaunchDarkly SDKs; the
   `auto-factory-ai-provider` flag selects the execution backend (Anthropic API by
-  default, Cursor agents via the Cursor SDK, or Vega).
+  default, Claude on Amazon Bedrock, Cursor agents via the Cursor SDK, or Vega).
 
 author: "LaunchDarkly"
 
@@ -19,6 +19,19 @@ inputs:
   # --- Anthropic execution backend (default provider) ---
   anthropic_api_key:
     description: "Anthropic API key. Required when the auto-factory-ai-provider flag serves 'anthropic' (the default)."
+    required: false
+  # --- Bedrock execution backend (only used when the provider flag serves 'bedrock') ---
+  aws_region:
+    description: "AWS region for Amazon Bedrock (e.g. us-east-1). Required when the auto-factory-ai-provider flag serves 'bedrock' (unless AWS_REGION is already in the env, e.g. via aws-actions/configure-aws-credentials)."
+    required: false
+  aws_access_key_id:
+    description: "AWS access key id for Bedrock. Optional — an ambient OIDC role (aws-actions/configure-aws-credentials) or any other AWS credential-chain source also works."
+    required: false
+  aws_secret_access_key:
+    description: "AWS secret access key for Bedrock (pair with aws_access_key_id)."
+    required: false
+  aws_session_token:
+    description: "AWS session token for temporary Bedrock credentials."
     required: false
   # --- Cursor execution backend (only used when the provider flag serves 'cursor') ---
   cursor_api_key:

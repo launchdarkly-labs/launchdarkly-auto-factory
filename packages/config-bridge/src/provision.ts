@@ -342,8 +342,13 @@ async function provisionMetric(appLd: LdClient, metric: MetricFile, result: Prov
   try {
     // Existence via create with 409-as-ok (same pattern as runtime ldWriter).
     if (dryRun) {
-      const list = await appLd.listMetrics<{ items?: Array<{ key: string }> }>(200);
-      if ((list.data.items ?? []).some((m) => m.key === metric.key)) {
+      // GET by key, not via the list endpoint — LD clamps list pages to 50, so
+      // a listing-based check reports false "missing" in metric-heavy projects.
+      const existing = await appLd.request({
+        path: `/api/v2/metrics/${appLd.projectKey}/${metric.key}`,
+        okStatuses: [404],
+      });
+      if (existing.status === 200) {
         result.metricsExisting.push(metric.key);
       } else {
         result.metricsCreated.push(metric.key);

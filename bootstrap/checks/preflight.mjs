@@ -4,7 +4,7 @@
  * Imported dynamically by create.mjs (after the workspace is built).
  */
 
-import { LdClient, targetConnection } from "@auto-factory/shared";
+import { LdClient, targetConnection, validateProjectKey } from "@auto-factory/shared";
 
 export async function preflight() {
   const ok = [];
@@ -21,6 +21,17 @@ export async function preflight() {
     ok.push(`Target: project '${conn.projectKey}' @ ${conn.baseUrl}`);
   } catch (e) {
     issues.push(e instanceof Error ? e.message : String(e));
+  }
+
+  // The app/data-plane project key is only USED mid-run (create_flag), where a
+  // malformed value surfaces as an opaque HTTP 405 — catch the paste error here.
+  if (process.env.LD_APP_PROJECT_KEY) {
+    try {
+      validateProjectKey("LD_APP_PROJECT_KEY", process.env.LD_APP_PROJECT_KEY);
+      ok.push(`App project key: '${process.env.LD_APP_PROJECT_KEY}'`);
+    } catch (e) {
+      issues.push(e instanceof Error ? e.message : String(e));
+    }
   }
 
   if (conn) {
@@ -43,6 +54,21 @@ export async function preflight() {
   // optional if the auto-factory-ai-provider flag serves 'vega' — so it's a note.
   if (process.env.ANTHROPIC_API_KEY) ok.push("ANTHROPIC_API_KEY present");
   else notes.push("ANTHROPIC_API_KEY not set (required when the auto-factory-ai-provider flag serves 'anthropic' — the default)");
+
+  // AWS credentials are only needed when the provider flag serves 'bedrock'
+  // (Claude via Amazon Bedrock). The runner uses the standard AWS chain, so any
+  // of these signals is enough; nothing is validated until the first API call.
+  const awsRegion = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
+  const awsCreds =
+    process.env.AWS_ACCESS_KEY_ID || process.env.AWS_PROFILE || process.env.AWS_BEARER_TOKEN_BEDROCK;
+  if (awsRegion && awsCreds) ok.push(`AWS region + credentials present (Bedrock provider ready, region ${awsRegion})`);
+  else if (awsRegion || awsCreds) {
+    notes.push(
+      `AWS ${awsRegion ? "credentials" : "region"} not set (Bedrock needs AWS_REGION AND credentials — access keys, a profile, an ambient role, or AWS_BEARER_TOKEN_BEDROCK; only needed when the auto-factory-ai-provider flag serves 'bedrock')`,
+    );
+  } else {
+    notes.push("AWS region/credentials not set (only needed when the auto-factory-ai-provider flag serves 'bedrock')");
+  }
 
   // CURSOR_API_KEY is only needed when the provider flag serves 'cursor' (Cursor
   // agents). That path also needs the checkout+npm-ci workflow, not the plain

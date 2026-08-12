@@ -22,9 +22,25 @@
  *       provision anything missing, then sync existing variation instructions
  *       and graph edges to the committed copies. Never touches flag targeting,
  *       model choices, or extra live variations — drift there is reported.
+ *
+ *   bridge init [--yes] [--provider anthropic|bedrock|cursor]
+ *               [--factory-project <key>] [--app-project <key>] [--ld-env <key>]
+ *               [--front-end github-action|claude-code|cursor-automation|none]
+ *               [--app-repo <owner/name>] [--app-repo-path <dir>]
+ *               [--tool-repo <owner/name>] [--no-pr] [--base-url <url>]
+ *       Guided first-time setup: create/confirm the LD projects, fetch the SDK
+ *       key, write .env, provision, and wire a front end (GitHub secrets +
+ *       setup PR via `gh`, or local skill/automation install).
+ *
+ *   bridge doctor [--app-repo <owner/name>] [--skip-github]
+ *       Validate an install end to end: local env, factory + app LD projects
+ *       (incl. SDK-key ownership and config drift), and the app repo's GitHub
+ *       secrets/variables/workflows. Exits 1 on failures; warnings advisory.
  */
 
 import { LdClient, appConnection, sourceConnection, targetConnection } from "@auto-factory/shared";
+import { doctor, printDoctorReport } from "./doctor.js";
+import { init } from "./init.js";
 import { provision } from "./provision.js";
 import { seed } from "./seed.js";
 import { sync } from "./sync.js";
@@ -154,7 +170,24 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.error("Usage: bridge <provision|sync|seed|upgrade> [options]");
+  if (cmd === "init") {
+    await init(args);
+    return;
+  }
+
+  if (cmd === "doctor") {
+    const { loadDotEnv } = await import("@auto-factory/shared");
+    loadDotEnv();
+    const report = await doctor({
+      appRepo: flag(args, "app-repo"),
+      skipGithub: args.includes("--skip-github"),
+    });
+    printDoctorReport(report);
+    if (report.failures > 0) process.exitCode = 1;
+    return;
+  }
+
+  console.error("Usage: bridge <init|doctor|provision|sync|seed|upgrade> [options]");
   process.exitCode = 2;
 }
 

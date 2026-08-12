@@ -17,10 +17,20 @@
 # below makes adding that label re-run the chain so it proceeds past the gate
 # (with AUTOFACTORY_REQUIRE_LABEL, keep `autofactory` on the PR so the job matches).
 #
-# Providers: this drop-in form works for the 'anthropic' (default) and 'vega'
-# backends. The 'cursor' backend can't run here — its @cursor/sdk dependency needs
-# node_modules, which a bare `uses:` action doesn't have. To run 'cursor', use the
-# checkout + `npm ci` + run-the-bundle workflow variant and add the cursor_api_key.
+# Providers: this drop-in form works for the 'anthropic' (default), 'bedrock',
+# and 'vega' backends. The 'cursor' backend can't run here — its @cursor/sdk
+# dependency needs node_modules, which a bare `uses:` action doesn't have. To run
+# 'cursor', use the checkout + `npm ci` + run-the-bundle workflow variant and add
+# the cursor_api_key.
+#
+# Bedrock: serve 'bedrock' from the auto-factory-ai-provider flag, then supply AWS
+# credentials with Bedrock model access — either add to the `with:` block:
+#   aws_region:            us-east-1
+#   aws_access_key_id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+#   aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+# or insert an aws-actions/configure-aws-credentials OIDC step before this one
+# (then only aws_region is needed, or nothing if that step sets AWS_REGION).
+# anthropic_api_key can be omitted when running on Bedrock.
 
 name: LaunchDarkly Auto-Factory
 

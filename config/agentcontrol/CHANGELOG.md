@@ -15,6 +15,30 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-12 (raise runaway backstops)
+
+### ✅ `gha-auto-factory`: all edge `max_turns` → 100
+
+- Raised every edge's `max_turns` (was 8 steward / 20 implementer / 20
+  metrics-author / 20 flag-testing / 30 reviewer) to a uniform **100**, and the
+  runner's no-edge default from 12 to 100. These caps are runaway backstops,
+  not budgets: the old values were low enough for a legitimately long node —
+  especially flag-testing scaffolding a test harness from scratch on a
+  greenfield repo (explore → scaffold → install → fix-and-re-run loop) — to
+  hit the cap mid-task. Worse, a capped node reports `stopped` (not `failed`),
+  the chain continues, and un-pushed work is silently lost.
+- Companion runtime changes (code repo, same day): per-response `max_tokens`
+  4096 → 32000 (a `write_file` carries the whole file in one response; a
+  max_tokens stop exited the tool loop silently as `completed`), judge cap
+  4096 → 16000 (truncation still detected + discarded), `run_tests` subprocess
+  timeout 240s → 30 min, and an explicit 60-min API client timeout (the SDK
+  refuses non-streaming requests above ~21k max_tokens without one).
+- Live update: `gha-auto-factory` on `auto-factory-prototype` PATCHed via
+  `bridge upgrade` (graph handoff drift is part of the owned shape). Other
+  existing projects pick this up on their next `bridge upgrade`.
+
+---
+
 ## 2026-08-11 (`create_metric` description over LD's 1024-byte cap)
 
 ### ✅ Tool: `create_metric` description trimmed to fit
@@ -29,6 +53,52 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **Credit:** fix contributed by Matt Laster (external PR); already-provisioned
   LD projects need a re-bootstrap / `bridge upgrade` to pick up the new
   description.
+
+---
+
+## 2026-08-07 (Bedrock provider)
+
+### ✅ `auto-factory-ai-provider`: new `bedrock` variation
+
+- Added a fourth variation `bedrock` ("Bedrock") to the committed flag definition
+  (`flags/auto-factory-ai-provider.json`), appended after the existing three so
+  the provisioned defaults (off→`anthropic`, on→`vega`) are untouched. Serving
+  `bedrock` runs the SAME agents/tool loop as `anthropic` over Claude on Amazon
+  Bedrock (the Bedrock Mantle Messages endpoint) — auth via the AWS credential
+  chain (AWS_REGION + keys/OIDC role), billing on AWS.
+- No AI-config changes needed: the runner maps the configs' Anthropic model
+  names to Bedrock ids automatically (`claude-…` → `anthropic.claude-…`), so the
+  per-agent model variations work unchanged on both providers.
+- LIVE flag updated the same day: the `bedrock` variation was PATCHed onto
+  `auto-factory-prototype`'s live flag (v2→v3, additive — the production 50/50
+  anthropic/cursor rollout and off-variation are unchanged). Other existing
+  projects need the same manual PATCH/UI edit — `bridge upgrade` deliberately
+  never edits existing flag variations; new bootstraps get it from the
+  committed file.
+- Runtime NOT yet validated live (no AWS credentials at build time). Before
+  serving `bedrock`, confirm the target AWS account has the mapped Claude
+  models enabled in the chosen region.
+
+---
+
+## 2026-07-31 (greenfield-repo harness scaffolding)
+
+### ✅ `autofactory-flag-testing`: scaffold the test harness when the repo has none
+- **What**: extended the "Test conventions" section: on a repo with no test
+  suite the agent must also SCAFFOLD the harness so `run_tests` can invoke it —
+  for Node that means adding the package.json `"test"` script (run_tests runs
+  `npm test`); a `run_tests` "no test harness" response is an instruction to
+  build it, not a reason to skip.
+- **Why**: external bug report (2026-07-30, SE run against a minimal Express
+  app with no tests): `run_tests` treated npm's default "no test specified"
+  stub as a RED run, so every upstream node handed off `tests_last_run=fail`
+  and the `tests-green-at-handoff` shim killed the chain before flag-testing —
+  the node whose job is to create the missing suite. The runtime side of the
+  fix (in code, not config): `run_tests` now classifies "no harness present"
+  (missing/stub npm test script, pytest exit 5) as inconclusive — it no longer
+  sets `tests_last_run`, so the shim only gates on real test executions.
+- **Deploy**: committed file updated; live projects pick it up via
+  `bridge upgrade`.
 
 ---
 
@@ -67,6 +137,8 @@ Status legend: ✅ done · 🔜 planned/in progress
 - Beacon Seer reuses `findRelatedIssue` from `@auto-factory/shared` (same as
   estate client).
 
+---
+
 ## 2026-07-24 (Sentry layer — ADR 0014)
 
 ### ✅ Metrics author: Sentry as error killswitch
@@ -89,6 +161,7 @@ Status legend: ✅ done · 🔜 planned/in progress
 - Runtime: `BEACON_SEER_AUTOFIX=true` → find Sentry issue → Autofix `open_pr`.
 
 ---
+
 
 ## 2026-07-20 (provider-aware model routing)
 

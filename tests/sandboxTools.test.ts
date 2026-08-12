@@ -631,3 +631,52 @@ describe("SandboxToolExecutor — create_flag scope", () => {
     assert.equal(writer.lastArgs?.scope, "backend");
   });
 });
+
+describe("SandboxToolExecutor — run_tests no-harness detection", () => {
+  const editingExec = () => new SandboxToolExecutor(root, undefined, true);
+
+  it("no recognized setup at all → inconclusive, tests_last_run NOT set", async () => {
+    const exec = editingExec();
+    const r = await exec.execute("run_tests", {});
+    assert.equal(r.isError, true);
+    assert.match(r.content, /no recognized test setup/);
+    assert.equal(exec.tags.tests_last_run, undefined);
+  });
+
+  it("package.json without a test script → no harness, tests_last_run NOT set", async () => {
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "app", scripts: { start: "node server.js" } }));
+    const exec = editingExec();
+    const r = await exec.execute("run_tests", {});
+    assert.equal(r.isError, true);
+    assert.match(r.content, /no test harness/);
+    assert.equal(exec.tags.tests_last_run, undefined);
+  });
+
+  it("npm's default 'no test specified' stub counts as no harness", async () => {
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "app", scripts: { test: 'echo "Error: no test specified" && exit 1' } }),
+    );
+    const exec = editingExec();
+    const r = await exec.execute("run_tests", {});
+    assert.equal(r.isError, true);
+    assert.match(r.content, /no test harness/);
+    assert.equal(exec.tags.tests_last_run, undefined);
+  });
+
+  it("a real passing test script → tests_last_run=pass", async () => {
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "app", scripts: { test: "exit 0" } }));
+    const exec = editingExec();
+    const r = await exec.execute("run_tests", {});
+    assert.ok(!r.isError);
+    assert.equal(exec.tags.tests_last_run, "pass");
+  });
+
+  it("a real failing test script → tests_last_run=fail", async () => {
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "app", scripts: { test: "exit 1" } }));
+    const exec = editingExec();
+    const r = await exec.execute("run_tests", {});
+    assert.equal(r.isError, true);
+    assert.equal(exec.tags.tests_last_run, "fail");
+  });
+});

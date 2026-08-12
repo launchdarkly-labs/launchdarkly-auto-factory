@@ -1,14 +1,15 @@
 {
   "key": "auto-factory-ai-provider",
   "name": "AutoFactory AI provider",
-  "description": "Selects the Phase 1 agent execution backend. Read natively by the runtime; defaults to 'anthropic' when this flag is absent. Provisioned off (serves 'anthropic'). Variations: 'vega' (LaunchDarkly-hosted) and 'cursor' (Cursor agents via @cursor/sdk — needs CURSOR_API_KEY and the checkout+npm-ci workflow, not the plain drop-in template).",
+  "description": "Selects the Phase 1 agent execution backend. Read natively by the runtime; defaults to 'anthropic' when this flag is absent. Provisioned off (serves 'anthropic'). Variations: 'bedrock' (same agents on Claude via Amazon Bedrock — needs AWS_REGION + AWS credentials), 'vega' (LaunchDarkly-hosted), and 'cursor' (Cursor agents via @cursor/sdk — needs CURSOR_API_KEY and the checkout+npm-ci workflow, not the plain drop-in template).",
   "kind": "multivariate",
   "temporary": false,
   "tags": ["auto-factory"],
   "variations": [
     { "value": "anthropic", "name": "Anthropic" },
     { "value": "vega", "name": "Vega" },
-    { "value": "cursor", "name": "Cursor" }
+    { "value": "cursor", "name": "Cursor" },
+    { "value": "bedrock", "name": "Bedrock" }
   ],
   "defaults": { "onVariation": 1, "offVariation": 0 }
 }
