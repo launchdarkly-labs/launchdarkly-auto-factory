@@ -24,7 +24,7 @@
  * A served graph that resolves differently fails this script with a diff.
  */
 
-import type { AgentNodeRequest, AgentNodeResult, AgentRunner } from "@auto-factory/shared";
+import type { AgentNodeRequest, AgentNodeResult, AgentRunner, JudgeHook } from "@auto-factory/shared";
 import { closeLdSdk, getLdSdk, loadDotEnv, pipelineContext, withProvider, walkGraph } from "@auto-factory/shared";
 
 /** The routing tags each node emits. The reviewer never approves, so the loop always fires. */
@@ -37,10 +37,30 @@ const SCRIPT: Record<string, Record<string, string>> = {
   "autofactory-code-reviewer": { review_approved: "false" },
 };
 
+/**
+ * A judge score BELOW the metrics loop's `loop_if_judge_below: 0.7`.
+ *
+ * Without a judge hook the walker has no usable score, `loop_if_judge_below` fails
+ * OPEN, and the metrics self-loop is never taken — so the first version of this
+ * script exercised only the reviewer loop, which has no forward edge to be ordered
+ * behind and therefore cannot be broken by edge order. The one order-vulnerable
+ * loop in the graph was the one it did not cover.
+ */
+const LOW_JUDGE_SCORE = 0.4;
+
+/**
+ * Two loops now fire per walk, both with `max_visits: 1`:
+ *   - metrics-author retries ITSELF once on the low judge score, then falls through
+ *   - code-reviewer sends work back to flag-implementer once, then the walk ends
+ * The metrics retry happens on each pass through metrics-author, so the second pass
+ * (after rework) retries again — its budget is per edge per walk, and this is the
+ * declared traversal count of 1 being spent on the first pass.
+ */
 const EXPECTED_RUNS = [
   "autofactory-research-planner",
   "autofactory-manifest-steward",
   "autofactory-flag-implementer",
+  "autofactory-metrics-author",
   "autofactory-metrics-author",
   "autofactory-flag-testing",
   "autofactory-code-reviewer",
@@ -122,7 +142,18 @@ async function main(): Promise<void> {
   console.log();
 
   const runner = new ScriptedRunner();
-  const walk = await walkGraph(graphDef, runner, { REPO: "smoke/test-bed" }, {});
+  // Scripted judge: always below the threshold, so the metrics quality loop fires on
+  // the served `loop_if_judge_below`. No judge model runs, so this still costs nothing.
+  const judgeHook: JudgeHook = async ({ configKey }) => [
+    {
+      judgeConfigKey: `smoke-judge-${configKey}`,
+      sampled: true,
+      success: true,
+      score: LOW_JUDGE_SCORE,
+      reasoning: "scripted smoke-test score, deliberately below every threshold",
+    },
+  ];
+  const walk = await walkGraph(graphDef, runner, { REPO: "smoke/test-bed" }, { judgeHook });
 
   console.log("Assertions:");
   check(
@@ -138,12 +169,27 @@ async function main(): Promise<void> {
     walk.loopBudgetSpent?.map((s) => ({ source: s.source, target: s.target, traversals: s.traversals, maxVisits: s.maxVisits })),
     [
       {
+        source: "autofactory-metrics-author",
+        target: "autofactory-metrics-author",
+        traversals: 1,
+        maxVisits: 1,
+      },
+      {
         source: "autofactory-code-reviewer",
         target: "autofactory-flag-implementer",
         traversals: 1,
         maxVisits: 1,
       },
     ],
+  );
+  // The judge-driven loop is the ONLY one in this graph whose source also has a
+  // forward edge, so it is the only one edge ORDER can silently kill. Asserting the
+  // run order above covers it; this asserts the walker agrees the served order is safe.
+  check("loopEdgeShadowed", walk.loopEdgeShadowed, undefined);
+  check(
+    "judge score routed the metrics loop",
+    walk.runs.filter((r) => r.configKey === "autofactory-metrics-author").map((r) => Object.values(r.judgeScores ?? {})),
+    [[LOW_JUDGE_SCORE], [LOW_JUDGE_SCORE], [LOW_JUDGE_SCORE]],
   );
   check("stalledAt", walk.stalledAt, undefined);
   check("replayDiverged", walk.replayDiverged, undefined);
@@ -153,6 +199,13 @@ async function main(): Promise<void> {
     "flag-implementer maxTurns per entry",
     runner.seen.filter((s) => s.configKey === "autofactory-flag-implementer").map((s) => s.maxTurns),
     [20, 20],
+  );
+  // On rework the implementer comes in through the loop edge, whose capabilities omit
+  // query_repos — the envelope is per-edge, so re-entry is not a repeat of first entry.
+  check(
+    "flag-implementer capabilities per entry",
+    runner.seen.filter((s) => s.configKey === "autofactory-flag-implementer").map((s) => s.capabilities?.includes("query_repos")),
+    [true, false],
   );
 
   if (failures.length > 0) {

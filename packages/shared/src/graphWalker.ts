@@ -253,6 +253,79 @@ export interface WalkResult {
     maxVisits: number;
     trigger?: string;
   }>;
+  /**
+   * Loop edges the SERVED graph declared AFTER a non-loop edge from the same source.
+   * Edge selection takes the first passing edge and breaks, so such a loop may never
+   * be reached — dead config that produces a walk which looks perfect: no extra runs,
+   * no loopBudgetSpent, no loopExhausted, and a quality retry that simply never
+   * happened. Informational, never a failure.
+   *
+   * Why it lives here and not only in a log: `check-configs` 6e already rejects this
+   * ordering in the COMMITTED graph, so anything this catches is a served-vs-committed
+   * divergence (a dashboard edit, or a seed from another project) — and REST GET's edge
+   * order is not faithful enough for `bridge upgrade` to catch it instead. See
+   * docs/loopback-handoff.md 7a. Reported on the same surfaces as loopBudgetSpent,
+   * because a retry that silently did not happen is invisible unless something says so.
+   */
+  loopEdgeShadowed?: Array<{
+    /** The source node whose edge list is mis-ordered. */
+    source: string;
+    /** The loop edge that may be unreachable (target config key). */
+    target: string;
+    /** The non-loop edge declared ahead of it, which selection would take first. */
+    precededBy: string;
+  }>;
+}
+
+/**
+ * The ONE statement of the loop-edge ordering rule, referenced by both halves that
+ * enforce it: `check-configs` 6e (committed graph, fails the build) and the walker's
+ * served-graph record (`WalkResult.loopEdgeShadowed`). check-configs asserts this exact
+ * marker still exists here, so the two cannot drift apart — the repo has corrected the
+ * same claim in three of four places eleven times, and this is the cheap way not to.
+ */
+export const LOOP_EDGE_SHADOWED_RULE =
+  "a loop edge (max_visits) must be declared BEFORE every non-loop edge from the same source, " +
+  "because edge selection takes the first passing edge and breaks";
+
+/**
+ * Scan one node's SERVED edge list for loop edges declared after a non-loop edge, and
+ * record each once per walk. Must run before edge selection, not inside it: selection
+ * stops at the first passing edge, which is precisely the edge doing the shadowing.
+ */
+function recordShadowedLoopEdges(
+  nodeKey: string,
+  node: AgentGraphNode,
+  into: NonNullable<WalkResult["loopEdgeShadowed"]>,
+  warned: Set<string>,
+): void {
+  let precededBy: string | undefined;
+  for (const edge of node.getEdges()) {
+    const isLoop = handoffNumber(edge.handoff, "max_visits") !== undefined;
+    if (!isLoop) {
+      // The FIRST forward edge is the one that shadows: selection reaches it first.
+      precededBy ??= edge.key;
+      continue;
+    }
+    if (precededBy === undefined) continue;
+    const seenKey = `${nodeKey}→${edge.key}`;
+    if (warned.has(seenKey)) continue;
+    warned.add(seenKey);
+    const entry = { source: nodeKey, target: edge.key, precededBy };
+    into.push(entry);
+    console.warn(`[loop] ${describeLoopEdgeShadowed([entry])[0]}`);
+  }
+}
+
+/** One line per loop edge the served graph may have made unreachable by ordering. */
+export function describeLoopEdgeShadowed(shadowed: NonNullable<WalkResult["loopEdgeShadowed"]>): string[] {
+  return shadowed.map(
+    (s) =>
+      `loop edge ${s.source} → ${s.target} is declared AFTER the forward edge to ${s.precededBy} in the graph ` +
+      `LaunchDarkly SERVES, so it may never fire (${LOOP_EDGE_SHADOWED_RULE}). The committed graph is checked ` +
+      `by check-configs 6e, so this is served-vs-committed drift — re-provision with 'bridge upgrade', or fix the ` +
+      `edge order in the LaunchDarkly UI.`,
+  );
 }
 
 /**
@@ -865,6 +938,11 @@ export async function walkGraph(
   const entryEdgeFields = new Map<string, { maxTurns?: number; requestType?: string; capabilities?: string[] }>();
   // Per-node execution count, for the `iteration` label and the rework preamble.
   const runCountByKey = new Map<string, number>();
+  // Loop edges the served graph declared after a forward edge from the same source, and
+  // the once-per-edge guard for saying so (the condition is a property of the served
+  // graph, not of any one traversal — same reasoning as malformedHandoffWarned).
+  const loopEdgeShadowed: NonNullable<WalkResult["loopEdgeShadowed"]> = [];
+  const shadowWarned = new Set<string>();
 
   const rootKey = graphDef.getConfig().root;
   // Run-level termination backstop, scaled to graph size (nodeCount × (hardCap+1));
@@ -1112,6 +1190,20 @@ export async function walkGraph(
     // CONSUMED rather than an entry index.
     const runsConsumed = runs.length;
     const budgetBlocked: LoopExhaustedInfo["exhausted"] = [];
+    // The SERVED counterpart of check-configs 6e (see LOOP_EDGE_SHADOWED_RULE): a loop
+    // edge declared after a non-loop edge from the same source may never be reached,
+    // because selection below takes the first passing edge and BREAKS. 6e enforces this
+    // on the committed file; nothing enforced it on the graph LaunchDarkly SERVES, and
+    // REST GET's edge order is not faithful enough for `bridge upgrade` to do it
+    // (docs/loopback-handoff.md 7a). Recorded, not enforced: the walk is still correct,
+    // it has just silently lost a retry, which is exactly what loopBudgetSpent exists
+    // to make visible.
+    //
+    // A SEPARATE pass over the edges, deliberately: folding this into the selection
+    // loop below cannot work, because that loop breaks at the first passing edge — the
+    // forward edge that shadows the loop — so it would never reach the very edge it is
+    // looking for. Written that way first, and the test caught it.
+    recordShadowedLoopEdges(key, node, loopEdgeShadowed, shadowWarned);
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
       const isLoop = handoffNumber(h, "max_visits") !== undefined;
@@ -1324,5 +1416,6 @@ export async function walkGraph(
     ...(loopExhausted ? { loopExhausted } : {}),
     ...(replayDiverged ? { replayDiverged } : {}),
     ...(budgetSpent.size > 0 ? { loopBudgetSpent: [...budgetSpent.values()] } : {}),
+    ...(loopEdgeShadowed.length > 0 ? { loopEdgeShadowed } : {}),
   };
 }

@@ -274,6 +274,43 @@ try {
   fail(`graphWalker.ts: could not run tag-class sync check: ${e.message}`);
 }
 
+// 6h: 6e above enforces the loop-edge ordering rule on the COMMITTED graph; the
+// walker enforces the same rule on the graph LaunchDarkly SERVES (a dashboard edit
+// or a seed from another project can diverge, and REST GET's edge order is not
+// faithful enough for `bridge upgrade` to notice — docs/loopback-handoff.md 7a).
+// Two enforcement points, one rule: assert the walker's half is still there, or a
+// future refactor silently leaves 6e guarding only half the surface. Eleven prose
+// corrections in this repo's history each fixed three of four sites; this is the
+// same class, so it gets a check rather than a comment.
+try {
+  const walkerSrc = readFileSync("packages/shared/src/graphWalker.ts", "utf8");
+  if (!walkerSrc.includes("LOOP_EDGE_SHADOWED_RULE")) {
+    fail(
+      "graphWalker.ts no longer defines LOOP_EDGE_SHADOWED_RULE — the served-graph counterpart of check 6e is gone, " +
+        "so a loop edge reordered in LaunchDarkly (not in the committed file) would fire nothing and report nothing.",
+    );
+  }
+  // Defined AND called AND surfaced. Each is separately droppable: a helper nobody
+  // calls, or a record that never reaches WalkResult, leaves the rule documented in
+  // the walker but unenforced there — worse than absent, because 6e reads as covering
+  // both graphs. (This check earned itself immediately: it caught the marker moving
+  // into a helper on the first run.)
+  for (const [needle, missing] of [
+    [/function recordShadowedLoopEdges\(/, "does not define recordShadowedLoopEdges"],
+    [/recordShadowedLoopEdges\(key, node,/, "never calls recordShadowedLoopEdges during the walk"],
+    [/loopEdgeShadowed\.length > 0 \? \{ loopEdgeShadowed \}/, "never puts loopEdgeShadowed on the WalkResult"],
+  ]) {
+    if (!needle.test(walkerSrc)) {
+      fail(
+        `graphWalker.ts defines LOOP_EDGE_SHADOWED_RULE but ${missing} — a loop edge reordered in LaunchDarkly ` +
+          "would then fire nothing and report nothing, while check 6e still passes on the committed file.",
+      );
+    }
+  }
+} catch (e) {
+  fail(`graphWalker.ts: could not run the loop-edge-order sync check (6h): ${e.message}`);
+}
+
 // --- Check 4: README ⟷ registry -------------------------------------------
 try {
   const md = readFileSync(README, "utf8");

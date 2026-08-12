@@ -40,6 +40,7 @@ import {
   createPolicyGate,
   decideApproval,
   describeLoopBudgetSpent,
+  describeLoopEdgeShadowed,
   describeLoopExhausted,
   extractConfigStamp,
   getLdSdk,
@@ -570,6 +571,12 @@ async function main(): Promise<void> {
   // Warning, not error: the run is not failed by an advisory loop, but a reviewer
   // should know quality retries were exhausted.
   for (const l of advisoryLoopText) console.log(`::warning::AutoFactory: ${l}`);
+  // Served-graph edge order may have made a loop unreachable. Also a warning rather
+  // than an error — the walk is valid — but it is config drift a reviewer must see,
+  // and it leaves no other trace: the loop never fired, so there is no budget to spend.
+  if (walk.loopEdgeShadowed) {
+    for (const l of describeLoopEdgeShadowed(walk.loopEdgeShadowed)) console.log(`::warning::AutoFactory: ${l}`);
+  }
 
   // Halted at an approval gate: report what's pending + how to approve, then
   // stop. The flag/code for the gated step have NOT been created. A re-run once

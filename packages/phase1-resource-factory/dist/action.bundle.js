@@ -33636,6 +33636,29 @@ var FACT_TAGS = /* @__PURE__ */ new Set([
   "metric_event_keys",
   "tests_last_run"
 ]);
+var LOOP_EDGE_SHADOWED_RULE = "a loop edge (max_visits) must be declared BEFORE every non-loop edge from the same source, because edge selection takes the first passing edge and breaks";
+function recordShadowedLoopEdges(nodeKey, node, into, warned) {
+  let precededBy;
+  for (const edge of node.getEdges()) {
+    const isLoop = handoffNumber(edge.handoff, "max_visits") !== void 0;
+    if (!isLoop) {
+      precededBy ??= edge.key;
+      continue;
+    }
+    if (precededBy === void 0)
+      continue;
+    const seenKey = `${nodeKey}\u2192${edge.key}`;
+    if (warned.has(seenKey))
+      continue;
+    warned.add(seenKey);
+    const entry = { source: nodeKey, target: edge.key, precededBy };
+    into.push(entry);
+    console.warn(`[loop] ${describeLoopEdgeShadowed([entry])[0]}`);
+  }
+}
+function describeLoopEdgeShadowed(shadowed) {
+  return shadowed.map((s) => `loop edge ${s.source} \u2192 ${s.target} is declared AFTER the forward edge to ${s.precededBy} in the graph LaunchDarkly SERVES, so it may never fire (${LOOP_EDGE_SHADOWED_RULE}). The committed graph is checked by check-configs 6e, so this is served-vs-committed drift \u2014 re-provision with 'bridge upgrade', or fix the edge order in the LaunchDarkly UI.`);
+}
 function describeLoopBudgetSpent(spent) {
   return spent.map((e) => `quality loop ${e.source} \u2192 ${e.target} used all ${e.maxVisits} attempt(s) without converging` + (e.trigger ? ` (${e.trigger})` : "") + " \u2014 the chain continued anyway.");
 }
@@ -33844,6 +33867,8 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
   const routingSnapshots = [];
   const entryEdgeFields = /* @__PURE__ */ new Map();
   const runCountByKey = /* @__PURE__ */ new Map();
+  const loopEdgeShadowed = [];
+  const shadowWarned = /* @__PURE__ */ new Set();
   const rootKey = graphDef.getConfig().root;
   const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
   let totalRuns = 0;
@@ -33986,6 +34011,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let nextJudgeThreshold;
     const runsConsumed = runs.length;
     const budgetBlocked = [];
+    recordShadowedLoopEdges(key, node, loopEdgeShadowed, shadowWarned);
     for (const edge of node.getEdges()) {
       const h = edge.handoff;
       const isLoop = handoffNumber(h, "max_visits") !== void 0;
@@ -34129,7 +34155,8 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     ...verificationFailed ? { verificationFailed } : {},
     ...loopExhausted ? { loopExhausted } : {},
     ...replayDiverged ? { replayDiverged } : {},
-    ...budgetSpent.size > 0 ? { loopBudgetSpent: [...budgetSpent.values()] } : {}
+    ...budgetSpent.size > 0 ? { loopBudgetSpent: [...budgetSpent.values()] } : {},
+    ...loopEdgeShadowed.length > 0 ? { loopEdgeShadowed } : {}
   };
 }
 
@@ -40412,6 +40439,9 @@ async function main() {
   const advisoryLoopText = walk2.loopBudgetSpent ? describeLoopBudgetSpent(walk2.loopBudgetSpent) : [];
   if (loopText) console.log(`::error::AutoFactory: ${loopText}`);
   for (const l of advisoryLoopText) console.log(`::warning::AutoFactory: ${l}`);
+  if (walk2.loopEdgeShadowed) {
+    for (const l of describeLoopEdgeShadowed(walk2.loopEdgeShadowed)) console.log(`::warning::AutoFactory: ${l}`);
+  }
   if (walk2.pendingApproval) {
     const node = walk2.pendingApproval.node;
     const label = approveLabel(node);

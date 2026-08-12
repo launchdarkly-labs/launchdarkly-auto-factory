@@ -265,9 +265,40 @@ Two consequences, and the second is the one that needs the design call:
 2. **No REST-based check can guard the ordering invariant at all** — GET's order is a derived view,
    so a real within-source reorder is indistinguishable from LaunchDarkly's own shuffling. The
    invariant in the graph's `$comment` ("the loop edge MUST stay declared BEFORE the forward edge",
-   which the walker reads via first-passing-edge) is therefore guardable only (a) against the
-   **SDK-served** graph, which IS order-faithful — `scripts/smoke-served-loop.ts` now prints exactly
-   this — or (b) repo-side, as a lint on the committed file. Pick one; `bridge upgrade` cannot be it.
+   which the walker reads via first-passing-edge) is therefore guardable only against the
+   **SDK-served** graph, which IS order-faithful. **CLOSED** — see below.
+
+### 7a.1 The ordering guard, closed 2026-08-12 (the factory is about to run real PRs)
+
+The exposure was one edge. Ordering can only kill a loop whose source ALSO has a non-loop edge:
+`code-reviewer`'s rework loop is its source's only edge, and the other four sources have one
+forward edge each. So the whole risk was the judge-driven `metrics-author` self-loop — one silently
+skipped quality retry, with the release machinery unaffected. Left alone that is survivable; on
+unattended real PRs it is a retry nobody would ever know did not happen.
+
+- **The committed half already existed**: `check-configs` **6e** fails the build on a loop edge
+  declared after a non-loop edge from the same source. Nothing was needed there.
+- **The served half now exists**: the walker records each such edge on
+  `WalkResult.loopEdgeShadowed` and warns once per edge per walk (`recordShadowedLoopEdges`). It is
+  a RECORD, not a gate — the walk is still valid, it has just lost a retry — reported on the same
+  three surfaces as `loopBudgetSpent` (Action warning, CLI summary, extension log), because the
+  failure leaves no other trace: no extra runs, no budget spent, no `loopExhausted`.
+- **The two halves cannot drift**: `check-configs` **6h** asserts the walker still defines
+  `LOOP_EDGE_SHADOWED_RULE`, still calls the recorder, and still puts the result on `WalkResult`.
+  Eleven prose corrections in this branch's history each fixed three of four sites; 6h is the cheap
+  refusal to make that twelve. It earned itself on the first run, catching the marker moving into a
+  helper.
+
+**A trap worth keeping**, because the first implementation had it: the detection CANNOT live inside
+the edge-selection loop. That loop breaks at the first passing edge — which is the forward edge doing
+the shadowing — so it never reaches the loop edge it is looking for. It must be a separate pass.
+`tests/loopEdgeOrder.test.ts` caught this, and pins the quiet-failure shape: a mis-ordered graph
+produces `["worker", "done"]` with `loopBudgetSpent`, `loopExhausted` and `stalledAt` all undefined.
+
+`npm run smoke:loop` also covers the served graph now. Its first version passed no `judgeHook`, so
+judge scores failed open and the `metrics-author` loop never fired — it exercised only the loop that
+ordering cannot break. It now scripts a 0.4 score, so both loops fire: 11 runs, two `loopBudgetSpent`
+entries, and `loopEdgeShadowed` asserted empty against the live served graph.
 
 Also observed: a 403 during tool provisioning makes `provision.ts:149` report
 `no such tool in config/agentcontrol/tools/` for every variation referencing that tool, when the

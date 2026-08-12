@@ -20,6 +20,7 @@ import {
   createPolicyGate,
   decideApproval,
   describeLoopBudgetSpent,
+  describeLoopEdgeShadowed,
   describeLoopExhausted,
   getLdSdk,
   interpretWalk,
@@ -133,6 +134,9 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
   // Advisory quality loops that gave up. The walk finished normally, so nothing
   // else would mention them.
   if (walk.loopBudgetSpent) for (const l of describeLoopBudgetSpent(walk.loopBudgetSpent)) reporter.log(`⚠ ${l}`);
+  // A loop the SERVED graph's edge order may have made unreachable — it never ran,
+  // so unlike an exhausted budget there is no other trace of it in this walk.
+  if (walk.loopEdgeShadowed) for (const l of describeLoopEdgeShadowed(walk.loopEdgeShadowed)) reporter.log(`⚠ ${l}`);
 
   const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);

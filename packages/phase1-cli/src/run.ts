@@ -46,6 +46,7 @@ import {
   createWorkingTreeEvidence,
   decideApproval,
   describeLoopBudgetSpent,
+  describeLoopEdgeShadowed,
   describeLoopExhausted,
   extractConfigStamp,
   getLdSdk,
@@ -636,6 +637,9 @@ async function run(opts: CliOptions): Promise<number> {
   // Advisory quality loops that gave up. Not a failure, but the run is worse than a
   // clean first pass and nothing else would say so.
   if (walk.loopBudgetSpent) for (const l of describeLoopBudgetSpent(walk.loopBudgetSpent)) lines.push(`⚠ ${l}`);
+  // A loop the SERVED graph's edge order may have made unreachable. Worse than an
+  // exhausted loop: that one tried and gave up, this one never ran at all.
+  if (walk.loopEdgeShadowed) for (const l of describeLoopEdgeShadowed(walk.loopEdgeShadowed)) lines.push(`⚠ ${l}`);
   if (walk.loopExhausted) {
     lines.push(`⚠ ${describeLoopExhausted(walk.loopExhausted)}`);
     // Budget alone would repeat the same failure, so the grant requires feedback.
