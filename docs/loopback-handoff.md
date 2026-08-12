@@ -238,6 +238,43 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
    the reason in §2: the walker executes the graph LaunchDarkly serves, which has neither loop edge
    until that runs.
 
+## 7a. SETTLED EMPIRICALLY 2026-08-12 — the edge-order finding, and the fix is not the filed one
+
+Run live against a separate LaunchDarkly project (`abram-factory-testbed`, the owner's persistent
+factory test bed) provisioned by `bridge provision` from the committed files, then walked by
+`npm run smoke:loop` with a scripted runner. **The served graph loops, bounds and reports exactly
+as the fixtures do**: 10 runs in the expected order, `loopExhausted.reason = "budget"` at the code
+reviewer, one `loopBudgetSpent` entry (1 traversal of 1), and `max_visits` arriving as a **number**,
+not the `"2"`-style string `5aa3315` was about. `bridge upgrade --dry-run` then reported 0 changes.
+
+**The two paths disagree about edge ORDER, and only one of them is faithful.** A probe graph
+declared three edges from one source in the order Z, M, A (edge keys deliberately reverse to the
+declared order):
+
+- **The SDK-served graph returned declared order** (Z, M, A), and likewise preserves the committed
+  graph's load-bearing `metrics-author` pair — the loop edge before the forward edge.
+- **REST GET returned A, M, Z** — the exact reverse. On the real graph REST returned yet another
+  arrangement (7 edges, neither declared nor alphabetical). **REST GET order is not dependable.**
+
+Two consequences, and the second is the one that needs the design call:
+
+1. **Do NOT drop the sort at `upgrade.ts:86`.** That was the filed proposal, and it is wrong: REST
+   returns a different order than the committed file for a graph LaunchDarkly created *from that
+   file*, so an order-sensitive comparison would report drift on every run, starting immediately.
+   The sort is load-bearing.
+2. **No REST-based check can guard the ordering invariant at all** — GET's order is a derived view,
+   so a real within-source reorder is indistinguishable from LaunchDarkly's own shuffling. The
+   invariant in the graph's `$comment` ("the loop edge MUST stay declared BEFORE the forward edge",
+   which the walker reads via first-passing-edge) is therefore guardable only (a) against the
+   **SDK-served** graph, which IS order-faithful — `scripts/smoke-served-loop.ts` now prints exactly
+   this — or (b) repo-side, as a lint on the committed file. Pick one; `bridge upgrade` cannot be it.
+
+Also observed: a 403 during tool provisioning makes `provision.ts:149` report
+`no such tool in config/agentcontrol/tools/` for every variation referencing that tool, when the
+file is present and the real cause is the permission failure printed above it. ~50 false lines
+buried 7 real 403s. Same over-claim class as §4 — the message names a cause the code cannot
+distinguish.
+
 Still open, and none of it blocking: the items in §5 (each deferred by decision), the two gaps
 recorded rather than closed (the permissions row in `PATCH_FAILURE_TAXONOMY`, and the sibling cost
 of the §6 narrowing in `PATCH_SITES`), and two lint tuning risks recorded in

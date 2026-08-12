@@ -6,5 +6,5 @@
     "declaration": false,
     "types": ["node"]
   },
-  "include": ["**/*.ts"]
+  "include": ["**/*.ts", "../scripts/**/*.ts"]
 }
