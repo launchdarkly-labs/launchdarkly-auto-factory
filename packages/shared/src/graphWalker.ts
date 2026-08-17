@@ -15,10 +15,13 @@
  *
  * Designed for the linear/conditional chains we use today; one outgoing edge is
  * taken per node. Per-node generation metrics and per-edge handoff metrics are
- * recorded back to LaunchDarkly via the AI-config and graph trackers.
+ * recorded back to LaunchDarkly via the AI-config and graph trackers, plus
+ * graph-level ("global") metrics on the graph tracker once the walk finishes:
+ * invocation success/failure, total duration, the path taken, and aggregate
+ * token usage summed from the per-node trackers.
  */
 
-import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker } from "@launchdarkly/server-sdk-ai";
+import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker, LDTokenUsage } from "@launchdarkly/server-sdk-ai";
 import type { AgentNodeResult, AgentRunner } from "./agentRunner.js";
 import type { HandoffVerification, HandoffVerifier } from "./handoffVerifier.js";
 import type { JudgeHook } from "./judges.js";
@@ -203,6 +206,10 @@ export async function walkGraph(
   const ctx: Record<string, unknown> = { ...context };
   const gatedSteps = new Set(gate?.steps ?? []);
   const visited = new Set<string>();
+  const startMs = Date.now();
+  // Aggregate token usage across the whole walk, summed from each node
+  // tracker's summary after its run (the runner records tokens on the tracker).
+  const totalTokens: LDTokenUsage = { total: 0, input: 0, output: 0 };
 
   let node: AgentGraphNode | null = graphDef.rootNode();
   // Handoff of the edge we traversed INTO the current node (root has none).
@@ -248,6 +255,20 @@ export async function walkGraph(
       // Tool attachments from the LD variation (interface overrides; ADR 0011).
       ...(cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}),
     });
+
+    // Roll this node's token usage into the graph-level aggregate. Defensive:
+    // a metrics read must never break the walk (and some providers record no
+    // tokens, in which case the summary simply has none).
+    try {
+      const nodeTokens = tracker.getSummary?.().tokens;
+      if (nodeTokens) {
+        totalTokens.total += nodeTokens.total;
+        totalTokens.input += nodeTokens.input;
+        totalTokens.output += nodeTokens.output;
+      }
+    } catch {
+      /* ignore — node metrics still landed via the node tracker itself */
+    }
 
     Object.assign(accumulatedTags, result.tags);
     const output = lastAssistantText(result);
@@ -329,6 +350,10 @@ export async function walkGraph(
       }
       if (unmet.length > 0) {
         stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
+        // Record each blocked edge as a failed handoff (the counterpart of the
+        // trackHandoffSuccess fired when an edge IS taken). Intentional
+        // skip_if short-circuits were filtered out above and are not failures.
+        for (const u of unmet) graphTracker?.trackHandoffFailure(key, u.target);
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
     }
@@ -347,6 +372,29 @@ export async function walkGraph(
     }
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
+  }
+
+  // Graph-level ("global") metrics, alongside the per-node metrics recorded
+  // above. A pause at an approval gate is NOT a finished invocation — emit
+  // nothing graph-level for it: the post-approval re-run walks the chain on a
+  // fresh tracker (fresh runId) and reports the complete run. Likewise skip
+  // when nothing ran (e.g. a disabled graph): there is no invocation to score.
+  // Defensive try/catch: metric emission must never fail the walk.
+  if (graphTracker && !pendingApproval && runs.length > 0) {
+    try {
+      graphTracker.trackPath(runs.map((r) => r.configKey));
+      graphTracker.trackDuration(Date.now() - startMs);
+      if (totalTokens.total > 0) graphTracker.trackTotalTokens(totalTokens);
+      // Success = the machinery finished cleanly: every node completed, no
+      // stall, no deterministic-verification failure. A reviewer REJECT is
+      // still an invocation success — the graph did its job; the business
+      // outcome lives in tags/judge scores, not this metric.
+      const clean = !stalledAt && !verificationFailed && runs.every((r) => r.status === "completed");
+      if (clean) graphTracker.trackInvocationSuccess();
+      else graphTracker.trackInvocationFailure();
+    } catch (e) {
+      console.warn(`[graph-metrics] emission failed (non-fatal): ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   const reached = new Set(runs.map((r) => r.configKey));

@@ -74729,6 +74729,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
   const ctx = { ...context };
   const gatedSteps = new Set(gate?.steps ?? []);
   const visited = /* @__PURE__ */ new Set();
+  const startMs = Date.now();
+  const totalTokens = { total: 0, input: 0, output: 0 };
   let node = graphDef.rootNode();
   let inboundHandoff;
   let stalledAt;
@@ -74762,6 +74764,15 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
       // Tool attachments from the LD variation (interface overrides; ADR 0011).
       ...cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}
     });
+    try {
+      const nodeTokens = tracker.getSummary?.().tokens;
+      if (nodeTokens) {
+        totalTokens.total += nodeTokens.total;
+        totalTokens.input += nodeTokens.input;
+        totalTokens.output += nodeTokens.output;
+      }
+    } catch {
+    }
     Object.assign(accumulatedTags, result.tags);
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
@@ -74829,6 +74840,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
       }
       if (unmet.length > 0) {
         stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
+        for (const u of unmet)
+          graphTracker?.trackHandoffFailure(key, u.target);
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
     }
@@ -74845,6 +74858,21 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     }
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
+  }
+  if (graphTracker && !pendingApproval && runs.length > 0) {
+    try {
+      graphTracker.trackPath(runs.map((r6) => r6.configKey));
+      graphTracker.trackDuration(Date.now() - startMs);
+      if (totalTokens.total > 0)
+        graphTracker.trackTotalTokens(totalTokens);
+      const clean = !stalledAt && !verificationFailed && runs.every((r6) => r6.status === "completed");
+      if (clean)
+        graphTracker.trackInvocationSuccess();
+      else
+        graphTracker.trackInvocationFailure();
+    } catch (e6) {
+      console.warn(`[graph-metrics] emission failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+    }
   }
   const reached = new Set(runs.map((r6) => r6.configKey));
   const skipped = allNodeKeys(graphDef).filter((k6) => !reached.has(k6));

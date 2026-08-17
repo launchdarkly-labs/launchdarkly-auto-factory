@@ -34,8 +34,32 @@ class FakeRunner implements AgentRunner {
   }
 }
 
-/** Minimal LDAIConfigTracker stub — the fake runner never reads it. */
-const fakeConfigTracker = () => ({}) as unknown as LDAIConfigTracker;
+/**
+ * Minimal LDAIConfigTracker stub — the fake runner never reads it, but the
+ * walker reads getSummary().tokens to aggregate graph-level token usage.
+ */
+const fakeConfigTracker = () =>
+  ({ getSummary: () => ({ tokens: { total: 10, input: 6, output: 4 } }) }) as unknown as LDAIConfigTracker;
+
+/** Recording LDGraphTracker stub: captures every graph-level tracking call. */
+function recordingGraphTracker() {
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  const record =
+    (method: string) =>
+    (...args: unknown[]) =>
+      calls.push({ method, args });
+  const tracker = {
+    trackInvocationSuccess: record("trackInvocationSuccess"),
+    trackInvocationFailure: record("trackInvocationFailure"),
+    trackDuration: record("trackDuration"),
+    trackTotalTokens: record("trackTotalTokens"),
+    trackPath: record("trackPath"),
+    trackHandoffSuccess: record("trackHandoffSuccess"),
+    trackHandoffFailure: record("trackHandoffFailure"),
+    trackRedirect: record("trackRedirect"),
+  } as unknown as LDGraphTracker;
+  return { tracker, calls, methods: () => calls.map((c) => c.method) };
+}
 
 /** Build an LDAIAgentConfig for a node key. */
 function agentConfig(key: string): LDAIAgentConfig {
@@ -130,6 +154,82 @@ describe("walkGraph", () => {
       events.push(e.type),
     );
     assert.ok(events.includes("stalled"), `expected a stalled event, got: ${events.join(", ")}`);
+  });
+});
+
+describe("walkGraph — graph-level (global) metrics", () => {
+  const fullScript = {
+    flag: { tags: { flag_created: "true" } },
+    review: { tags: { review_approved: "approve" } },
+  };
+
+  it("a clean full run emits invocation success, path, duration, and aggregate tokens", async () => {
+    const g = recordingGraphTracker();
+    await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, g.tracker);
+    assert.ok(g.methods().includes("trackInvocationSuccess"), `got: ${g.methods().join(", ")}`);
+    assert.ok(!g.methods().includes("trackInvocationFailure"));
+    assert.ok(g.methods().includes("trackDuration"));
+    const path = g.calls.find((c) => c.method === "trackPath")?.args[0];
+    assert.deepEqual(path, ["research", "flag", "test", "review"]);
+    // 4 nodes × the stub tracker's {total:10, input:6, output:4} each.
+    const tokens = g.calls.find((c) => c.method === "trackTotalTokens")?.args[0];
+    assert.deepEqual(tokens, { total: 40, input: 24, output: 16 });
+    // One handoff per traversed edge.
+    assert.equal(g.calls.filter((c) => c.method === "trackHandoffSuccess").length, 3);
+  });
+
+  it("a stall emits invocation failure and a handoff failure for the blocked edge", async () => {
+    const g = recordingGraphTracker();
+    await walkGraph(buildGraph(), new FakeRunner({ flag: { tags: {} } }), { PR_NUMBER: "1" }, g.tracker);
+    assert.ok(g.methods().includes("trackInvocationFailure"), `got: ${g.methods().join(", ")}`);
+    assert.ok(!g.methods().includes("trackInvocationSuccess"));
+    const hf = g.calls.find((c) => c.method === "trackHandoffFailure");
+    assert.deepEqual(hf?.args, ["flag", "test"]);
+  });
+
+  it("a failed node emits invocation failure", async () => {
+    const g = recordingGraphTracker();
+    await walkGraph(
+      buildGraph(),
+      new FakeRunner({ ...fullScript, test: { status: "failed" } }),
+      { PR_NUMBER: "1" },
+      g.tracker,
+    );
+    assert.ok(g.methods().includes("trackInvocationFailure"), `got: ${g.methods().join(", ")}`);
+  });
+
+  it("an intentional skip_if short-circuit is an invocation SUCCESS (not a failure)", async () => {
+    const g = recordingGraphTracker();
+    await walkGraph(buildGraph(), new FakeRunner({ research: { tags: { skip_flagging: "true" } } }), { PR_NUMBER: "1" }, g.tracker);
+    assert.ok(g.methods().includes("trackInvocationSuccess"), `got: ${g.methods().join(", ")}`);
+    assert.ok(!g.methods().includes("trackHandoffFailure"));
+    assert.deepEqual(g.calls.find((c) => c.method === "trackPath")?.args[0], ["research"]);
+  });
+
+  it("a pause at an approval gate emits NO graph-level metrics (run is unfinished)", async () => {
+    const g = recordingGraphTracker();
+    await walkGraph(buildGraph(), new FakeRunner(fullScript), { PR_NUMBER: "1" }, g.tracker, undefined, {
+      steps: ["flag"],
+      resolve: () => false,
+    });
+    const global = g
+      .methods()
+      .filter((m) => ["trackInvocationSuccess", "trackInvocationFailure", "trackDuration", "trackTotalTokens", "trackPath"].includes(m));
+    assert.deepEqual(global, [], `expected no global metrics, got: ${global.join(", ")}`);
+  });
+
+  it("node trackers without getSummary don't break the walk (tokens simply unreported)", async () => {
+    const g = recordingGraphTracker();
+    const flagValue: LDAgentGraphFlagValue = { root: "research", edges: {} };
+    const bareTracker = () => ({}) as unknown as LDAIConfigTracker;
+    const configs = {
+      research: { key: "research", enabled: true, createTracker: bareTracker } as unknown as LDAIAgentConfig,
+    };
+    const graph = new AgentGraphDefinition(flagValue, AgentGraphDefinition.buildNodes(flagValue, configs), true, () => g.tracker);
+    const r = await walkGraph(graph, new FakeRunner({}), { PR_NUMBER: "1" }, g.tracker);
+    assert.equal(r.runs.length, 1);
+    assert.ok(g.methods().includes("trackInvocationSuccess"));
+    assert.ok(!g.methods().includes("trackTotalTokens"));
   });
 });
 
