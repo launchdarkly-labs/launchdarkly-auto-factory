@@ -32,7 +32,12 @@ import { type BeaconConfig, loadBeaconConfig } from "./config.js";
 import { discoverNewReleaseFlags } from "./discovery.js";
 import { otherSideHasFile } from "./fullstack.js";
 import { GitHubClient } from "./github.js";
-import { dedupeMonitors, monitorSettingsFromEnv, monitorTriggeredRelease } from "./monitor.js";
+import {
+  dedupeMonitors,
+  monitorSettingsFromEnv,
+  monitorTriggeredRelease,
+  type ReleaseMonitorContext,
+} from "./monitor.js";
 import { repointDependentPrerequisites } from "./repoint.js";
 import { FilePendingStore, recordOutcome, type PendingEntry, type PendingStore } from "./pending.js";
 import { parseRailwayWebhook } from "./railway.js";
@@ -83,7 +88,11 @@ export interface BeaconDeps {
   pending?: PendingStore;
   /** Hook fired when a release is started (or found already running); the
    *  default monitors it to a terminal state. Injectable for tests. */
-  onReleaseStarted?: (flagKey: string, environmentKey: string) => void | Promise<unknown>;
+  onReleaseStarted?: (
+    flagKey: string,
+    environmentKey: string,
+    ctx?: ReleaseMonitorContext,
+  ) => void | Promise<unknown>;
 }
 
 /**
@@ -213,17 +222,18 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
   // response must not wait on it.
   const attachMonitor =
     deps.onReleaseStarted ??
-    (async (flagKey: string, environmentKey: string): Promise<void> => {
+    (async (flagKey: string, environmentKey: string, ctx?: ReleaseMonitorContext): Promise<void> => {
       if (!monitorSettings.enabled) return;
-      await monitorTriggeredRelease(ld, flagKey, environmentKey, monitorSettings);
+      await monitorTriggeredRelease(ld, flagKey, environmentKey, monitorSettings, ctx);
     });
   // Dedup wraps the attach function UNCONDITIONALLY, including an injected one. "One watch
   // per flag/environment in flight" is a property Beacon wants whoever does the watching —
   // a redelivered `already_running` must not stack a second 24h poll loop onto a release
   // that already has one. And when the dedup lived only in the `??` default branch, every
   // test injected straight past it, so the property was unverifiable by construction.
-  const onReleaseStarted = dedupeMonitors(async (flagKey: string, environmentKey: string) =>
-    attachMonitor(flagKey, environmentKey),
+  const onReleaseStarted = dedupeMonitors(
+    async (flagKey: string, environmentKey: string, ctx?: ReleaseMonitorContext) =>
+      attachMonitor(flagKey, environmentKey, ctx),
   );
 
   async function handleDeploy(n: DeployNotification): Promise<{ status: number; body: unknown }> {
@@ -352,6 +362,15 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
      */
     const evaluateManifest = async (flag: DiscoveredFlag): Promise<FlagOutcome> => {
       const scope = flag.scope ?? "frontend";
+      // What Seer needs if this release later REVERTS (ADR 0014): the repo to search, the sha
+      // that started it, and the variation. Built once — both hook call sites below (the
+      // re-attach and the fresh staged release) pass the same context, and two literals is how
+      // one of them silently loses a field.
+      const monitorCtx: ReleaseMonitorContext = {
+        repoFullName: `${service.repo.owner}/${service.repo.name}`,
+        sha: n.sha,
+        ...(flag.targetVariation ? { targetVariation: flag.targetVariation } : {}),
+      };
       const decision = decideScope(scope, service.side);
 
       if (decision === "skip") {
@@ -469,7 +488,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           };
         }
         if (active) {
-          onReleaseStarted(flag.flagKey, n.environment); // re-attach monitoring (e.g. after a Beacon restart)
+          onReleaseStarted(flag.flagKey, n.environment, monitorCtx); // re-attach monitoring (e.g. after a Beacon restart)
           return { flag: flag.flagKey, sourceFile: flag.sourceFile, scope, action: "already_running", detail: { releaseId: active.id } };
         }
         // A REPEAT evaluation of an already-processed sha must not re-release a flag whose
@@ -545,7 +564,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         // Only staged rollouts get release monitoring: "held"/"noop" started
         // nothing, "prerequisites"/"immediate" have no automated release to watch.
         if (result.method === "progressive" || result.method === "guarded") {
-          onReleaseStarted(flag.flagKey, n.environment);
+          onReleaseStarted(flag.flagKey, n.environment, monitorCtx);
         }
         // An immediate release moves the fallthrough right here — re-point any
         // auto-factory children pinned on the previous variation (staged

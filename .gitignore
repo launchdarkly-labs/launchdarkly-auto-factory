@@ -11,6 +11,10 @@ sources/repos/
 # (these bypass check-public; the source LD project is the sanitization boundary).
 .agentcontrol-cache/
 
+# `bridge init --no-pr` output: workflows rendered for YOUR app repo (they
+# embed your owner/project key), meant to be copied there, not committed here.
+.autofactory-rendered/
+
 # --- Secrets ---
 .env
 .env.local

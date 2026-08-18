@@ -1,21 +1,36 @@
 # Drop this into your app repo at .github/workflows/auto-factory.yml
 #
-# Phase 1 runs on every PR (opened/updated). The agent chain runs on the
-# Anthropic API by default. The auto-factory-ai-provider flag in the factory
-# project selects the backend; it is optional and defaults to "anthropic" when
-# absent. With flag creation and code changes enabled, the agents create a real
-# flag (targeting off), wire it into the code, instrument metrics, add tests,
-# and push to the PR branch.
+# Phase 1 runs on every PR (opened/updated) by default. To make it label-gated
+# instead — only PRs carrying the `autofactory` label run (e.g. feature PRs, not
+# docs/chores) — set the repository variable AUTOFACTORY_REQUIRE_LABEL=true
+# (Settings → Secrets and variables → Actions → Variables). Unset = every PR.
+#
+# The agent chain runs on the Anthropic API by default. The
+# auto-factory-ai-provider flag in the factory project selects the backend; it
+# is optional and defaults to "anthropic" when absent. With flag creation and
+# code changes enabled, the agents create a real flag (targeting off), wire it
+# into the code, instrument metrics, add tests, and push to the PR branch.
 #
 # Per-step approval gates (optional): the auto-factory-approval-gates flag (an
 # array of agent node keys) pauses the chain before those steps. The run halts
 # and comments which label to add (af-approve:<step>); the `labeled` trigger
-# below makes adding that label re-run the chain so it proceeds past the gate.
+# below makes adding that label re-run the chain so it proceeds past the gate
+# (with AUTOFACTORY_REQUIRE_LABEL, keep `autofactory` on the PR so the job matches).
 #
-# Providers: this drop-in form works for the 'anthropic' (default) and 'vega'
-# backends. The 'cursor' backend can't run here — its @cursor/sdk dependency needs
-# node_modules, which a bare `uses:` action doesn't have. To run 'cursor', use the
-# checkout + `npm ci` + run-the-bundle workflow variant and add the cursor_api_key.
+# Providers: this drop-in form works for the 'anthropic' (default), 'bedrock',
+# and 'vega' backends. The 'cursor' backend can't run here — its @cursor/sdk
+# dependency needs node_modules, which a bare `uses:` action doesn't have. To run
+# 'cursor', use the checkout + `npm ci` + run-the-bundle workflow variant and add
+# the cursor_api_key.
+#
+# Bedrock: serve 'bedrock' from the auto-factory-ai-provider flag, then supply AWS
+# credentials with Bedrock model access — either add to the `with:` block:
+#   aws_region:            us-east-1
+#   aws_access_key_id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+#   aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+# or insert an aws-actions/configure-aws-credentials OIDC step before this one
+# (then only aws_region is needed, or nothing if that step sets AWS_REGION).
+# anthropic_api_key can be omitted when running on Bedrock.
 
 name: LaunchDarkly Auto-Factory
 
@@ -31,12 +46,13 @@ permissions:
 jobs:
   auto-factory:
     runs-on: ubuntu-latest
-    # CI-loop guard (secondary). The primary guard is in the action itself: agent
-    # commits carry `[skip ci]`, so the agents' pushes don't create a workflow run
-    # at all (a job-level `if:` can't help — GitHub gates bot-triggered PR runs for
-    # approval at the RUN level, before job conditions evaluate). This `if` is just
-    # belt-and-suspenders in case a bot-triggered run is ever created and approved.
-    if: github.actor != 'github-actions[bot]'
+    # CI-loop guard (secondary — the primary guard is `[skip ci]` on agent
+    # commits), plus the OPTIONAL label gate: when the repo variable
+    # AUTOFACTORY_REQUIRE_LABEL is 'true', only `autofactory`-labeled PRs run.
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      (vars.AUTOFACTORY_REQUIRE_LABEL != 'true' ||
+       contains(github.event.pull_request.labels.*.name, 'autofactory'))
     steps:
       - uses: actions/checkout@v4
         with:

@@ -5,14 +5,19 @@ import { SANDBOX_TOOL_DEFS, applyLdToolOverlay, buildSandboxTools } from "@auto-
 
 const FULL_CAPS = {
   createFlag: true, flagState: true, createMetric: true, editFiles: true,
-  writeManifest: true, queryGraph: false, readDocs: true,
+  writeManifest: true, queryGraph: false, querySentry: false, readDocs: true,
 };
 
 describe("LD tool overlay (ADR 0011)", () => {
   it("registry covers every capability-buildable tool", () => {
-    const built = buildSandboxTools({ ...FULL_CAPS, queryGraph: true, queryRepos: true });
+    const built = buildSandboxTools({
+      ...FULL_CAPS,
+      queryGraph: true,
+      querySentry: true,
+      queryRepos: true,
+    });
     for (const t of built) assert.ok(SANDBOX_TOOL_DEFS.has(t.name), `registry missing ${t.name}`);
-    assert.equal(SANDBOX_TOOL_DEFS.size, 19);
+    assert.equal(SANDBOX_TOOL_DEFS.size, 20);
   });
 
   it("no attachments → built-in defaults, unchanged (pre-tools projects)", () => {

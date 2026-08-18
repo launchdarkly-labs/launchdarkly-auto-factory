@@ -36,13 +36,20 @@ export * from "./providerFlag.js";
 export * from "./anthropic/sandboxTools.js";
 export * from "./anthropic/ldWriter.js";
 export * from "./anthropic/anthropicAgentRunner.js";
+// Bedrock provider: the Anthropic runner's tool loop over the Bedrock Mantle
+// transport (same Messages API, AWS auth/billing).
+export * from "./bedrock/bedrockAgentRunner.js";
 export * from "./cursor/cursorModel.js";
 export * from "./cursor/cursorAgentRunner.js";
 export * from "./observability.js";
+export * from "./sentryInit.js";
+export * from "./sentryMetrics.js";
+export * from "./sentry/index.js";
 // Judges: provider-agnostic hook + per-provider judge completions + evidence.
 export * from "./judges.js";
 export * from "./judgeEvidence.js";
 export * from "./anthropic/judgeCompletion.js";
+export * from "./bedrock/judgeCompletion.js";
 export * from "./cursor/judgeCompletion.js";
 // Knowledge graph (ADR 0010): LD-native composition + agent queries.
 export * from "./graph/index.js";

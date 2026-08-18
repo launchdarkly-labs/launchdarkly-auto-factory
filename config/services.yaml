@@ -1,5 +1,9 @@
 # Service registry for Beacon (Phase 2).
 #
+# NOTE: the entries below are the AUTHOR'S DEMO ESTATE (Railway-hosted demo
+# services), committed as a worked example of the shape. A real deployment
+# replaces them all with its own services; nothing else reads this file.
+#
 # Each deployable service maps to a scope "side" (frontend/backend), the repo
 # its code + `.release-flags/` live in, and a status endpoint that reports the
 # service's currently-deployed SHA (used for fullstack cross-service checks).

@@ -48,6 +48,8 @@ export interface SeedOptions {
   stagingDir: string;
   /** When true, the provision step reports without writing. */
   dryRun?: boolean;
+  /** APP-project client for shared metrics (ADR 0014). */
+  appLd?: LdClient;
 }
 
 export interface SeedResult {
@@ -76,6 +78,7 @@ export async function seed(opts: SeedOptions): Promise<SeedResult> {
   const provisionResult = await provision(opts.target, {
     aiConfigsDir: join(opts.stagingDir, "ai-configs"),
     graphsDir: join(opts.stagingDir, "graphs"),
+    ...(opts.appLd ? { appLd: opts.appLd } : {}),
     ...(opts.dryRun ? { dryRun: true } : {}),
   });
 

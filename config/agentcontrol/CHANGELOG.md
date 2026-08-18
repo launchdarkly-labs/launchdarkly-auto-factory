@@ -15,6 +15,47 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-12 (raise runaway backstops)
+
+### ✅ `gha-auto-factory`: all edge `max_turns` → 100
+
+- Raised every edge's `max_turns` (was 8 steward / 20 implementer / 20
+  metrics-author / 20 flag-testing / 30 reviewer) to a uniform **100**, and the
+  runner's no-edge default from 12 to 100. These caps are runaway backstops,
+  not budgets: the old values were low enough for a legitimately long node —
+  especially flag-testing scaffolding a test harness from scratch on a
+  greenfield repo (explore → scaffold → install → fix-and-re-run loop) — to
+  hit the cap mid-task. Worse, a capped node reports `stopped` (not `failed`),
+  the chain continues, and un-pushed work is silently lost.
+- Companion runtime changes (code repo, same day): per-response `max_tokens`
+  4096 → 32000 (a `write_file` carries the whole file in one response; a
+  max_tokens stop exited the tool loop silently as `completed`), judge cap
+  4096 → 16000 (truncation still detected + discarded), `run_tests` subprocess
+  timeout 240s → 30 min, and an explicit 60-min API client timeout (the SDK
+  refuses non-streaming requests above ~21k max_tokens without one).
+- Live update: `gha-auto-factory` on `auto-factory-prototype` PATCHed via
+  `bridge upgrade` (graph handoff drift is part of the owned shape). Other
+  existing projects pick this up on their next `bridge upgrade`.
+
+---
+
+## 2026-08-11 (`create_metric` description over LD's 1024-byte cap)
+
+### ✅ Tool: `create_metric` description trimmed to fit
+- **Why:** LaunchDarkly rejects AI tool descriptions over **1024 bytes** (counted
+  as bytes, not characters), and the `create_metric` description had grown to
+  1114 bytes — bootstrap failed to create the tool and two dependent
+  tool-attachments cascaded. Multibyte punctuation (em dashes, ellipses, `↔`)
+  made the byte count exceed the visible character count.
+- **Config:** `tools/create_metric.json` description condensed to 1020 bytes —
+  wording tightened, multibyte punctuation converted to ASCII; no semantic
+  changes to the backing rules (event vs. trace) or the schema.
+- **Credit:** fix contributed by Matt Laster (external PR); already-provisioned
+  LD projects need a re-bootstrap / `bridge upgrade` to pick up the new
+  description.
+
+---
+
 ## 2026-08-10
 
 ### ✅ Guard: a `loop_if_judge_below` edge's source must have a judge attached
@@ -152,6 +193,70 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-07 (Bedrock provider)
+
+### ✅ `auto-factory-ai-provider`: new `bedrock` variation
+
+- Added a fourth variation `bedrock` ("Bedrock") to the committed flag definition
+  (`flags/auto-factory-ai-provider.json`), appended after the existing three so
+  the provisioned defaults (off→`anthropic`, on→`vega`) are untouched. Serving
+  `bedrock` runs the SAME agents/tool loop as `anthropic` over Claude on Amazon
+  Bedrock (the Bedrock Mantle Messages endpoint) — auth via the AWS credential
+  chain (AWS_REGION + keys/OIDC role), billing on AWS.
+- No AI-config changes needed: the runner maps the configs' Anthropic model
+  names to Bedrock ids automatically (`claude-…` → `anthropic.claude-…`), so the
+  per-agent model variations work unchanged on both providers.
+- LIVE flag updated the same day: the `bedrock` variation was PATCHed onto
+  `auto-factory-prototype`'s live flag (v2→v3, additive — the production 50/50
+  anthropic/cursor rollout and off-variation are unchanged). Other existing
+  projects need the same manual PATCH/UI edit — `bridge upgrade` deliberately
+  never edits existing flag variations; new bootstraps get it from the
+  committed file.
+- Runtime NOT yet validated live (no AWS credentials at build time). Before
+  serving `bedrock`, confirm the target AWS account has the mapped Claude
+  models enabled in the chosen region.
+
+---
+
+## 2026-07-31 (greenfield-repo harness scaffolding)
+
+### ✅ `autofactory-flag-testing`: scaffold the test harness when the repo has none
+- **What**: extended the "Test conventions" section: on a repo with no test
+  suite the agent must also SCAFFOLD the harness so `run_tests` can invoke it —
+  for Node that means adding the package.json `"test"` script (run_tests runs
+  `npm test`); a `run_tests` "no test harness" response is an instruction to
+  build it, not a reason to skip.
+- **Why**: external bug report (2026-07-30, SE run against a minimal Express
+  app with no tests): `run_tests` treated npm's default "no test specified"
+  stub as a RED run, so every upstream node handed off `tests_last_run=fail`
+  and the `tests-green-at-handoff` shim killed the chain before flag-testing —
+  the node whose job is to create the missing suite. The runtime side of the
+  fix (in code, not config): `run_tests` now classifies "no harness present"
+  (missing/stub npm test script, pytest exit 5) as inconclusive — it no longer
+  sets `tests_last_run`, so the shim only gates on real test executions.
+- **Deploy**: committed file updated; live projects pick it up via
+  `bridge upgrade`.
+
+---
+
+## 2026-07-29 (Sentry path → `sentry` variation; review patch)
+
+### ✅ Metrics author: Sentry moved to a dedicated variation
+- **Why:** keep Sentry an optional path with zero drift on the core factory —
+  the `default` variation (instructions + tools) is byte-identical to the
+  pre-Sentry config; LD targeting selects the `sentry` variation to opt in.
+- **Config:** `autofactory-metrics-author.json` now ships two variations:
+  `default` (unchanged, no `query_sentry` attached) and `sentry` (Sentry
+  instructions + `query_sentry`). The graph edge keeps `query_sentry` as the
+  capability ceiling (ADR 0011); runners only advertise the tool in the mode
+  note when the served variation actually attaches it.
+- **Also in this patch:** LD LLM Observability spans record prompts/outputs
+  unconditionally again (SENTRY_AI_RECORD_PROMPTS gates only the Sentry copy);
+  the GHA/pre-push label gate is now optional (AUTOFACTORY_REQUIRE_LABEL,
+  default = every PR); demo manifest `pr-1.json` back to `api-errors` only.
+
+---
+
 ## 2026-07-28 (bounded loop-back edges)
 
 ### ✅ `max_visits` handoff field + rework-aware agents
@@ -176,6 +281,48 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **Runtime (tooling — this branch):** walker per-edge budget + routing/inventory
   tag split + rewind; approval orphan/false-green guard; loop-exhausted reporting
   across all front ends; pre-push gate hook inverted to a fail-closed allowlist.
+
+---
+
+## 2026-07-24 (Sentry estate bridge — ADR 0015)
+
+### ✅ Metrics author: `query_sentry` + dual-export guidance
+- **Why:** Sentry is ingest-only for OTel; estates need an author-time picture
+  and dual-export so LD `otel*` / KG still work alongside Sentry APM.
+- **Tool:** `query_sentry` (REST estate client) — issues, error volume,
+  `launchdarklyContext` coverage, dual-export gap hints. Soft when creds absent.
+- **Graph / grant:** metrics-author edge + fallback include `query_sentry`.
+- **Instructions:** call `query_sentry` before choosing killswitches; attach
+  `sentry-errors-*` for errors; prefer `otel*` via `list_metrics` when LD o11y
+  is present; never invent guardrails from Sentry aggregate-only stats; ensure
+  full Sentry baseline + dual-export / LD flag-in-span when LD o11y is present.
+
+### ✅ Shared Seer issue matcher
+- Beacon Seer reuses `findRelatedIssue` from `@auto-factory/shared` (same as
+  estate client).
+
+---
+
+## 2026-07-24 (Sentry layer — ADR 0014)
+
+### ✅ Metrics author: Sentry as error killswitch
+- **Why:** LaunchDarkly's official Sentry→LD metrics integration feeds guarded
+  rollouts from production errors; feature-scoped `track()` error events are
+  redundant when Sentry is present and miss attribution without
+  `launchdarklyContext`.
+- **Instructions:** detect Sentry → reuse `sentry-errors-binary` /
+  `sentry-errors-count` via `list_metrics`, instrument exact context name
+  `launchdarklyContext`, tag `sentry_guardrail=true` (M13). Latency/business
+  stay LD `track()` / trace metrics.
+- **Config:** `config/agentcontrol/metrics/` provisioned into the APP project;
+  tag registry + handoff verifier updated.
+
+### ✅ Factory LLM observability → Sentry AI monitoring (dual-write)
+- Runtime: `SENTRY_DSN` enables `@sentry/node` on Phase 1 runners; spans dual-
+  write with LD LLM Observability until `DISABLE_LD_OBSERVABILITY=true`.
+
+### ✅ Beacon Seer on revert
+- Runtime: `BEACON_SEER_AUTOFIX=true` → find Sentry issue → Autofix `open_pr`.
 
 ---
 
@@ -260,7 +407,6 @@ Status legend: ✅ done · 🔜 planned/in progress
   arms differ ONLY by model, which is what makes the A/B a model comparison.
 
 
-
 ### ✅ Metrics author: literal event keys (M12) — instruction hardening from live run
 - **Motivation (live CLI run, `show-free-shipping-nudge`):** the metrics author
   instrumented events with a template literal — `` track(`${FLAG_KEY}-error`) `` —
@@ -275,7 +421,6 @@ Status legend: ✅ done · 🔜 planned/in progress
   string" at the `track()` syntax. The shim stays strict (greppable literal = the
   verifiable contract); its failure detail now explains the dynamic-key case and
   the fix (runtime change, noted here because it pairs with M12).
-
 
 
 ### ✅ Deterministic handoff shims: agent claims re-derived from primary evidence

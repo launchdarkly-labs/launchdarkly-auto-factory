@@ -7,6 +7,11 @@
  * CLI writes at `<git-dir>/autofactory-last-run.json` (dry runs don't write
  * one). Decisions:
  *
+ *   - AUTOFACTORY_REQUIRE_LABEL=true and the PR / create command is not
+ *     labeled `autofactory` → allow (label-gated mode: bugfixes, chores,
+ *     docs, etc. skip AutoFactory). Default is EVERY push — set the env var
+ *     (e.g. in .claude/settings.json "env") to match a label-gated GitHub
+ *     Action (AUTOFACTORY_REQUIRE_LABEL repo variable).
  *   - no record, or record from another branch → DENY, with the fix
  *     ("run /autofactory") fed back to Claude.
  *   - record shows a known-good outcome (approved / noop) → allow.
@@ -29,6 +34,11 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
+/** Label that means "new feature — AutoFactory required" (Action + local gate). */
+const AUTOFACTORY_LABEL = "autofactory";
+/** Optional label-gated mode; mirrors the Action's AUTOFACTORY_REQUIRE_LABEL repo variable. */
+const REQUIRE_LABEL = process.env.AUTOFACTORY_REQUIRE_LABEL === "true";
+
 function decide(permissionDecision, reason) {
   console.log(
     JSON.stringify({
@@ -36,6 +46,46 @@ function decide(permissionDecision, reason) {
     }),
   );
   process.exit(0);
+}
+
+function normalizeLabel(label) {
+  return String(label ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function hasAutofactoryLabel(labels) {
+  return labels.some((l) => normalizeLabel(l) === AUTOFACTORY_LABEL);
+}
+
+/**
+ * Labels passed to `gh pr create` via repeated `--label` / `-l` flags.
+ * Does not shell-parse quoted values with spaces beyond a simple token grab —
+ * prefer `--label autofactory`.
+ */
+function labelsFromPrCreateCommand(command) {
+  const labels = [];
+  const re = /(?:^|\s)(?:--label|-l)\s+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
+  let m;
+  while ((m = re.exec(command))) {
+    labels.push(m[1] ?? m[2] ?? m[3]);
+  }
+  return labels;
+}
+
+/** Open PR labels for the current branch, or null if none / gh unavailable. */
+function labelsForBranch() {
+  try {
+    const raw = execFileSync(
+      "gh",
+      ["pr", "view", "--json", "labels", "--jq", ".labels[].name"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+    if (!raw) return [];
+    return raw.split("\n").map((l) => l.trim()).filter(Boolean);
+  } catch {
+    return null;
+  }
 }
 
 try {
@@ -71,6 +121,35 @@ try {
   // The chain is for change branches; pushing the default branch isn't a PR.
   if (branch === "main" || branch === "master" || branch === "HEAD") {
     decide("allow", `no AutoFactory gate on '${branch}'`);
+  }
+
+  // Label-gated mode (opt-in): unlabeled / non-feature PRs skip AutoFactory.
+  // Default mode gates every push, label or not.
+  if (REQUIRE_LABEL) {
+    if (isPrCreate) {
+      const labels = labelsFromPrCreateCommand(command);
+      if (!hasAutofactoryLabel(labels)) {
+        decide(
+          "allow",
+          "gh pr create without `autofactory` label — AutoFactory gate skipped (AUTOFACTORY_REQUIRE_LABEL)",
+        );
+      }
+    } else {
+      const prLabels = labelsForBranch();
+      if (prLabels === null) {
+        decide(
+          "allow",
+          "no open PR for this branch — AutoFactory gate skipped (AUTOFACTORY_REQUIRE_LABEL; add the `autofactory` label when you open a feature PR)",
+        );
+      }
+      if (!hasAutofactoryLabel(prLabels)) {
+        const shown = prLabels.length ? prLabels.join(", ") : "none";
+        decide(
+          "allow",
+          `PR labels [${shown}] do not include \`autofactory\` — AutoFactory gate skipped (AUTOFACTORY_REQUIRE_LABEL)`,
+        );
+      }
+    }
   }
 
   const recordPath = join(gitDir, "autofactory-last-run.json");

@@ -43,7 +43,7 @@ import {
   applyLdToolOverlay,
   buildSandboxTools,
 } from "../anthropic/sandboxTools.js";
-import { SpanKind, SpanStatusCode, aiTracer, setGenAiAttributes } from "../observability.js";
+import { startAiSpan } from "../observability.js";
 import { mapModelParameters, mapToCursorModel } from "./cursorModel.js";
 
 /** Cursor model used when the LD-configured model can't be mapped to the catalog. */
@@ -167,6 +167,8 @@ export class CursorAgentRunner implements AgentRunner {
       stewardManifest: grant.stewardManifest === true && this.opts.codeChangesEnabled === true,
       // Read-only; globally enabled by the presence of a composed graph (KG flag).
       queryGraph: grant.queryGraph === true && this.opts.knowledgeGraph !== undefined,
+      // Read-only; soft when SENTRY_* unset (estate picture returns available:false).
+      querySentry: grant.querySentry === true,
       // Read-only; no global gate (fetch failures degrade inside the tool).
       readDocs: grant.readDocs === true,
       // Read-only; globally enabled by a registered relatedRepos list + a token.
@@ -176,7 +178,7 @@ export class CursorAgentRunner implements AgentRunner {
         Boolean(this.opts.githubToken ?? process.env.GITHUB_TOKEN),
     };
     console.log(
-      `[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} queryRepos=${grant.queryRepos === true} → effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} queryRepos=${caps.queryRepos === true}`,
+      `[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} querySentry=${grant.querySentry === true} queryRepos=${grant.queryRepos === true} → effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} querySentry=${caps.querySentry === true} queryRepos=${caps.queryRepos === true}`,
     );
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : undefined;
 
@@ -232,8 +234,11 @@ export class CursorAgentRunner implements AgentRunner {
     }
 
     // No system-prompt param in the SDK → prepend the LD instructions + the
-    // shared capability/tagging note, then the run prompt.
-    const preamble = (req.instructions ?? "") + modeNote(caps);
+    // shared capability/tagging note, then the run prompt. The Sentry note is
+    // keyed to the variation's offered tools, not the shared edge ceiling.
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const preamble =
+      (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
     const message = `${preamble}\n\n---\n\n${req.prompt}`;
 
     let status: AgentStatus = "completed";
@@ -242,10 +247,8 @@ export class CursorAgentRunner implements AgentRunner {
     let agent: SDKAgent | undefined;
     const started = Date.now();
 
-    // Emit a gen_ai span for LD LLM Observability. Cursor runs inference in its
-    // hosted service, so this is a manual span — set its attributes from the run
-    // result below. No-op tracer when observability isn't enabled.
-    const span = aiTracer().startSpan(`chat ${req.configKey}`, { kind: SpanKind.CLIENT });
+    // Manual gen_ai span (Cursor hosts inference) — dual-write to LD + Sentry.
+    const span = startAiSpan(`chat ${req.configKey}`, { op: "gen_ai.chat" });
 
     try {
       const { Agent } = await loadCursorSdk();
@@ -304,7 +307,7 @@ export class CursorAgentRunner implements AgentRunner {
       status = "failed";
       finalText = e instanceof Error ? e.message : String(e);
       req.tracker?.trackError();
-      if (e instanceof Error) span.recordException(e);
+      span.recordException(e);
     } finally {
       req.tracker?.trackDuration(Date.now() - started);
       // Tool-invocation telemetry (AI Config monitoring's tool dimension).
@@ -318,17 +321,16 @@ export class CursorAgentRunner implements AgentRunner {
       if (usage) {
         req.tracker?.trackTokens({ input: usage.inputTokens, output: usage.outputTokens, total: usage.totalTokens });
       }
-      // Record the gen_ai attributes + status on the observability span, then end it.
-      setGenAiAttributes(span, {
+      span.setGenAi({
         provider: "cursor",
         requestModel: match.id,
+        agentName: req.configKey,
         ...(req.tracker ? { tracker: req.tracker } : {}),
         prompt: message,
         output: finalText,
         ...(usage ? { usage: { input: usage.inputTokens, output: usage.outputTokens, total: usage.totalTokens } } : {}),
       });
-      span.setStatus({ code: status === "completed" ? SpanStatusCode.OK : SpanStatusCode.ERROR });
-      span.end();
+      span.end(status === "completed" ? "ok" : "error");
       if (agent) {
         try {
           await agent[Symbol.asyncDispose]();

@@ -20,7 +20,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { AgentNodeRequest, AgentNodeResult, AgentRunner, AgentStatus } from "../agentRunner.js";
-import { SpanKind, SpanStatusCode, aiTracer, setGenAiAttributes } from "../observability.js";
+import { startAiSpan } from "../observability.js";
 import type { KnowledgeGraph } from "../graph/schema.js";
 import { type RelatedRepo, RelatedReposClient } from "../github/relatedRepos.js";
 import type { LdResourceWriter } from "./ldWriter.js";
@@ -48,6 +48,11 @@ export function modeNote(caps: ToolCapabilities): string {
   if (caps.queryGraph) {
     lines.push(
       "You have `query_dependencies` — the estate's knowledge graph (service call edges observed from LaunchDarkly telemetry + flag→code wrap points). Call it with NO arguments EARLY to get this PR's blast radius (changed services, dependent services at risk, upstream contracts, flags already on the changed code) and let it inform your classification and risk_score. Treat any entry in its `gaps` list as UNKNOWN coverage — a thin graph is never evidence of low impact.",
+    );
+  }
+  if (caps.querySentry) {
+    lines.push(
+      "You have `query_sentry` — a Sentry estate picture (top issues, error volume, whether recent errors carry `launchdarklyContext`, dual-export hints for otel*). Call it EARLY when choosing error killswitches or when the repo has Sentry. It does not create LD metrics; attach sentry-errors-* / otel* via list_metrics + write_manifest. Never treat Sentry Explore aggregates as guarded-release backings (ADR 0015).",
     );
   }
   if (caps.queryRepos) {
@@ -93,9 +98,45 @@ export function modeNote(caps: ToolCapabilities): string {
   return lines.join("\n") + TAGGING_NOTE;
 }
 
-const DEFAULT_MAX_TURNS = 12;
-const MAX_TOKENS = 4096;
+// Backstops, not budgets: sized so they only trip on runaway behavior, never
+// on a legitimately long task (e.g. flag-testing scaffolding a test harness
+// from scratch — see the turn-cap loss + silent max_tokens truncation modes,
+// 2026-08-12). A node that hits either of these has gone really wrong.
+const DEFAULT_MAX_TURNS = 100;
+// 32000 = the max output every current Claude model supports (Opus caps at
+// 32k; Sonnet/Haiku go higher). A single write_file carries the whole file in
+// one response, and a max_tokens stop exits the tool loop with the write lost.
+const MAX_TOKENS = 32_000;
+/**
+ * Explicit per-client timeout. Without one, the SDK REFUSES non-streaming
+ * requests whose max_tokens implies >10 minutes at its modeled throughput
+ * (~21k tokens), throwing at request time — so raising MAX_TOKENS past that
+ * requires setting this. 60 min matches the SDK's own non-streaming ceiling.
+ */
+export const ANTHROPIC_TIMEOUT_MS = 3_600_000;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
+
+/**
+ * Per-turn retries on TRANSIENT API errors, on top of the SDK's own built-in
+ * (short-horizon) retries. Observed live: a single "Request timed out." from
+ * the SDK aborted the whole node — its final text became the error string, the
+ * judge scored the "output" 0.00, and downstream agents received an error
+ * message as their brief, even though the node's actual work (flags, metrics,
+ * commits) had already landed. The conversation state is intact in `messages`,
+ * so re-issuing the same request is always safe.
+ */
+const TRANSIENT_RETRIES = 3;
+const TRANSIENT_BACKOFF_MS = [5_000, 15_000, 45_000];
+
+/** Connection failures/timeouts and retryable statuses (408/429/5xx incl. 529 overloaded). */
+function isTransientApiError(e: unknown): boolean {
+  if (e instanceof Anthropic.APIConnectionError) return true; // includes APIConnectionTimeoutError
+  if (e instanceof Anthropic.APIError) {
+    const s = e.status;
+    return s === 408 || s === 429 || (typeof s === "number" && s >= 500);
+  }
+  return false;
+}
 
 /**
  * FALLBACK per-node capability grants, used only when the graph edge doesn't
@@ -121,7 +162,7 @@ const NODE_CAPABILITIES: Record<string, ToolCapabilities> = {
   "autofactory-flag-testing": { createFlag: false, createMetric: false, editFiles: true },
   // The metrics author creates LD metrics and instruments the event (track()) that
   // feeds them — so it needs create_metric AND edit_files (+ manifest updates).
-  "autofactory-metrics-author": { createFlag: false, createMetric: true, editFiles: true, writeManifest: true, readDocs: true, queryGraph: true },
+  "autofactory-metrics-author": { createFlag: false, createMetric: true, editFiles: true, writeManifest: true, readDocs: true, queryGraph: true, querySentry: true },
   // The reviewer is read-only but verifies LaunchDarkly semantics — docs access
   // lets it check claims against the source instead of trusting the chain.
   "autofactory-code-reviewer": { createFlag: false, createMetric: false, editFiles: false, readDocs: true },
@@ -160,6 +201,7 @@ export const CAP_EDIT_FILES = "edit_files";
 export const CAP_WRITE_MANIFEST = "write_manifest";
 export const CAP_STEWARD_MANIFEST = "steward_manifest";
 export const CAP_QUERY_GRAPH = "query_graph";
+export const CAP_QUERY_SENTRY = "query_sentry";
 export const CAP_READ_DOCS = "read_docs";
 export const CAP_QUERY_REPOS = "query_repos";
 
@@ -182,6 +224,7 @@ export function resolveGrant(
         writeManifest: capabilities.includes(CAP_WRITE_MANIFEST),
         stewardManifest: capabilities.includes(CAP_STEWARD_MANIFEST),
         queryGraph: capabilities.includes(CAP_QUERY_GRAPH),
+        querySentry: capabilities.includes(CAP_QUERY_SENTRY),
         readDocs: capabilities.includes(CAP_READ_DOCS),
         queryRepos: capabilities.includes(CAP_QUERY_REPOS),
       },
@@ -193,11 +236,39 @@ export function resolveGrant(
   return { grant: { createFlag: false, createMetric: false, editFiles: false }, source: "none" };
 }
 
+/**
+ * The slice of the Anthropic client the runner needs. Structural, so any
+ * client exposing the same Messages surface plugs in — notably
+ * `AnthropicBedrockMantle` (@anthropic-ai/bedrock-sdk), which serves the same
+ * Messages API via AWS Bedrock and reuses this exact loop (see ../bedrock/).
+ */
+export interface AnthropicMessagesClient {
+  messages: {
+    create(params: Anthropic.MessageCreateParamsNonStreaming): Promise<Anthropic.Message>;
+  };
+}
+
 export interface AnthropicAgentRunnerOptions {
   /** Absolute path the sandbox tools operate within (the repo under review / the checkout). */
   sandboxRoot: string;
-  /** Anthropic API key; falls back to ANTHROPIC_API_KEY in the env. */
+  /** Anthropic API key; falls back to ANTHROPIC_API_KEY in the env. Ignored when `client` is provided. */
   apiKey?: string;
+  /**
+   * Pre-constructed Anthropic-compatible client. Lets a sibling provider (e.g.
+   * Bedrock) reuse this runner's whole tool loop — retries, forced tags,
+   * trackers, spans — with only the transport swapped. Default: `new Anthropic()`.
+   */
+  client?: AnthropicMessagesClient;
+  /**
+   * Provider name stamped on logs + gen_ai observability spans. Default
+   * "anthropic"; the Bedrock wrapper passes "bedrock".
+   */
+  providerName?: string;
+  /**
+   * Maps the LD AI config's model name to the provider's model id. Default
+   * `anthropicModelId`; the Bedrock wrapper passes `bedrockModelId`.
+   */
+  modelIdMapper?: (name: string | undefined) => string;
   /** When provided, `create_flag` is enabled for capable nodes (real flags in the app project). */
   writer?: LdResourceWriter;
   /** When true, file-edit + commit/push tools are enabled for capable nodes. */
@@ -231,10 +302,33 @@ export interface AnthropicAgentRunnerOptions {
 }
 
 export class AnthropicAgentRunner implements AgentRunner {
-  private readonly client: Anthropic;
+  private readonly client: AnthropicMessagesClient;
+  private readonly providerName: string;
+  private readonly modelId: (name: string | undefined) => string;
 
   constructor(private readonly opts: AnthropicAgentRunnerOptions) {
-    this.client = new Anthropic(opts.apiKey ? { apiKey: opts.apiKey } : {});
+    this.client = opts.client ?? new Anthropic({ timeout: ANTHROPIC_TIMEOUT_MS, ...(opts.apiKey ? { apiKey: opts.apiKey } : {}) });
+    this.providerName = opts.providerName ?? "anthropic";
+    this.modelId = opts.modelIdMapper ?? anthropicModelId;
+  }
+
+  /** `messages.create` with backoff retries on transient errors (see TRANSIENT_RETRIES). */
+  private async createMessage(
+    configKey: string,
+    params: Anthropic.MessageCreateParamsNonStreaming,
+  ): Promise<Anthropic.Message> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.client.messages.create(params);
+      } catch (e) {
+        if (!isTransientApiError(e) || attempt >= TRANSIENT_RETRIES) throw e;
+        const delay = TRANSIENT_BACKOFF_MS[attempt] ?? 45_000;
+        console.warn(
+          `[node] ${configKey} transient API error (${e instanceof Error ? e.message : e}) — retry ${attempt + 1}/${TRANSIENT_RETRIES} in ${delay / 1000}s`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
   }
 
   async runNode(req: AgentNodeRequest): Promise<AgentNodeResult> {
@@ -251,6 +345,8 @@ export class AnthropicAgentRunner implements AgentRunner {
       stewardManifest: grant.stewardManifest === true && this.opts.codeChangesEnabled === true,
       // Read-only; globally enabled by the presence of a composed graph (KG flag).
       queryGraph: grant.queryGraph === true && this.opts.knowledgeGraph !== undefined,
+      // Read-only; soft when SENTRY_* unset (estate picture returns available:false).
+      querySentry: grant.querySentry === true,
       // Read-only; no global gate (fetch failures degrade inside the tool).
       readDocs: grant.readDocs === true,
       // Read-only; globally enabled by a registered relatedRepos list + a token.
@@ -262,15 +358,14 @@ export class AnthropicAgentRunner implements AgentRunner {
     // Per-node diagnostic: makes a renamed/added agent that silently lost its
     // grant (source "none", read-only) visible in the run logs.
     console.log(
-      `[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} queryRepos=${grant.queryRepos === true} → effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} queryRepos=${caps.queryRepos === true}`,
+      `[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} querySentry=${grant.querySentry === true} queryRepos=${grant.queryRepos === true} → effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} querySentry=${caps.querySentry === true} queryRepos=${caps.queryRepos === true}`,
     );
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : undefined;
 
-    const system = (req.instructions ?? "") + modeNote(caps);
-    const model = anthropicModelId(req.model);
+    const model = this.modelId(req.model);
     // Parity with the Cursor runner's model log: the served variation's model is
     // what makes A/B run logs attributable without querying LD monitoring.
-    console.log(`[node] ${req.configKey} anthropic model → '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
+    console.log(`[node] ${req.configKey} ${this.providerName} model → '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
     const executor = new SandboxToolExecutor(
       this.opts.sandboxRoot,
       writer,
@@ -298,6 +393,12 @@ export class AnthropicAgentRunner implements AgentRunner {
       );
     }
     const tools = overlay.tools as Anthropic.Tool[];
+    // The Sentry note only belongs in the prompt when the variation actually
+    // attached query_sentry — the edge grant is a ceiling shared by variations
+    // (e.g. the metrics author's non-Sentry default), not the offered set.
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const system =
+      (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
     const toolCallsUsed = new Set<string>();
     const maxTurns = req.maxTurns ?? DEFAULT_MAX_TURNS;
 
@@ -308,14 +409,12 @@ export class AnthropicAgentRunner implements AgentRunner {
     let outputTokens = 0;
     const started = Date.now();
 
-    // Emit a gen_ai span for LD LLM Observability (parity with the Cursor runner),
-    // so every provider's agent runs show up in LLM Observability, not just Cursor.
-    // No-op tracer when observability isn't enabled.
-    const span = aiTracer().startSpan(`chat ${req.configKey}`, { kind: SpanKind.CLIENT });
+    // Dual-write gen_ai span: LD LLM Observability (OTel) + Sentry AI monitoring.
+    const span = startAiSpan(`chat ${req.configKey}`, { op: "gen_ai.chat" });
 
     try {
       for (let turn = 0; turn < maxTurns; turn++) {
-        const resp = await this.client.messages.create({
+        const resp = await this.createMessage(req.configKey, {
           model,
           max_tokens: MAX_TOKENS,
           system,
@@ -358,7 +457,7 @@ export class AnthropicAgentRunner implements AgentRunner {
             "Call `tag_conversation` now with a `tags` object, choosing the correct value(s) per your instructions " +
             "(e.g. your flag-worthiness decision, the testing hand-off, or your APPROVE/REJECT verdict and risk level).";
           messages.push({ role: "user", content: forcePrompt });
-          const forced = await this.client.messages.create({
+          const forced = await this.createMessage(req.configKey, {
             model,
             max_tokens: MAX_TOKENS,
             system,
@@ -386,7 +485,7 @@ export class AnthropicAgentRunner implements AgentRunner {
       status = "failed";
       finalText = e instanceof Error ? e.message : String(e);
       req.tracker?.trackError();
-      if (e instanceof Error) span.recordException(e);
+      span.recordException(e);
     } finally {
       req.tracker?.trackDuration(Date.now() - started);
       // Tool-invocation telemetry (AI Config monitoring's tool dimension).
@@ -400,10 +499,10 @@ export class AnthropicAgentRunner implements AgentRunner {
       if (inputTokens || outputTokens) {
         req.tracker?.trackTokens({ input: inputTokens, output: outputTokens, total: inputTokens + outputTokens });
       }
-      // Record the gen_ai attributes + status on the observability span, then end it.
-      setGenAiAttributes(span, {
-        provider: "anthropic",
+      span.setGenAi({
+        provider: this.providerName,
         requestModel: model,
+        agentName: req.configKey,
         ...(req.tracker ? { tracker: req.tracker } : {}),
         prompt: req.prompt,
         output: finalText,
@@ -411,8 +510,7 @@ export class AnthropicAgentRunner implements AgentRunner {
           ? { usage: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens } }
           : {}),
       });
-      span.setStatus({ code: status === "completed" ? SpanStatusCode.OK : SpanStatusCode.ERROR });
-      span.end();
+      span.end(status === "completed" ? "ok" : "error");
     }
 
     return {

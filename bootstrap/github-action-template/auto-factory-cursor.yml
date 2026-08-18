@@ -1,6 +1,9 @@
 # Drop this into your app repo at .github/workflows/auto-factory.yml when you want
 # Phase 1 to run on the CURSOR provider (Cursor agents via @cursor/sdk).
 #
+# Phase 1 runs on every PR by default; set the repository variable
+# AUTOFACTORY_REQUIRE_LABEL=true to gate it on the `autofactory` PR label.
+#
 # Why this differs from the plain template: the Cursor provider lazy-loads
 # @cursor/sdk, which needs node_modules — a bare `uses: <owner>/...@main` action
 # ships no node_modules, so it can't run Cursor. This workflow instead checks the
@@ -26,9 +29,13 @@ permissions:
 jobs:
   auto-factory:
     runs-on: ubuntu-latest
-    # CI-loop guard (secondary). The primary guard is in the action: agent commits
-    # carry [skip ci], so the agents' pushes never create a workflow run.
-    if: github.actor != 'github-actions[bot]'
+    # CI-loop guard (secondary — the primary guard is `[skip ci]` on agent
+    # commits), plus the OPTIONAL label gate: when the repo variable
+    # AUTOFACTORY_REQUIRE_LABEL is 'true', only `autofactory`-labeled PRs run.
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      (vars.AUTOFACTORY_REQUIRE_LABEL != 'true' ||
+       contains(github.event.pull_request.labels.*.name, 'autofactory'))
     steps:
       # The code under analysis = the PR's head branch (so agent commits push back cleanly).
       - name: Check out the PR code

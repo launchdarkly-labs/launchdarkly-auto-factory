@@ -55,6 +55,10 @@ bootstrap/cursor-automation/
 
 ## Install into a target app repo
 
+Guided: `npm run init -- --front-end cursor-automation --app-repo-path <target>`
+(from this tooling repo's root) does steps 1–2 for you, rendering `mcp.json`
+with your token. Or by hand:
+
 1. Copy `dot-cursor/` into the target repo as `.cursor/` (or merge its contents
    into an existing `.cursor/`).
 2. In `.cursor/mcp.json`, replace `REPLACE_WITH_LD_API_KEY` with your token. Do

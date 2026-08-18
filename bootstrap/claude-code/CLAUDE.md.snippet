@@ -3,6 +3,8 @@
 ## AutoFactory (LaunchDarkly)
 
 Before pushing a branch or opening a PR, run `/autofactory` on the change set.
+(In label-gated mode — `AUTOFACTORY_REQUIRE_LABEL=true` — only PRs labeled
+`autofactory` need it; bugfix / chore / unlabeled PRs skip the gate.)
 It researches the change and, when flag-worthy, creates a feature flag
 (targeting off) with the behavior wired behind it, guarded-release metrics with
 instrumentation, flag-on/flag-off tests, and a release manifest under

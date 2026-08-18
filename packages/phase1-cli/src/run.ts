@@ -23,6 +23,7 @@ import {
   type AgentRunner,
   AnthropicAgentRunner,
   type AssembledGraph,
+  BedrockAgentRunner,
   type JudgeCompletion,
   type JudgeHook,
   KNOWLEDGE_GRAPH_FLAG_KEY,
@@ -41,6 +42,7 @@ import {
   computeConfigHash,
   declaredMaxVisits,
   createAnthropicJudgeCompletion,
+  createBedrockJudgeCompletion,
   createJudgeHook,
   createPolicyGate,
   createWorkingTreeEvidence,
@@ -51,6 +53,7 @@ import {
   extractConfigStamp,
   getLdSdk,
   hasChangeToProcess,
+  initFactorySentry,
   interpretWalk,
   isGitRepo,
   loadDotEnv,
@@ -200,6 +203,8 @@ async function run(opts: CliOptions): Promise<number> {
   if (!process.env.LD_SDK_KEY) throw new UsageError("LD_SDK_KEY is not set (factory project server SDK key)");
   if (!process.env.LD_PROJECT_KEY) throw new UsageError("LD_PROJECT_KEY is not set (factory project key)");
 
+  await initFactorySentry({ serviceName: "auto-factory-phase1-cli" });
+
   const root = resolve(opts.root);
   if (!(await isGitRepo(root))) throw new UsageError(`'${root}' is not a git repository`);
   const state = await readRepoState(root, opts.base);
@@ -212,27 +217,28 @@ async function run(opts: CliOptions): Promise<number> {
   const { ldClient, aiClient } = await getLdSdk();
   let ldContext = pipelineContext();
 
-  // The CLI runs on Anthropic ONLY. Vega executes agents server-side, so it
-  // can't edit this working tree. Cursor executes locally BUT its local agent
-  // carries native shell/git tools alongside our sandbox tools — in a live run
-  // (2026-07-20) it committed each step and pushed the branch itself, bypassing
-  // commit_and_push (the only place gitMode "workingTree" is enforced), and the
-  // SDK offers no tool-restriction API to prevent it. Only the Anthropic runner
-  // is structurally confined to the sandbox tools, which is what the CLI's
-  // "nothing is committed or pushed" contract requires.
+  // The CLI runs on the SANDBOXED runners only (Anthropic or Bedrock — the
+  // same tool loop over different transports). Vega executes agents
+  // server-side, so it can't edit this working tree. Cursor executes locally
+  // BUT its local agent carries native shell/git tools alongside our sandbox
+  // tools — in a live run (2026-07-20) it committed each step and pushed the
+  // branch itself, bypassing commit_and_push (the only place gitMode
+  // "workingTree" is enforced), and the SDK offers no tool-restriction API to
+  // prevent it. Only the sandbox-confined runners satisfy the CLI's "nothing
+  // is committed or pushed" contract.
   let provider = await resolveAiProvider(ldClient, ldContext);
-  if (provider !== "anthropic") {
+  if (provider !== "anthropic" && provider !== "bedrock") {
     console.log(
-      `Provider flag selects '${provider}', but the CLI's working-tree mode requires the sandboxed Anthropic runner ` +
+      `Provider flag selects '${provider}', but the CLI's working-tree mode requires a sandboxed runner ` +
         `(${provider === "cursor" ? "Cursor local agents have native git and would commit/push" : "Vega runs server-side"}). Using Anthropic.`,
     );
     provider = "anthropic";
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new UsageError("ANTHROPIC_API_KEY is not set (the CLI always executes on the Anthropic runner)");
+  if (provider === "anthropic" && !process.env.ANTHROPIC_API_KEY) {
+    throw new UsageError("ANTHROPIC_API_KEY is not set (required on the Anthropic runner)");
   }
-  // Stamp the EFFECTIVE provider (always anthropic here) on the run context so
-  // AI config targeting serves only models this runner can execute (rules on
+  // Stamp the EFFECTIVE provider (anthropic or bedrock here) on the run context
+  // so AI config targeting serves only models this runner can execute (rules on
   // `run.provider` — e.g. never a Cursor-catalog model to an Anthropic run).
   ldContext = withProvider(ldContext, provider);
 
@@ -315,10 +321,16 @@ async function run(opts: CliOptions): Promise<number> {
     ...(kg ? { knowledgeGraph: kg.graph, changedFiles: kg.changedFiles } : {}),
     ...(relatedRepos.length > 0 && reposToken ? { relatedRepos, githubToken: reposToken } : {}),
   };
-  const runner: AgentRunner = new AnthropicAgentRunner({
-    ...localOpts,
-    ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
-  });
+  const runner: AgentRunner =
+    provider === "bedrock"
+      ? new BedrockAgentRunner({
+          ...localOpts,
+          ...(process.env.AWS_REGION ? { awsRegion: process.env.AWS_REGION } : {}),
+        })
+      : new AnthropicAgentRunner({
+          ...localOpts,
+          ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
+        });
 
   // The approval policy (mode/threshold/gates flags) compiles into
   // pre-execution gates. The CLI's gate answer is non-blocking, like the
@@ -423,7 +435,10 @@ async function run(opts: CliOptions): Promise<number> {
 
   // Judges: agents never commit in workingTree mode, so the verified evidence
   // is the node-scoped working-tree diff instead of the commit-scoped one.
-  const judgeCompletion: JudgeCompletion | undefined = createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
+  const judgeCompletion: JudgeCompletion | undefined =
+    provider === "bedrock"
+      ? createBedrockJudgeCompletion(process.env.AWS_REGION)
+      : createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
   const baseJudgeHook = judgeCompletion
     ? createJudgeHook({
         aiClient,

@@ -25,7 +25,18 @@ end-to-end against a live demo repo. Not a product.
   diffs `.release-flags/` between the deployed SHA and the previous one, and starts a
   guarded release for each new manifest (turning the flag on atomically). It then monitors
   the release to a terminal state: completed, reverted by a guardrail metric, or stopped.
+  When Sentry is wired (ADR 0014), shared `sentry-errors-*` metrics can killswitch the
+  rollout; on `reverted`, Beacon can start Seer Autofix (`BEACON_SEER_AUTOFIX`).
 - **Phase 3 (flag cleanup):** out of scope; existing LaunchDarkly functionality.
+
+Sentry layer (optional — nothing changes until you opt in): [ADR 0014](docs/adr/0014-sentry-guardrails-and-agent-monitoring.md) —
+app error killswitches via the LD↔Sentry metrics integration, factory LLM traces in Sentry
+AI agent monitoring, Seer on revert (`BEACON_SEER_AUTOFIX`). [ADR 0015](docs/adr/0015-sentry-estate-and-dual-export.md) —
+Metrics Author `query_sentry` estate picture at author time; dual-export so the same spans
+reach Sentry **and** LD (Sentry does not OTLP-export outbound; `otel*` / KG still need LD o11y).
+The agent-side path lives in a **`sentry` variation** of the Metrics Author AI config —
+LaunchDarkly targeting selects it; the `default` variation is unchanged from the
+non-Sentry factory. Runtime pieces key off `SENTRY_*` env and soft-disable without it.
 
 Node-by-node detail with the exact mechanics: [docs/pipeline-overview.html](docs/pipeline-overview.html).
 Design history: [docs/adr/](docs/adr/).
@@ -34,16 +45,17 @@ Design history: [docs/adr/](docs/adr/).
 
 | Path | What it is |
 |------|------------|
-| `packages/shared/` | LD clients (REST + native SDK), the `AgentRunner` provider seam, the Anthropic / Vega / Cursor runners and agent tools, LLM-observability spans, the release adapter, and the provider-agnostic Phase 1 orchestration (graph walk + approval) |
+| `packages/shared/` | LD clients (REST + native SDK), the `AgentRunner` provider seam, the Anthropic / Vega / Cursor runners and agent tools, LLM-observability spans (LD + Sentry AI monitoring), the release adapter, and the provider-agnostic Phase 1 orchestration (graph walk + approval) |
 | `packages/phase1-resource-factory/` | Phase 1 front end #1 (GitHub Action): code; its drop-in workflow lives in `bootstrap/github-action-template/` |
 | `packages/phase1-cursor-extension/` | Phase 1 front end #2 (Cursor/VS Code extension): working-tree edits from the editor, calls Anthropic directly |
 | `bootstrap/cursor-automation/` | Phase 1 front end #3 (native Cursor automation): a drop-in `.cursor/` rule + command + MCP config; runs in Cursor's own agent (local prototype) |
 | `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code skill that drives it lives in `bootstrap/claude-code/` |
-| `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor) |
-| `packages/config-bridge/` | CLI that provisions/syncs the agent configs and graph between LD projects |
+| `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor, optional Seer Autofix on revert) |
+| `packages/config-bridge/` | CLI that provisions/syncs the agent configs, graph, operational flags, and shared APP metrics between LD projects |
 | `config/agentcontrol/ai-configs/` | The six agent + two judge definitions (instructions live here and in LD) |
 | `config/agentcontrol/tools/` | The agents' tool definitions (descriptions + schemas), provisioned into LaunchDarkly's tools library and attached per variation — editable in the LD UI; execution stays in code (ADR 0011) |
 | `config/agentcontrol/graphs/` | The agent graph: chain order, routing conditions, per-agent write capabilities |
+| `config/agentcontrol/metrics/` | Shared APP-project metrics (Sentry-backed `sentry-errors-*` guardrails, ADR 0014) |
 | `bootstrap/` | One-command setup, plus the drop-in front-end templates (GitHub Action workflow, Cursor automation) |
 | `examples/demo-app/` | Local sandbox the agents run against in dry-run mode |
 | `docs/` | Pipeline overview, ADRs, design docs |
@@ -56,10 +68,10 @@ same release manifest — they differ only in trigger, output, and which models 
 
 | Front end | Trigger | Output | Models | Status |
 |-----------|---------|--------|--------|--------|
-| **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Vega / Cursor (flag-selected; model per agent from the AI config) | primary, verified path |
-| **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API (Cursor can't expose its models to extensions) | working |
+| **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Bedrock / Vega / Cursor (flag-selected; model per agent from the AI config) | primary, verified path (Bedrock path not yet exercised live) |
+| **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API or Bedrock (Cursor can't expose its models to extensions) | working |
 | **Native Cursor automation** — [`bootstrap/cursor-automation`](bootstrap/cursor-automation/) | the `/autofactory` command in Cursor | edits left in your working tree | Cursor's own models (no API key) | local prototype; cloud (auto, PR-based) is a later phase |
-| **Headless CLI / Claude Code** — [`packages/phase1-cli`](packages/phase1-cli/), skill in [`bootstrap/claude-code/`](bootstrap/claude-code/) | `autofactory run` in a terminal, or `/autofactory` in Claude Code | edits left in your working tree | Anthropic API only (model per agent from the AI config; the working-tree ceiling requires the sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
+| **Headless CLI / Claude Code** — [`packages/phase1-cli`](packages/phase1-cli/), skill in [`bootstrap/claude-code/`](bootstrap/claude-code/) | `autofactory run` in a terminal, or `/autofactory` in Claude Code | edits left in your working tree | Anthropic API or Bedrock (model per agent from the AI config; the working-tree ceiling requires the sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
 
 Setup for the GitHub Action is below; the extension, the automation, and the CLI each have their
 own README. For the Claude Code path there is a standalone install guide:
@@ -70,21 +82,45 @@ own README. For the Claude Code path there is a standalone install guide:
 ### Prerequisites
 
 - Node 20+ for local tooling (the GitHub Action itself runs on Node 24; the Cursor provider requires Node ≥22.13)
-- A LaunchDarkly account with **two projects**:
-  - a **factory** project, which holds the agent configs and graph (the pipeline reads from it)
-  - an **app** project, where the agents create flags and metrics (the pipeline writes to it)
-- A LaunchDarkly server SDK key for the factory project's environment, and an API access
-  token with write access to both projects
-- An Anthropic API key (the default agent execution backend), or a Cursor API key to run on the Cursor provider
-- A GitHub repository for your application
+- A LaunchDarkly account and an **API access token** (`api-…`) with write access —
+  everything else on the LD side (the two projects, the SDK key) is created or
+  fetched by the guided setup below
+- An Anthropic API key (the default agent execution backend), AWS credentials with Bedrock model access to run on the Bedrock provider, or a Cursor API key to run on the Cursor provider
+- A GitHub repository for your application, and the [GitHub CLI](https://cli.github.com)
+  logged in (`gh auth login`) if you want setup to configure it for you
 
-### 1. Provision the agent configs, graph, and operational flags
+### Quick start (guided)
 
 ```bash
 git clone <this repo> && cd launchdarkly-auto-factory
 npm install
+npm run init
+```
+
+`init` asks for the API token and a few choices, then does the rest: creates (or
+confirms) the **factory** project — which holds the agent configs and graph — and
+the **app** project — where agents create flags and metrics; **fetches** the
+factory environment's server SDK key (so it can never be the wrong project's key);
+writes `.env`; provisions the agent configs, judges, graph, tools, and operational
+flags (details below); and wires your chosen front end. For the GitHub Action that
+means setting the app repo's secrets and `LD_APP_PROJECT_KEY` variable via `gh`
+and opening a **setup PR** with the rendered workflows — merge it and open any PR
+to see the chain run. It's idempotent: re-running resumes wherever it stopped, and
+never overwrites existing LD resources or targeting.
+
+Validate an install any time (each failing check prints its fix):
+
+```bash
+npm run doctor          # add: -- --app-repo owner/name for the GitHub-side checks
+```
+
+The steps below document the same setup done **by hand** (or what `init` just did).
+
+### 1. Provision the agent configs, graph, and operational flags
+
+```bash
 cp .env.example .env    # fill in LD_SDK_KEY, LD_API_KEY, LD_PROJECT_KEY, LD_APP_PROJECT_KEY, ANTHROPIC_API_KEY
-npm run bootstrap       # prompts for the execution provider (anthropic or cursor)
+npm run bootstrap       # prompts for the execution provider (anthropic, bedrock, or cursor)
 ```
 
 Bootstrap runs preflight checks, then creates, in your factory project from the committed
@@ -119,6 +155,8 @@ run warns — in the Actions log and the PR summary comment — and points you b
 tracks which repo version last provisioned the project, not live content.
 
 ### 2. Add the workflow to your app repo
+
+(`npm run init` does all of this via `gh` — secrets, variable, and a setup PR.)
 
 Copy `bootstrap/github-action-template/auto-factory.yml` into your app repo at
 `.github/workflows/auto-factory.yml` and replace `<owner>` with the org or user hosting this
@@ -170,6 +208,15 @@ stays off; the dependency binds at release — same-project flags only, see
 secret (and pass it through the workflow env) for private sibling repos. No
 registry, no tool — and failures degrade to warnings, never failed runs.
 
+To run on the **Bedrock** provider instead (the same agents on Claude via Amazon Bedrock —
+AWS auth and billing), keep the drop-in workflow, serve `bedrock` from the provider flag
+(below), and supply AWS credentials with Bedrock model access in place of
+`ANTHROPIC_API_KEY`: either the action's `aws_region` / `aws_access_key_id` /
+`aws_secret_access_key` inputs, or an `aws-actions/configure-aws-credentials` OIDC step
+before the action. The agents' LD-configured model names map to Bedrock ids automatically
+(`claude-…` → `anthropic.claude-…`); the AWS account must have those models enabled in the
+chosen region. *This path is code-complete but not yet exercised against a live AWS account.*
+
 To run on the **Cursor** provider instead, copy `bootstrap/github-action-template/auto-factory-cursor.yml`
 (it checks the tool out and `npm ci`s it, because the Cursor SDK can't run via the bare
 `uses:` form), set a `CURSOR_API_KEY` secret in place of `ANTHROPIC_API_KEY`, and serve
@@ -178,7 +225,9 @@ To run on the **Cursor** provider instead, copy `bootstrap/github-action-templat
 ### 3. Open a pull request
 
 Write the change normally, with no flag. The chain runs on every PR
-(opened/synchronize/reopened) and takes a few minutes. On a flag-worthy PR you get:
+(opened/synchronize/reopened/labeled) and takes a few minutes. Optional: set the
+repo variable `AUTOFACTORY_REQUIRE_LABEL=true` to gate it on the `autofactory`
+PR label instead (feature PRs only, not docs/chores). On a flag-worthy PR you get:
 
 - a string multivariate flag in the app project (`control` + `v1`), targeting **off** in all
   environments — follow-up PRs iterate it with new variations (`v2`, `v3`, …) or ride an
@@ -202,8 +251,8 @@ config changes) short-circuit after the first agent.
 | `graph_key` | `gha-auto-factory` | which agent graph to walk |
 
 The `auto-factory-ai-provider` flag (factory project, string variations
-`anthropic`/`vega`/`cursor`) selects the execution backend per run. Bootstrap provisions it
-**off** (serves `anthropic`); flip it to serve `vega` or `cursor`. (If the flag is ever
+`anthropic`/`bedrock`/`vega`/`cursor`) selects the execution backend per run. Bootstrap provisions it
+**off** (serves `anthropic`); flip it to serve `bedrock`, `vega`, or `cursor`. (If the flag is ever
 absent, the runtime defaults to `anthropic`.) The graph, instructions, and per-agent model are
 the same across providers — only the model brain changes. The model for each agent is read
 from its AI config, so reasoning agents (research, review) and coding agents can run different
@@ -226,8 +275,8 @@ flag-implementer and metrics-author variations score each run 0..1 (with reasoni
 **verified evidence** — the node-scoped git diff of what the agent actually committed, gathered
 by the pipeline rather than claimed by the agent. Scores record per-variation under the judge's
 `$ld:ai:judge:…` metric (each config's Monitoring tab, or Metrics → Judge metrics), which is
-what makes the per-agent model A/B a cost-vs-quality comparison. Judges run on the Anthropic
-and Cursor providers; Vega skips them.
+what makes the per-agent model A/B a cost-vs-quality comparison. Judges run on the Anthropic,
+Bedrock, and Cursor providers; Vega skips them.
 
 ### Approvals: three flags, compiled into pre-execution gates
 
@@ -285,6 +334,7 @@ npm test             # unit + integration tests
 npm run typecheck    # build + tests typecheck
 npm run check:public # guard against committing internal material
 npm run check:configs # validate agent configs/graph consistency (tags, routing, README)
+npm run doctor       # validate a live install (env, LD projects, GitHub app repo)
 ```
 
 Changes to the agent configs, the graph, or operational flags are logged in

@@ -16,7 +16,9 @@ import {
   type AgentRunner,
   AnthropicAgentRunner,
   type AssembledGraph,
+  BedrockAgentRunner,
   buildHandoffVerifier,
+  createBedrockJudgeCompletion,
   CursorAgentRunner,
   KNOWLEDGE_GRAPH_FLAG_KEY,
   assembleKnowledgeGraph,
@@ -46,6 +48,7 @@ import {
   getLdSdk,
   interpretWalk,
   intentIsDefault,
+  initFactorySentry,
   loadRelatedRepos,
   normalizeReleaseIntent,
   pipelineContext,
@@ -143,6 +146,17 @@ function createAgentRunner(provider: string, kg?: AssembledGraph): AgentRunner {
     });
   }
 
+  if (provider === "bedrock") {
+    // Same runner + sandbox tools as Anthropic, over the Bedrock Mantle
+    // transport. Region/credentials come from the AWS chain (AWS_REGION,
+    // access keys / OIDC role); the LD model names map to Bedrock's
+    // `anthropic.`-prefixed ids automatically.
+    return new BedrockAgentRunner({
+      ...localOpts,
+      ...(process.env.AWS_REGION ? { awsRegion: process.env.AWS_REGION } : {}),
+    });
+  }
+
   // Anthropic (default).
   return new AnthropicAgentRunner({
     ...localOpts,
@@ -164,6 +178,9 @@ function createJudgeCompletion(provider: string): JudgeCompletion | undefined {
   }
   if (provider === "anthropic") {
     return createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
+  }
+  if (provider === "bedrock") {
+    return createBedrockJudgeCompletion(process.env.AWS_REGION);
   }
   console.log(`Judges: no local judge execution on provider '${provider}' — attached judges are skipped.`);
   return undefined;
@@ -350,6 +367,13 @@ function mapActionInputs(): void {
   };
   set("LD_SDK_KEY", "ld_sdk_key");
   set("ANTHROPIC_API_KEY", "anthropic_api_key");
+  // Bedrock provider: standard AWS env names, consumed by the AWS credential
+  // chain inside @anthropic-ai/bedrock-sdk (an ambient OIDC role also works —
+  // e.g. aws-actions/configure-aws-credentials — in which case leave these unset).
+  set("AWS_REGION", "aws_region");
+  set("AWS_ACCESS_KEY_ID", "aws_access_key_id");
+  set("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key");
+  set("AWS_SESSION_TOKEN", "aws_session_token");
   set("CURSOR_API_KEY", "cursor_api_key");
   set("CURSOR_MODEL", "cursor_model");
   set("LD_API_KEY", "ld_api_key");
@@ -408,6 +432,9 @@ async function detectConfigDrift(graphKey: string): Promise<string | undefined> 
 async function main(): Promise<void> {
   mapActionInputs();
   const context = assemblePrContext();
+
+  // Sentry AI agent monitoring for factory runners (ADR 0014). No-op without DSN.
+  await initFactorySentry({ serviceName: "auto-factory-phase1-gha" });
 
   // Native LaunchDarkly: server SDK (flag eval) + AI SDK (graph + agent configs).
   const { ldClient, aiClient } = await getLdSdk();

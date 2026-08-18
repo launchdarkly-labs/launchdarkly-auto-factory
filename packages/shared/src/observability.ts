@@ -1,22 +1,24 @@
 /**
- * LaunchDarkly LLM Observability helpers.
+ * LaunchDarkly LLM Observability + Sentry AI agent monitoring helpers (ADR 0014).
  *
- * LD's LLM Observability is OpenTelemetry-based (GenAI semantic conventions). The
- * `Observability` plugin (registered on the server SDK in ldSdk.ts) sets up the
- * global OTel tracer + an exporter to LaunchDarkly's OTLP endpoint. We then emit a
- * span per agent run with `gen_ai.*` attributes so each LLM call shows up in LD's
- * LLM Observability views, correlated to the AgentControl config that produced it.
+ * Spans use OpenTelemetry GenAI semantic conventions (`gen_ai.*`). When the LD
+ * Observability plugin is registered (ldSdk.ts), the global OTel tracer exports
+ * to LaunchDarkly. When SENTRY_DSN is set (sentryInit.ts), the same attributes
+ * are also written onto a Sentry span so agent runs show up in Sentry AI
+ * monitoring. Dual-write until DISABLE_LD_OBSERVABILITY cuts over LD export.
  *
- * The Cursor provider needs MANUAL spans: inference happens inside Cursor's hosted
- * service, so there's no local LLM SDK for the plugin to auto-instrument — we set
- * the attributes ourselves from what `RunResult` gives us (model, token usage,
- * duration). All helpers here are defensive: telemetry must never break a run.
+ * The Cursor provider needs MANUAL spans: inference happens inside Cursor's
+ * hosted service. Anthropic may also be auto-instrumented by Sentry when the
+ * integration is present — manual spans still carry AgentControl correlation.
+ *
+ * All helpers are defensive: telemetry must never break a run.
  */
 
 import * as nodeModule from "node:module";
 import type { LDAIConfigTracker } from "@launchdarkly/server-sdk-ai";
 import type { Attributes, Span, Tracer } from "@opentelemetry/api";
 import { pipelineRunId } from "./ldSdk.js";
+import { sentryEnabled } from "./sentryInit.js";
 
 const TRACER_NAME = "launchdarkly-auto-factory";
 /** Cap prompt/completion content recorded on a span so spans stay bounded. */
@@ -101,53 +103,172 @@ export interface GenAiSpanData {
   output?: string;
   /** Token usage from the provider, if reported. */
   usage?: { input: number; output: number; total: number };
+  /** Agent / config key for gen_ai.agent.name (defaults to tracker config key). */
+  agentName?: string;
+  /** Override gen_ai.operation.name (default "chat"). */
+  operationName?: string;
+}
+
+/**
+ * Build GenAI + LD correlation attributes (shared by OTel and Sentry).
+ *
+ * `includeContent` controls whether the prompt/output land on the span. The LD
+ * span always records them (pre-Sentry behavior — LD LLM Observability is the
+ * operator's own account); the Sentry copy only includes them when the operator
+ * opts in with SENTRY_AI_RECORD_PROMPTS=true (CI prompts carry PR diffs).
+ */
+function buildGenAiAttributes(d: GenAiSpanData, includeContent: boolean): Attributes {
+  const attrs: Attributes = {
+    "gen_ai.operation.name": d.operationName ?? "chat",
+    "gen_ai.system": d.provider,
+    "gen_ai.provider": d.provider,
+    "gen_ai.request.model": d.requestModel,
+    "gen_ai.model": d.requestModel,
+    // Groups the whole Phase 1 chain in Sentry Conversations / LD views.
+    "gen_ai.conversation.id": pipelineRunId(),
+  };
+  const agentName = d.agentName ?? d.tracker?.getTrackData?.()?.configKey;
+  if (agentName) attrs["gen_ai.agent.name"] = agentName;
+
+  if (d.usage) {
+    attrs["gen_ai.usage.input_tokens"] = d.usage.input;
+    attrs["gen_ai.usage.output_tokens"] = d.usage.output;
+    attrs["gen_ai.usage.total_tokens"] = d.usage.total;
+    attrs["gen_ai.usage.prompt_tokens"] = d.usage.input;
+    attrs["gen_ai.usage.completion_tokens"] = d.usage.output;
+  }
+  if (includeContent) {
+    if (d.prompt) attrs["gen_ai.input"] = truncate(d.prompt);
+    if (d.output) attrs["gen_ai.output"] = truncate(d.output);
+  }
+
+  attrs["launchdarkly.run.id"] = pipelineRunId();
+
+  const td = d.tracker?.getTrackData?.();
+  if (td) {
+    attrs["launchdarkly.ai.config.key"] = td.configKey;
+    attrs["launchdarkly.ai.config.variation"] = td.variationKey;
+    attrs["launchdarkly.ai.config.version"] = td.version;
+    attrs["launchdarkly.ai.config.model"] = td.modelName;
+    attrs["launchdarkly.ai.provider"] = td.providerName;
+    attrs["launchdarkly.ai.run.id"] = td.runId;
+    if (td.graphKey) attrs["launchdarkly.ai.graph.key"] = td.graphKey;
+  }
+  return attrs;
 }
 
 /**
  * Set GenAI + LaunchDarkly-AI-config attributes on a span. Both the OTel GenAI
- * convention keys (`gen_ai.usage.input_tokens`, …) and the flatter keys the LD
- * docs list (`gen_ai.provider`, `gen_ai.model`, prompt/completion tokens) are set,
- * so the LLM Observability view picks them up regardless of which it keys on.
- * Never throws.
+ * convention keys and flatter aliases are set so LD LLM Observability and
+ * Sentry AI monitoring pick them up. Never throws.
  */
 export function setGenAiAttributes(span: Span, d: GenAiSpanData): void {
   try {
-    const attrs: Attributes = {
-      "gen_ai.operation.name": "chat",
-      "gen_ai.system": d.provider,
-      "gen_ai.provider": d.provider,
-      "gen_ai.request.model": d.requestModel,
-      "gen_ai.model": d.requestModel,
-    };
-    if (d.usage) {
-      attrs["gen_ai.usage.input_tokens"] = d.usage.input;
-      attrs["gen_ai.usage.output_tokens"] = d.usage.output;
-      attrs["gen_ai.usage.total_tokens"] = d.usage.total;
-      // Older convention aliases (some views still read these).
-      attrs["gen_ai.usage.prompt_tokens"] = d.usage.input;
-      attrs["gen_ai.usage.completion_tokens"] = d.usage.output;
-    }
-    if (d.prompt) attrs["gen_ai.input"] = truncate(d.prompt);
-    if (d.output) attrs["gen_ai.output"] = truncate(d.output);
-
-    // Correlation id shared by every agent span in this pipeline run (the `run`
-    // multi-context key), so the whole chain groups together in observability.
-    attrs["launchdarkly.run.id"] = pipelineRunId();
-
-    // Correlate the span to the AgentControl config it ran, so LLM Observability
-    // lines up with the same config's AI Config metrics.
-    const td = d.tracker?.getTrackData?.();
-    if (td) {
-      attrs["launchdarkly.ai.config.key"] = td.configKey;
-      attrs["launchdarkly.ai.config.variation"] = td.variationKey;
-      attrs["launchdarkly.ai.config.version"] = td.version;
-      attrs["launchdarkly.ai.config.model"] = td.modelName;
-      attrs["launchdarkly.ai.provider"] = td.providerName;
-      attrs["launchdarkly.ai.run.id"] = td.runId;
-      if (td.graphKey) attrs["launchdarkly.ai.graph.key"] = td.graphKey;
-    }
-    span.setAttributes(attrs);
+    span.setAttributes(buildGenAiAttributes(d, true));
   } catch {
     /* telemetry must never break the run */
   }
+}
+
+/** Optional Sentry span handle (duck-typed so @sentry/node stays lazy). */
+interface SentrySpanLike {
+  setAttributes(attrs: Record<string, unknown>): void;
+  setStatus(status: { code: number; message?: string }): void;
+  end(): void;
+}
+
+export interface AiSpanHandle {
+  /** OTel span (LD exporter when plugin is loaded). */
+  otel: Span;
+  end(status?: "ok" | "error", message?: string): void;
+  setGenAi(d: GenAiSpanData): void;
+  recordException(err: unknown): void;
+}
+
+/**
+ * Start a dual-write AI span: OTel (LD) + Sentry when enabled.
+ * Prefer this over bare `aiTracer().startSpan` for agent/LLM/handoff spans.
+ */
+export function startAiSpan(
+  name: string,
+  opts: { kind?: number; op?: string } = {},
+): AiSpanHandle {
+  const otelSpan = aiTracer().startSpan(name, { kind: opts.kind ?? SpanKind.CLIENT });
+  let sentrySpan: SentrySpanLike | null = null;
+
+  if (sentryEnabled()) {
+    try {
+      // Synchronous require via createRequire so we don't force a top-level import
+      // when Sentry isn't installed (bare action bundle).
+      const Sentry = nodeModule.createRequire(import.meta.url)("@sentry/node") as {
+        startInactiveSpan?: (args: { name: string; op?: string }) => SentrySpanLike;
+      };
+      if (typeof Sentry.startInactiveSpan === "function") {
+        sentrySpan = Sentry.startInactiveSpan({
+          name,
+          op: opts.op ?? "gen_ai.chat",
+        });
+      }
+    } catch {
+      /* Sentry optional */
+    }
+  }
+
+  return {
+    otel: otelSpan,
+    setGenAi(d: GenAiSpanData) {
+      setGenAiAttributes(otelSpan, d);
+      if (sentrySpan) {
+        try {
+          // Prompt/output content goes to Sentry only on explicit opt-in.
+          const recordPrompts = process.env.SENTRY_AI_RECORD_PROMPTS === "true";
+          sentrySpan.setAttributes(buildGenAiAttributes(d, recordPrompts) as Record<string, unknown>);
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+    recordException(err: unknown) {
+      if (err instanceof Error) otelSpan.recordException(err);
+    },
+    end(status = "ok", message?: string) {
+      try {
+        otelSpan.setStatus({
+          code: status === "ok" ? SpanStatusCode.OK : SpanStatusCode.ERROR,
+          ...(message ? { message } : {}),
+        });
+        otelSpan.end();
+      } catch {
+        /* ignore */
+      }
+      if (sentrySpan) {
+        try {
+          // Sentry span status: 1 = ok, 2 = error (OTel-aligned in recent SDKs).
+          sentrySpan.setStatus({
+            code: status === "ok" ? 1 : 2,
+            ...(message ? { message } : {}),
+          });
+          sentrySpan.end();
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+  };
+}
+
+/** Start an invoke_agent span for a graph node. */
+export function startAgentNodeSpan(configKey: string): AiSpanHandle {
+  return startAiSpan(`invoke_agent ${configKey}`, {
+    kind: SpanKind.INTERNAL,
+    op: "gen_ai.invoke_agent",
+  });
+}
+
+/** Start a handoff span between graph nodes. */
+export function startHandoffSpan(fromKey: string, toKey: string): AiSpanHandle {
+  return startAiSpan(`handoff from ${fromKey} to ${toKey}`, {
+    kind: SpanKind.INTERNAL,
+    op: "gen_ai.handoff",
+  });
 }

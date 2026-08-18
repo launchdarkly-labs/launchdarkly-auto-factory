@@ -47,6 +47,11 @@ user of the repo** (repo config, not per-user memory):
    edits after a run doesn't re-trip it; "re-run after significant changes"
    stays advisory in layer 1.
 
+Label-gated mode (optional): set `AUTOFACTORY_REQUIRE_LABEL=true` (env for the
+hook — e.g. in `.claude/settings.json` `"env"` — and the matching repo variable
+for the GitHub Action) to scope both to PRs labeled `autofactory`; unlabeled
+bugfix/chore PRs then skip the gate and the Action.
+
 The GitHub Action remains the server-side backstop for anything that bypasses
 both.
 

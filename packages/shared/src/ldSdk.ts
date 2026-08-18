@@ -72,7 +72,16 @@ export async function getLdSdk(): Promise<LdSdk> {
 
 /** Flush and close the SDK so the process can exit (the client holds the event loop open). */
 export async function closeLdSdk(): Promise<void> {
-  if (!cached) return;
+  if (!cached) {
+    // Still flush Sentry if it was initialized without an LD client cache hit.
+    try {
+      const { flushFactorySentry } = await import("./sentryInit.js");
+      await flushFactorySentry();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
   // Flush LLM-observability spans before the (short-lived CI) process exits, or
   // they may never reach LaunchDarkly. Best-effort and only if the plugin loaded.
   try {
@@ -80,6 +89,12 @@ export async function closeLdSdk(): Promise<void> {
     await LDObserve.flush();
   } catch {
     /* observability not enabled / not installed — nothing to flush */
+  }
+  try {
+    const { flushFactorySentry } = await import("./sentryInit.js");
+    await flushFactorySentry();
+  } catch {
+    /* ignore */
   }
   try {
     await cached.ldClient.flush();

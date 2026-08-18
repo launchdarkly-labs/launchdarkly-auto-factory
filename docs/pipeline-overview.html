@@ -235,10 +235,12 @@
       <div class="tip">
         <ul>
           <li>Metric categories: error (occurrence, lower is better), latency (numeric ms, lower is better), business (occurrence, higher is better).</li>
-          <li>Adds <span class="k">track()</span> calls on the flagged path. Telemetry is wrapped so a tracking failure cannot fail the request.</li>
-          <li>Creates each metric with <span class="k">eventKey</span> equal to the tracked event name. Metric key convention: <span class="k">&lt;flag&gt;-&lt;category&gt;</span>.</li>
+          <li><b>Sentry estate (ADR 0015, optional <span class="k">sentry</span> variation):</b> when LD targeting serves the metrics author's <span class="k">sentry</span> variation and Sentry creds/env are present, call <span class="k">query_sentry</span> early for an estate picture (top issues, error volume, <span class="k">launchdarklyContext</span> coverage, dual-export hints). Guardrails remain LD metrics — never invent latency killswitches from Sentry Explore aggregates alone.</li>
+          <li><b>Sentry error path (ADR 0014, <span class="k">sentry</span> variation):</b> prefer shared <span class="k">sentry-errors-binary</span> / <span class="k">sentry-errors-count</span> (LD↔Sentry integration event key <span class="k">sentry-errors</span>) as the error killswitch; instrument Sentry custom context named exactly <span class="k">launchdarklyContext</span>; tag <span class="k">sentry_guardrail=true</span>. For latency prefer existing <span class="k">otel*</span> via <span class="k">list_metrics</span> when dual-export/LD o11y is present; else feature-scoped <span class="k">track()</span> / document the dual-export gap.</li>
+          <li>Otherwise adds <span class="k">track()</span> calls on the flagged path. Telemetry is wrapped so a tracking failure cannot fail the request.</li>
+          <li>Creates each feature-scoped metric with <span class="k">eventKey</span> equal to the tracked event name. Metric key convention: <span class="k">&lt;flag&gt;-&lt;category&gt;</span>.</li>
           <li>The metric randomization unit must equal the flag rollout unit (default <span class="k">user</span>).</li>
-          <li>Metric backing rules: guardrails must be per-unit attributable — <span class="k">track()</span> events (default) or <b>trace metrics</b> on span attributes, the latter ONLY when the flag is evaluated inside the active span (the observability SDK's <span class="k">afterEvaluation</span> hook enriches that span). Pre-aggregated OTel metrics never qualify. Trace-metric creation is UI-only today, so the agent records <span class="k">trace_metric_candidates</span> instead of creating them.</li>
+          <li>Metric backing rules: guardrails must be per-unit attributable — <span class="k">track()</span> events (default), Sentry→LD error metrics, or <b>trace metrics</b> on span attributes (flag evaluated inside the active span). Pre-aggregated OTel metrics never qualify.</li>
           <li>Telemetry footprint (M10): when the service already uses the LaunchDarkly observability SDK, the agent span-covers the flagged path (flag evaluated in-span, <span class="k">&lt;flag&gt;.&lt;attribute&gt;</span> span attributes) — growing the very telemetry the knowledge graph reads. Each processed PR widens the map that informs the next PR.</li>
           <li>Classifies metrics killswitch / pause / monitoring and writes <span class="k">metricKeys</span> + <span class="k">randomizationUnit</span> into the manifest.</li>
           <li>An attached LaunchDarkly judge (<span class="k">metrics-quality</span>) then scores the output 0..1 against the agent's actual git diff (instrumentation + manifest edits). Non-blocking; scores record per-variation for the model A/B.</li>
@@ -247,7 +249,7 @@
     <div class="arrow">→</div>
 
 <div class="shim">⛊
-      <div class="tip"><b>Metrics verified</b> — deterministic shim (no model): metric tags (<span class="k">metrics_created</span>, <span class="k">metric_keys</span>, <span class="k">metric_event_keys</span>) are tool-owned — they derive from LaunchDarkly API responses. The shim then greps the checkout for an EMITTER of every event-backed metric&rsquo;s event key: a metric that exists in LaunchDarkly but that nothing in the code emits fails the run — no silent no-op guardrails.</div>
+      <div class="tip"><b>Metrics verified</b> — deterministic shim (no model): metric tags (<span class="k">metrics_created</span>, <span class="k">metric_keys</span>, <span class="k">metric_event_keys</span>) are tool-owned — they derive from LaunchDarkly API responses. The shim then greps the checkout for an EMITTER of every event-backed metric&rsquo;s event key (Sentry integration key <span class="k">sentry-errors</span> exempt). When <span class="k">sentry_guardrail=true</span>, also requires <span class="k">launchdarklyContext</span> in the checkout.</div>
     </div>
     <div class="arrow">→</div>
 
@@ -415,8 +417,10 @@
         regression and reverts: traffic returns to the ORIGINAL variation by flag
         change — control on a first release, the previous vN-1 on an iteration
         release (v2 regresses back to v1, not to off) — with no deploy and no
-        Beacon involvement. Beacon merely records the
-        <span class="k">reverted</span> terminal state.</div>
+        Beacon involvement. Beacon records the
+        <span class="k">reverted</span> terminal state and, when
+        <span class="k">BEACON_SEER_AUTOFIX</span> is on, starts Seer Autofix on a
+        matching Sentry issue (ADR 0014 / shared matcher ADR 0015).</div>
     </div>
 
   </div>

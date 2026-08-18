@@ -9,7 +9,7 @@
       "sourceConfig": "autofactory-research-planner",
       "targetConfig": "autofactory-manifest-steward",
       "handoff": {
-        "max_turns": 8,
+        "max_turns": 100,
         "request_type": "Fix",
         "capabilities": [
           "steward_manifest"
@@ -24,7 +24,7 @@
       "sourceConfig": "autofactory-manifest-steward",
       "targetConfig": "autofactory-flag-implementer",
       "handoff": {
-        "max_turns": 20,
+        "max_turns": 100,
         "request_type": "Fix",
         "capabilities": [
           "create_flag",
@@ -41,7 +41,7 @@
       "sourceConfig": "autofactory-flag-testing",
       "targetConfig": "autofactory-code-reviewer",
       "handoff": {
-        "max_turns": 30,
+        "max_turns": 100,
         "request_type": "Fix",
         "capabilities": [
           "read_docs"
@@ -72,7 +72,7 @@
       "sourceConfig": "autofactory-metrics-author",
       "targetConfig": "autofactory-flag-testing",
       "handoff": {
-        "max_turns": 20,
+        "max_turns": 100,
         "request_type": "Fix",
         "capabilities": [
           "edit_files"
@@ -87,14 +87,15 @@
       "sourceConfig": "autofactory-flag-implementer",
       "targetConfig": "autofactory-metrics-author",
       "handoff": {
-        "max_turns": 20,
+        "max_turns": 100,
         "request_type": "Fix",
         "capabilities": [
           "create_metric",
           "edit_files",
           "write_manifest",
           "read_docs",
-          "query_graph"
+          "query_graph",
+          "query_sentry"
         ],
         "require_tags": {
           "flag_ready": "true"

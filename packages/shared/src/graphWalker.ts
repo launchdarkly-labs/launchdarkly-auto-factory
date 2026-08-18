@@ -31,13 +31,16 @@
  *
  * One outgoing edge is taken per node. Per-node generation metrics and per-edge
  * handoff metrics are recorded back to LaunchDarkly via the AI-config and graph
- * trackers.
+ * trackers, plus graph-level ("global") metrics on the graph tracker once the walk
+ * finishes: invocation success/failure, total duration, the path taken, and
+ * aggregate token usage summed from the per-node trackers.
  */
 
-import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker } from "@launchdarkly/server-sdk-ai";
+import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker, LDTokenUsage } from "@launchdarkly/server-sdk-ai";
 import type { AgentNodeResult, AgentRunner } from "./agentRunner.js";
 import type { HandoffVerification, HandoffVerifier } from "./handoffVerifier.js";
 import type { JudgeHook } from "./judges.js";
+import { startHandoffSpan } from "./observability.js";
 
 /** Bound on a journalled judge `reasoning` string, so the resume journal stays small. */
 const JUDGE_REASONING_MAX = 1000;
@@ -72,6 +75,13 @@ const ROUTING_TAGS = new Set<string>([
   "review_approved",
   "risk_level",
   "risk_score",
+  // Arrived with the Sentry guardrail work (ADR 0014) on `main`, which had no loop to
+  // rewind for. It belongs here rather than in FACT_TAGS: it is the metrics-author's
+  // CLAIM about the pass it just made, and that node carries the judge-driven self-loop.
+  // Left un-rewound, iteration 1's `true` would make the handoff verifier check
+  // `launchdarklyContext` for an iteration that attached no Sentry-backed metric — a
+  // stale claim verified as a fresh one.
+  "sentry_guardrail",
 ]);
 
 /**
@@ -992,6 +1002,10 @@ export async function walkGraph(
   // walk reports loopExhausted (run-cap), never a false success.
   const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
   let totalRuns = 0;
+  const startMs = Date.now();
+  // Aggregate token usage across the whole walk, summed from each node
+  // tracker's summary after its run (the runner records tokens on the tracker).
+  const totalTokens: LDTokenUsage = { total: 0, input: 0, output: 0 };
 
   let node: AgentGraphNode | null = graphDef.rootNode();
   // Handoff of the edge we traversed INTO the current node (root has none).
@@ -1124,6 +1138,21 @@ export async function walkGraph(
       ...(cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}),
     });
 
+    // Roll this node's token usage into the graph-level aggregate. Defensive:
+    // a metrics read must never break the walk (and some providers record no
+    // tokens, in which case the summary simply has none).
+    try {
+      // `tracker?` — optional on this branch: a REPLAYED node runs no tracker at all.
+      const nodeTokens = tracker?.getSummary?.().tokens;
+      if (nodeTokens) {
+        totalTokens.total += nodeTokens.total;
+        totalTokens.input += nodeTokens.input;
+        totalTokens.output += nodeTokens.output;
+      }
+    } catch {
+      /* ignore — node metrics still landed via the node tracker itself */
+    }
+
     Object.assign(accumulatedTags, result.tags);
     // Mirror tool-produced facts into the never-rewound inventory.
     for (const [k, v] of Object.entries(result.tags)) {
@@ -1162,7 +1191,16 @@ export async function walkGraph(
     // it earlier would delay the "step done" event by a full judge call on every
     // surface. Scores are therefore attached by mutating the pushed run, which is
     // the same object reference and leaves routingSnapshots alignment untouched.
-    if (judgeHook && tracker) {
+    //
+    // A FAILED node is never judged either: its "output" is an error string (e.g.
+    // "Request timed out."), so a score would measure infrastructure luck, not agent
+    // quality — observed live as a misleading 0.00 on work that had actually landed.
+    // The failure itself is still recorded via trackError. It matters more here than on
+    // a DAG: a judge-driven loop edge routes on that score, so scoring an infra failure
+    // would spend a quality iteration on a run that produced no work to improve.
+    if (judgeHook && result.status === "failed") {
+      console.log(`[judge] ${key}: node failed (infra/API error) — judges skipped, no score recorded`);
+    } else if (judgeHook && tracker) {
       let judgeResults: Awaited<ReturnType<JudgeHook>> = [];
       try {
         judgeResults = await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
@@ -1360,6 +1398,10 @@ export async function walkGraph(
         onEvent?.({ type: "loop-exhausted", info: loopExhausted });
       } else if (unmet.length > 0) {
         stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
+        // Record each blocked edge as a failed handoff (the counterpart of the
+        // trackHandoffSuccess fired when an edge IS taken). Intentional
+        // skip_if short-circuits were filtered out above and are not failures.
+        for (const u of unmet) graphTracker?.trackHandoffFailure(key, u.target);
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
     }
@@ -1421,8 +1463,20 @@ export async function walkGraph(
     // re-recording would double-count. Known undercount: when the journal ends at a
     // loop-exhausted node, the original took no edge, so the one handoff a grant now
     // unlocks goes untracked. Undercounting one edge beats inflating every replayed
-    // one.
-    if (next && !replaying) graphTracker?.trackHandoffSuccess(key, next);
+    // one. The Sentry/LD handoff SPAN is gated the same way and for the same reason: a
+    // replayed edge is not a handoff that happened on this walk.
+    if (next && !replaying) {
+      graphTracker?.trackHandoffSuccess(key, next);
+      // Agent-chain handoff span for Sentry AI monitoring / LD o11y.
+      const handoff = startHandoffSpan(key, next);
+      handoff.setGenAi({
+        provider: "auto-factory",
+        requestModel: "graph-walker",
+        agentName: key,
+        operationName: "handoff",
+      });
+      handoff.end("ok");
+    }
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
   }
@@ -1440,6 +1494,41 @@ export async function walkGraph(
         "the walk terminated before consuming the whole journal — an edge condition or the graph changed. A fresh run is required.",
     };
     onEvent?.({ type: "replay-diverged", info: replayDiverged });
+  }
+
+  // Graph-level ("global") metrics, alongside the per-node metrics recorded
+  // above. A pause at an approval gate is NOT a finished invocation — emit
+  // nothing graph-level for it: the post-approval re-run walks the chain on a
+  // fresh tracker (fresh runId) and reports the complete run. Likewise skip
+  // when nothing ran (e.g. a disabled graph): there is no invocation to score.
+  // Defensive try/catch: metric emission must never fail the walk.
+  if (graphTracker && !pendingApproval && runs.length > 0) {
+    try {
+      graphTracker.trackPath(runs.map((r) => r.configKey));
+      graphTracker.trackDuration(Date.now() - startMs);
+      if (totalTokens.total > 0) graphTracker.trackTotalTokens(totalTokens);
+      // Success = the machinery finished cleanly: every node completed, no
+      // stall, no deterministic-verification failure. A reviewer REJECT is
+      // still an invocation success — the graph did its job; the business
+      // outcome lives in tags/judge scores, not this metric.
+      //
+      // `replayDiverged` joins that list because a divergent replay is not an
+      // invocation at all: the walk is abandoned fail-closed and a fresh run is
+      // required, so scoring it as a success would count one PR's machinery twice
+      // and score the abandoned half clean.
+      //
+      // `loopExhausted` deliberately does NOT: exhausting a bounded retry budget is
+      // the loop working as specified — the cap fired — and the run's quality verdict
+      // is carried by tags and judge scores, exactly as a reviewer REJECT is. Folding
+      // it in here would make every graph that uses its full budget report the
+      // machinery as broken.
+      const clean =
+        !stalledAt && !verificationFailed && !replayDiverged && runs.every((r) => r.status === "completed");
+      if (clean) graphTracker.trackInvocationSuccess();
+      else graphTracker.trackInvocationFailure();
+    } catch (e) {
+      console.warn(`[graph-metrics] emission failed (non-fatal): ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   const reached = new Set(runs.map((r) => r.configKey));

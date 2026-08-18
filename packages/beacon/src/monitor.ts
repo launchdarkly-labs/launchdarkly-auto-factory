@@ -21,6 +21,11 @@ import {
   type LdClient,
 } from "@auto-factory/shared";
 import { repointDependentPrerequisites } from "./repoint.js";
+import {
+  seerSettingsFromEnv,
+  triggerSeerOnRevert,
+  type RevertAutofixContext,
+} from "./seerAutofix.js";
 
 export interface MonitorSettings {
   enabled: boolean;
@@ -48,27 +53,41 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  * in-process: once the running task settles, the key frees, so a genuine re-attach
  * after a completed/abandoned watch still works.
  */
+/**
+ * The revert-time context a release-started hook carries: repo, sha, target variation. ONE
+ * declaration, because `monitorTriggeredRelease`, `dedupeMonitors` and `BeaconDeps.onReleaseStarted`
+ * must agree on it — and it is derived from `RevertAutofixContext` rather than restated, so adding a
+ * field Seer needs cannot leave the hook signatures behind.
+ */
+export type ReleaseMonitorContext = Partial<Omit<RevertAutofixContext, "flagKey" | "environmentKey">>;
+
 export function dedupeMonitors(
-  run: (flagKey: string, environmentKey: string) => Promise<unknown>,
-): (flagKey: string, environmentKey: string) => void {
+  run: (flagKey: string, environmentKey: string, ctx?: ReleaseMonitorContext) => Promise<unknown>,
+): (flagKey: string, environmentKey: string, ctx?: ReleaseMonitorContext) => void {
   const inFlight = new Set<string>();
-  return (flagKey, environmentKey) => {
+  // The key is flag/environment ONLY: the context describes the same release, so a redelivery
+  // carrying it must still be deduped against the watch already in flight.
+  return (flagKey, environmentKey, ctx) => {
     const key = `${flagKey}/${environmentKey}`;
     if (inFlight.has(key)) return;
     inFlight.add(key);
-    void run(flagKey, environmentKey).finally(() => inFlight.delete(key));
+    void run(flagKey, environmentKey, ctx).finally(() => inFlight.delete(key));
   };
 }
 
 /**
  * Resolve the active release's id for a flag (retrying briefly — the listing
  * is eventually consistent right after the start), then poll to completion.
+ *
+ * @param revertCtx Optional context for Seer Autofix when status is `reverted`
+ *   (repo, sha, variation). When omitted, Seer still runs with flag/env only.
  */
 export async function monitorTriggeredRelease(
   ld: LdClient,
   flagKey: string,
   environmentKey: string,
   settings: MonitorSettings,
+  revertCtx?: ReleaseMonitorContext,
 ): Promise<AutomatedRelease | null> {
   const tag = `[beacon] release ${flagKey}/${environmentKey}`;
   try {
@@ -111,6 +130,18 @@ export async function monitorTriggeredRelease(
       // reverted = a guardrail metric regressed and LD rolled the flag back;
       // monitoring_stopped = a human intervened. Both are end states for us.
       console.warn(`${tag}: ended ${final.status.toUpperCase()} (stage ${final.latestStageIndex})`);
+      if (final.status === "reverted") {
+        await triggerSeerOnRevert(
+          {
+            flagKey,
+            environmentKey,
+            ...(revertCtx?.repoFullName ? { repoFullName: revertCtx.repoFullName } : {}),
+            ...(revertCtx?.sha ? { sha: revertCtx.sha } : {}),
+            ...(revertCtx?.targetVariation ? { targetVariation: revertCtx.targetVariation } : {}),
+          },
+          seerSettingsFromEnv(),
+        );
+      }
     } else if (isReleaseRunning(final.status)) {
       // Still legitimately running when the window closed. A guarded rollout's stages can
       // outlast the monitoring timeout, so this is a slow release, NOT a paused one —

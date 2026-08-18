@@ -21,6 +21,7 @@ import type { KnowledgeGraph } from "../graph/schema.js";
 import { fileNodeId, flagNodeId, serviceNodeId } from "../graph/schema.js";
 import { blastRadius, neighbors } from "../graph/query.js";
 import type { RelatedReposClient } from "../github/relatedRepos.js";
+import { getEstatePicture } from "../sentry/sentryEstate.js";
 import { variationReleased, type LdResourceWriter, type MetricCategory } from "./ldWriter.js";
 import type { ReleaseFlagFile, Scope } from "../types.js";
 
@@ -177,7 +178,7 @@ const USE_EXISTING_FLAG_TOOL: AnthropicToolDef = {
 const CREATE_METRIC_TOOL: AnthropicToolDef = {
   name: "create_metric",
   description:
-    "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) — pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, …)` call on the path the flag wraps, via edit_file) so the metric has data once live. (2) TRACE-backed — pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span — see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
+    "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) — pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, …)` call on the path the flag wraps, via edit_file) so the metric has data once live — EXCEPTION: event_key `sentry-errors` is fed by the LD↔Sentry integration (no track() emitter). Prefer reusing provisioned `sentry-errors-binary` / `sentry-errors-count` via list_metrics when Sentry is present (ADR 0014). (2) TRACE-backed — pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span — see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
   input_schema: {
     type: "object",
     properties: {
@@ -274,6 +275,11 @@ export interface ToolCapabilities {
   stewardManifest?: boolean;
   /** Offer `query_dependencies` (needs a composed knowledge graph, ADR 0010). */
   queryGraph?: boolean;
+  /**
+   * Offer `query_sentry` (Sentry estate picture via REST — ADR 0015). Soft when
+   * SENTRY_* env is unset (returns available:false guidance).
+   */
+  querySentry?: boolean;
   /** Offer `read_ld_docs` (LaunchDarkly docs pages as markdown, allowlisted). */
   readDocs?: boolean;
   /** Offer `query_related_repos` (needs a registered relatedRepos list + GitHub token). */
@@ -358,6 +364,37 @@ const QUERY_DEPENDENCIES_TOOL: AnthropicToolDef = {
         description: "With `node`: walk who depends on it (default) or what it depends on.",
       },
       max_depth: { type: "number", description: "Traversal depth cap (default 3)." },
+    },
+  },
+};
+
+const QUERY_SENTRY_TOOL: AnthropicToolDef = {
+  name: "query_sentry",
+  description:
+    "Query the Sentry estate picture for this app (ADR 0015): top unresolved issues, approximate error volume, whether recent errors carry launchdarklyContext (required for the LD↔Sentry metrics integration), and dual-export guidance for otel* latency guardrails. Call EARLY when the repo has Sentry or when choosing error killswitches. Does NOT create LaunchDarkly metrics — use list_metrics / create_metric / write_manifest for that. Sentry Explore aggregates alone are NEVER valid guarded-release backings. Soft-fails with available:false when SENTRY_AUTH_TOKEN / SENTRY_ORG / SENTRY_PROJECT are unset.",
+  input_schema: {
+    type: "object",
+    properties: {
+      window_hours: {
+        type: "number",
+        description: "Lookback window in hours (default 24).",
+      },
+      flag_key: {
+        type: "string",
+        description: "Flag key to bias issue search (usually from the Flag Implementer).",
+      },
+      query: {
+        type: "string",
+        description: "Optional extra Sentry issue/Discover query fragment.",
+      },
+      transaction: {
+        type: "string",
+        description: "Optional transaction/endpoint name to scope error stats.",
+      },
+      sha: {
+        type: "string",
+        description: "Optional release/deploy SHA for issue search.",
+      },
     },
   },
 };
@@ -488,6 +525,7 @@ export const SANDBOX_TOOL_DEFS: ReadonlyMap<string, AnthropicToolDef> = new Map(
     ...READONLY_TOOLS,
     READ_LD_DOCS_TOOL,
     QUERY_DEPENDENCIES_TOOL,
+    QUERY_SENTRY_TOOL,
     QUERY_RELATED_REPOS_TOOL,
     GET_FLAG_STATE_TOOL,
     CREATE_FLAG_TOOL,
@@ -552,6 +590,7 @@ export function buildSandboxTools(caps: ToolCapabilities): AnthropicToolDef[] {
   const tools = [...READONLY_TOOLS];
   if (caps.readDocs) tools.push(READ_LD_DOCS_TOOL);
   if (caps.queryGraph) tools.push(QUERY_DEPENDENCIES_TOOL);
+  if (caps.querySentry) tools.push(QUERY_SENTRY_TOOL);
   if (caps.queryRepos) tools.push(QUERY_RELATED_REPOS_TOOL);
   if (caps.flagState) tools.push(GET_FLAG_STATE_TOOL);
   if (caps.createFlag) tools.push(CREATE_FLAG_TOOL, ADD_VARIATION_TOOL, USE_EXISTING_FLAG_TOOL);
@@ -601,6 +640,9 @@ export const TOOL_OWNED_TAGS: ReadonlySet<string> = new Set([
   "metric_event_keys",
   "tests_last_run",
 ]);
+
+/** Event keys that must not require an in-repo track() emitter (ADR 0014). */
+const EXTERNAL_METRIC_EVENT_KEYS = new Set(["sentry-errors"]);
 
 /**
  * Executes tool calls against a fixed root directory, accumulating routing tags.
@@ -690,6 +732,8 @@ export class SandboxToolExecutor {
           return this.writeManifestTool(String(input.path ?? ""), input.manifest);
         case "query_dependencies":
           return this.queryDependencies(input);
+        case "query_sentry":
+          return await this.querySentry(input);
         case "query_related_repos":
           return await this.queryRelatedRepos(input);
         case "read_ld_docs":
@@ -708,6 +752,17 @@ export class SandboxToolExecutor {
     } catch (e) {
       return { content: e instanceof Error ? e.message : String(e), isError: true };
     }
+  }
+
+  private async querySentry(input: Record<string, unknown>): Promise<ToolExecResult> {
+    const picture = await getEstatePicture({
+      ...(input.window_hours != null ? { windowHours: Number(input.window_hours) } : {}),
+      ...(input.flag_key ? { flagKey: String(input.flag_key) } : {}),
+      ...(input.query ? { query: String(input.query) } : {}),
+      ...(input.transaction ? { transaction: String(input.transaction) } : {}),
+      ...(input.sha ? { sha: String(input.sha) } : {}),
+    });
+    return { content: JSON.stringify(picture, null, 2) };
   }
 
   /**
@@ -1131,8 +1186,9 @@ export class SandboxToolExecutor {
     if (!keys.includes(result.key)) keys.push(result.key);
     this.tags.metric_keys = keys.join(",");
     // Event-backed metrics also record their event key — the deterministic
-    // handoff shim greps the code for an emitter of each one.
-    if (input.event_key) {
+    // handoff shim greps the code for an emitter of each one. Skip Sentry
+    // integration event keys (ADR 0014) — those have no track() emitter.
+    if (input.event_key && !EXTERNAL_METRIC_EVENT_KEYS.has(String(input.event_key))) {
       const events = this.tags.metric_event_keys ? this.tags.metric_event_keys.split(",").filter(Boolean) : [];
       if (!events.includes(String(input.event_key))) events.push(String(input.event_key));
       this.tags.metric_event_keys = events.join(",");
@@ -1448,8 +1504,11 @@ export class SandboxToolExecutor {
     }
   }
 
-  /** Run a command capturing output + exit code without throwing. */
-  private sh(file: string, args: string[], cwd: string, timeoutMs = 240_000): { code: number; out: string } {
+  /** Run a command capturing output + exit code without throwing. Only the
+   *  test/install commands come through here (git uses runGit); the timeout is
+   *  a runaway backstop, sized so a slow cold dependency install + a real
+   *  suite never hit it. */
+  private sh(file: string, args: string[], cwd: string, timeoutMs = 1_800_000): { code: number; out: string } {
     const r = spawnSync(file, args, { cwd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 });
     const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
     if (r.error) return { code: -1, out: `${out}\n${r.error.message}` };
@@ -1463,16 +1522,19 @@ export class SandboxToolExecutor {
   /** Auto-detect the repo's test runner (pytest / npm / go), install deps, and run it. */
   private runTests(dir?: string): ToolExecResult {
     if (!this.allowEdits) return { content: "run_tests is not available", isError: true };
-    const result = this.runTestsInner(dir);
+    const { ran, ...result } = this.runTestsInner(dir);
     // Tool-owned fact for the deterministic handoff shim: the LAST real test
-    // execution's outcome. "no recognized test setup" is inconclusive, not a run.
-    if (!result.content.includes("no recognized test setup")) {
+    // execution's outcome. A repo with NO test harness (no runner, no test
+    // script, nothing collected) is inconclusive, not a red run — otherwise a
+    // greenfield repo deadlocks: every node hands off "fail" and the chain dies
+    // before flag-testing, the node whose job is to create the missing suite.
+    if (ran) {
       this.tags.tests_last_run = result.isError ? "fail" : "pass";
     }
     return result;
   }
 
-  private runTestsInner(dir?: string): ToolExecResult {
+  private runTestsInner(dir?: string): ToolExecResult & { ran: boolean } {
     const cwd = dir ? this.safeResolve(dir) : this.root;
     const has = (f: string) => existsSync(resolve(cwd, f));
     let entries: string[] = [];
@@ -1494,18 +1556,50 @@ export class SandboxToolExecutor {
       this.sh("python3", ["-m", "pip", "install", "-q", "pytest"], cwd);
       const t = this.sh("python3", ["-m", "pytest", "-q"], cwd);
       const body = `${log.join("\n")}\n$ python3 -m pytest -q (in ${where})\n${t.out}`.trim();
-      return { content: this.trunc(body), isError: t.code !== 0 };
+      // pytest exit 5 = "no tests were collected": a missing suite, not a red one.
+      if (t.code === 5) {
+        return {
+          content: this.trunc(`${body}\nrun_tests: pytest collected NO tests — the repo has no test suite yet. Write the test files (and any needed config) first, then re-run.`),
+          isError: true,
+          ran: false,
+        };
+      }
+      return { content: this.trunc(body), isError: t.code !== 0, ran: true };
     }
     if (has("package.json")) {
+      // A package.json without a real `test` script means "no test harness",
+      // not "tests failing" — `npm test` would just exit 1 on npm's default
+      // "Error: no test specified" stub.
+      if (!this.npmTestScript(cwd)) {
+        return {
+          content: `run_tests: package.json in ${where} has no "test" script — the repo has no test harness yet. Add the test files AND a package.json "test" script (run_tests invokes \`npm test\`), then re-run.`,
+          isError: true,
+          ran: false,
+        };
+      }
       this.sh("npm", ["install", "--no-audit", "--no-fund"], cwd);
       const t = this.sh("npm", ["test"], cwd);
-      return { content: this.trunc(`$ npm test (in ${where})\n${t.out}`), isError: t.code !== 0 };
+      return { content: this.trunc(`$ npm test (in ${where})\n${t.out}`), isError: t.code !== 0, ran: true };
     }
     if (has("go.mod")) {
       const t = this.sh("go", ["test", "./..."], cwd);
-      return { content: this.trunc(`$ go test ./... (in ${where})\n${t.out}`), isError: t.code !== 0 };
+      return { content: this.trunc(`$ go test ./... (in ${where})\n${t.out}`), isError: t.code !== 0, ran: true };
     }
-    return { content: "run_tests: no recognized test setup (pytest/npm/go) found in this directory", isError: true };
+    return { content: "run_tests: no recognized test setup (pytest/npm/go) found in this directory", isError: true, ran: false };
+  }
+
+  /** The package.json `test` script, if it's a real one (npm's default "no test specified" stub doesn't count). */
+  private npmTestScript(cwd: string): string | undefined {
+    try {
+      const pkg = JSON.parse(readFileSync(resolve(cwd, "package.json"), "utf8")) as {
+        scripts?: Record<string, unknown>;
+      };
+      const script = pkg.scripts?.test;
+      if (typeof script !== "string" || !script.trim() || script.includes("no test specified")) return undefined;
+      return script;
+    } catch {
+      return undefined;
+    }
   }
 
   private commitAndPush(message: string): ToolExecResult {

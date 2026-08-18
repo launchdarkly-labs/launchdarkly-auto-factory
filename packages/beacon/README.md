@@ -32,6 +32,7 @@ Flat `src/`:
 | `src/github.ts` | GitHub Contents API client (list/read `.release-flags/` at a SHA) |
 | `src/trigger.ts` | Resolve variations + rollout shape, execute via the shared release adapter |
 | `src/monitor.ts` | Poll a triggered release to a terminal state (completed / reverted / stopped) |
+| `src/seerAutofix.ts` | On `reverted`, optionally find a Sentry issue and start Seer Autofix (ADR 0014) |
 | `src/config.ts` | Load config from the YAML files + env |
 
 ## HTTP contract
@@ -77,6 +78,16 @@ redelivery mid-rollout is the normal shape of a deploy) but the manifest **stays
 the ledger**. Those are different questions: only one variation of a flag can be
 releasing at a time, so a manifest asking for v2 hits `already_running` on v1's
 rollout, and treating that as "done" discarded the v2 release and called it a success.
+
+On `reverted`, when `BEACON_SEER_AUTOFIX=true` and Sentry credentials are set,
+Beacon searches for a related Sentry issue and starts Seer Autofix
+(`stopping_point: open_pr` by default) — see ADR 0014 / `src/seerAutofix.ts`.
+
+**Seer token scopes.** `SENTRY_AUTH_TOKEN` must allow listing issues
+(`project:read`, `event:read`) and starting Autofix (`event:write` / Seer
+entitlement). A 403 on issue search is logged explicitly — it used to look like
+"no matching issue". Matching prefers `feature:<slug>` / `flag:<flagKey>` tags
+(e.g. flag `enable-broken-sign-in` → search `feature:broken-sign-in`).
 
 ## Several manifests, one flag
 
@@ -161,3 +172,48 @@ and the missed copy was reliably the one an auditor reads first. So the copies a
 annotated: this section is a pointer and states no part of the argument, and
 `tests/taxonomyHome.test.ts` fails if any of the three sites starts stating one again — including in
 paraphrase, which is the hole the first version of that test left open.
+
+---
+
+## Config surface
+
+Read from the repo `config/` dir + env:
+
+- `config/services.yaml` — service → side/repo/status-endpoint registry.
+- `config/scopes.yaml` — scope routing rules.
+- `config/release-source.yaml` — where release-flag files are read from.
+- Env:
+  - `BEACON_WEBHOOK_SECRET` (required) — shared webhook secret.
+  - `GITHUB_TOKEN` (required) — reads `.release-flags/` via the Contents API.
+  - LD connection: `LD_API_KEY`, `LD_PROJECT_KEY` (the **app** project),
+    `LD_BASE_URL` (optional), `LD_ENVIRONMENT_KEY` (default `production`).
+  - `BEACON_STATE_FILE` (default `beacon-state.json`).
+  - `BEACON_MONITOR` (`false` disables), `BEACON_MONITOR_POLL_MS` (default
+    10000), `BEACON_MONITOR_TIMEOUT_MS` (default 24h).
+
+## Deploying
+
+Host it anywhere that runs a container and gives it an HTTPS URL:
+
+```sh
+docker build -f packages/beacon/Dockerfile -t auto-factory-beacon .   # from the repo root
+docker run -p 8080:8080 --env-file beacon.env auto-factory-beacon
+```
+
+`PORT` is honored (default 8080). The image bundles the repo's `config/` dir;
+point deploy webhooks/notifiers at `https://<host>/flag-releases` (generic) or
+`https://<host>/webhooks/railway?secret=…` (Railway).
+
+## Fullstack coordination
+
+On each notification, Beacon checks whether the **other** service's
+currently-deployed SHA already contains the same `.release-flags/` file. If yes,
+both services have the code and the release triggers; if no, it waits for the
+other service's deploy notification to re-evaluate.
+
+> **No retry queue (prototype).** A "waiting" flag is released only when the OTHER
+> service's deploy notification arrives and re-evaluates. Beacon logs each waiting
+> outcome (`[beacon] WAITING: …`) with the flag, file, and service so a lost
+> notification is visible. **Manual re-trigger:** once both services are deployed,
+> re-POST `/flag-releases` for the service (same `sha`/`service`) to re-run discovery
+> and release the now-ready flag — the state store re-resolves the same diff range.

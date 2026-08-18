@@ -7,19 +7,36 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { JudgeCompletion } from "../judges.js";
-import { anthropicModelId } from "./anthropicAgentRunner.js";
+import { ANTHROPIC_TIMEOUT_MS, type AnthropicMessagesClient, anthropicModelId } from "./anthropicAgentRunner.js";
 
-// Generous on purpose: the output is one {score, reasoning} tool call, but the
-// reasoning is written against a large evidence diff. At 1024 a verbose judge
-// hit max_tokens MID-TOOL-INPUT, which surfaces as a silent parse failure in
-// the SDK Judge ("eval FAILED: unknown" — live CLI run, 2026-07-20).
-const MAX_TOKENS = 4096;
+// Backstop, not a budget: the output is one {score, reasoning} tool call, but
+// the reasoning is written against a large evidence diff. At 1024 a verbose
+// judge hit max_tokens MID-TOOL-INPUT, which surfaces as a silent parse
+// failure in the SDK Judge ("eval FAILED: unknown" — live CLI run,
+// 2026-07-20). Sized so only a runaway judge trips it (truncation is still
+// detected and discarded below); kept under the SDK's ~21k non-streaming
+// threshold so it works even on clients without an explicit timeout.
+const MAX_TOKENS = 16_000;
 
 export function createAnthropicJudgeCompletion(apiKey?: string): JudgeCompletion {
-  const client = new Anthropic(apiKey ? { apiKey } : {});
+  return createForcedToolJudgeCompletion(
+    new Anthropic({ timeout: ANTHROPIC_TIMEOUT_MS, ...(apiKey ? { apiKey } : {}) }),
+    anthropicModelId,
+  );
+}
+
+/**
+ * The client-agnostic core: any Anthropic-Messages-compatible client (direct
+ * API or Bedrock Mantle) with the matching model-id mapper. Exported so the
+ * Bedrock provider gets the exact same forced-tool judge behavior.
+ */
+export function createForcedToolJudgeCompletion(
+  client: AnthropicMessagesClient,
+  modelId: (name: string | undefined) => string,
+): JudgeCompletion {
   return async (req) => {
     const resp = await client.messages.create({
-      model: anthropicModelId(req.model),
+      model: modelId(req.model),
       max_tokens: MAX_TOKENS,
       system: req.system,
       messages: [{ role: "user", content: req.input }],

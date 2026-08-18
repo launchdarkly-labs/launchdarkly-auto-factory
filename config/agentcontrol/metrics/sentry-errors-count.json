@@ -1,0 +1,11 @@
+{
+  "key": "sentry-errors-count",
+  "name": "Sentry errors (error count)",
+  "description": "Shared guarded-release error-count metric fed by the LaunchDarkly↔Sentry metrics integration (same event key sentry-errors). Use as pause/monitoring alongside sentry-errors-binary killswitch. Lower is better.",
+  "kind": "custom",
+  "eventKey": "sentry-errors",
+  "isNumeric": false,
+  "successCriteria": "LowerThanBaseline",
+  "randomizationUnits": ["user"],
+  "tags": ["auto-factory", "sentry", "guardrail", "pause"]
+}
