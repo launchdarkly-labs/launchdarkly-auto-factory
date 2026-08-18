@@ -1,7 +1,8 @@
 # `loopback-support` — working notes for whoever picks this up
 
-**Status as of 2026-08-11:** the editorial pass after round 6 is the tip, and **the branch is fully
-pushed**. **No PR exists yet**, and the graph is still not provisioned — both remain the owner's call.
+**Status as of 2026-08-18:** `origin/main` is MERGED IN and **PR #19 is open, green and mergeable**.
+The graph is still not provisioned — that remains the owner's call, now waiting on review of the PR
+rather than on the PR being opened.
 
 Measure the rest rather than reading it here, because every number this header used to carry went
 stale, twice:
@@ -10,7 +11,8 @@ stale, twice:
 git rev-list --left-right --count origin/loopback-support...HEAD   # pushed?  → 0 0
 git rev-list --count main..HEAD ; git diff --shortstat main..HEAD  # size
 npm test ; npm run typecheck ; npm run check:configs ; npm run check:public
-gh pr list --head loopback-support --state all                    # PR?     → empty
+gh pr view 19 --json state,mergeable,mergeStateStatus              # PR?     → OPEN/CLEAN
+gh pr checks 19                                                    # CI?     → verify pass
 ```
 
 The header first claimed `3324b40`, 674 tests and "46 commits unpushed" after two rounds had been
@@ -39,12 +41,14 @@ branch merges.
 - **Do not provision the graph.** `npm run bridge -- upgrade` is held until the branch is peer
   reviewed and approved. The walker executes the graph **LaunchDarkly serves**, which has neither
   loop edge until that runs — so a live run shows no looping and looks broken.
-- **The branch IS pushed** — rounds 1–5 were committed and pushed on the owner's explicit
-  instruction, so `origin/loopback-support` matches HEAD. What is still the owner's call is
-  **opening the PR**, and provisioning the graph after review.
-- **No PR exists yet** (`gh pr list --head loopback-support --state all` is empty). A draft PR body
-  was kept in a session scratchpad and is now **stale and gone** (it described 51 commits / 619
-  tests). Regenerate it from the git log rather than hunting for it.
+- **The branch IS pushed**, and **PR #19 is open** — its body was regenerated from the git log, as
+  §7 asked (the old scratchpad draft was stale and gone). What is still the owner's call is
+  provisioning the graph after review.
+- **`main` is merged in, not rebased onto.** It had advanced 10 commits, including one that emits
+  graph-level metrics from `graphWalker.ts` — 70 lines into the same file this branch rewrites. Nine
+  files conflicted; the merge commit records every decision that was not mechanical, and the two
+  worth re-reading are that main's `visited` DAG guard is dropped (keeping it would have disabled
+  every loop) and that `clean` now excludes `replayDiverged` but still ignores `loopExhausted`.
 
 ## 3. How verification silently lies here — read before trusting any green suite
 
@@ -229,14 +233,19 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
 
 ## 7. Suggested next steps
 
-§4.1–§4.6 are done and the branch is pushed, so what is left is review and release:
+§4.1–§4.6 are done, `main` is merged in, and PR #19 is open and green. What is left:
 
-1. **Regenerate the PR body from `git log main..HEAD`** — from the log itself, not from any count
-   written down here, for the reason in the header. The old draft is gone; do not hunt for it.
-2. **Open the PR and get human review.** This is the owner's call, not an agent's.
-3. **Then** provision the graph (`npm run bridge -- upgrade`) — still held until after approval, for
+1. **Human review of PR #19.** Nothing else blocks it.
+2. **Then** provision the graph (`npm run bridge -- upgrade`) — still held until after approval, for
    the reason in §2: the walker executes the graph LaunchDarkly serves, which has neither loop edge
    until that runs.
+3. **Delete this file when the branch merges**, as the top of it says.
+
+One trap CI found that §3 had not: `git init` in a test fixture inherits the machine's
+`init.defaultBranch`, so walkState's fixture was `main` locally and `master` on the runner — and the
+"falls through to LOCAL main" test asserted a refusal it was not reaching. Fixed by pinning
+`-b main`. The general form belongs with the other five: **a green suite on a dev box says nothing
+about a fixture whose shape comes from git config.**
 
 ## 7a. SETTLED EMPIRICALLY 2026-08-12 — the edge-order finding, and the fix is not the filed one
 
