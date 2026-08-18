@@ -15,6 +15,34 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-18 (provider-aware routing on flag-testing)
+
+### ✅ `autofactory-flag-testing`: run.provider rules added around the composer-2-5 arm
+
+- **Why:** on 2026-08-13 a `composer-2-5` A/B arm was added to this config
+  (live, via API — not by the bridge) with a naked 50/50 `default`/`composer-2-5`
+  fallthrough rollout and NO `run.provider` rules. Composer only runs on the
+  Cursor provider, so any run bucketed to the anthropic provider AND the
+  composer arm passed `composer-2.5` to the Anthropic API and failed the node
+  with a 404 `not_found_error` — deterministically, ~25% of runs. Observed
+  live: demo PRs #238 and #240 (2026-08-18) failed flag-testing this way,
+  driving the graph invocation-failure rate to 75% that day.
+- **Change (production targeting, via API):** mirrored the 2026-07-20
+  provider-aware pattern from `autofactory-flag-implementer` /
+  `autofactory-metrics-author` — rule `run.provider = cursor` → 50/50
+  `default` / `composer-2-5`; rule `run.provider = anthropic` → 100%
+  `default` (this config has no fable arm); fallthrough → 100% `default`
+  (safe for runtimes that don't stamp `run.provider`).
+- **⚠ Known drift, not fixed here:** the `composer-2-5` variation's
+  instructions are STALE (pre-ADR-0013: boolean flag-on/flag-off language, no
+  T14, no string-multivariate T01, no run_tests scaffolding paragraph), so the
+  arm differs from `default` by more than model. Re-sync by hand before
+  reading the A/B as a model comparison. There is also a `hello-test`
+  connectivity-test variation (weight 0 everywhere) from the same 2026-08-13
+  session that can be deleted.
+
+---
+
 ## 2026-08-12 (raise runaway backstops)
 
 ### ✅ `gha-auto-factory`: all edge `max_turns` → 100
