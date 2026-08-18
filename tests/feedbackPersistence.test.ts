@@ -82,7 +82,10 @@ function repo(): string {
   const dir = mkdtempSync(join(tmpdir(), "af-feedback-"));
   tmps.push(dir);
   const git = (args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
-  git(["init", "-q"]);
+  // `-b main` pinned rather than inherited from `init.defaultBranch` — the tests below
+  // declare `base: "main"`, which is only the fixture's branch on a machine configured
+  // that way. See tests/walkState.test.ts for the CI-only failure this caused there.
+  git(["init", "-q", "-b", "main"]);
   git(["config", "user.email", "t@t.t"]);
   git(["config", "user.name", "t"]);
   writeFileSync(join(dir, "app.ts"), "export const x = 1;\n");

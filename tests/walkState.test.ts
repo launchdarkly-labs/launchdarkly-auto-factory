@@ -27,7 +27,13 @@ function repo(): string {
   const dir = mkdtempSync(join(tmpdir(), "af-walkstate-"));
   tmps.push(dir);
   const git = (args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
-  git(["init", "-q"]);
+  // `-b main` PINNED, not inherited: `git init` takes its branch name from the machine's
+  // `init.defaultBranch`, so this fixture was `main` on a dev box and `master` on the CI
+  // runner. That made the "falls through to LOCAL main" case test nothing there — with no
+  // local `main`, resolveBase returned undefined and the refusal came from the
+  // can't-resolve-either-side path instead of the substituted-ref one it asserts. Green
+  // locally, red in CI, and the same fixture is used by every test in this file.
+  git(["init", "-q", "-b", "main"]);
   git(["config", "user.email", "t@t.t"]);
   git(["config", "user.name", "t"]);
   writeFileSync(join(dir, "app.ts"), "export const x = 1;\n");
