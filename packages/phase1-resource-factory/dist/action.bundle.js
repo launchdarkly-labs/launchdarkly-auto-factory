@@ -75163,13 +75163,18 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         const rawMax = handoffNumber(edge.handoff, "max_visits");
         if (rawMax === void 0)
           continue;
+        const exit = handoffTags(edge.handoff, "skip_if_tags");
+        if (exit && tagsMatch(withFreshRouting(accumulatedTags, result.tags), exit))
+          continue;
         const ek = `${key}\u2192${edge.key}`;
         const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);
         const trigger2 = "the previous attempt failed and its retry budget is spent";
         if (traversals >= maxVisits) {
           const spent = { source: key, target: edge.key, traversals, maxVisits, trigger: trigger2 };
-          budgetBlocked.push(spent);
-          budgetSpent.set(ek, spent);
+          if (!budgetBlocked.some((b6) => b6.source === key && b6.target === edge.key))
+            budgetBlocked.push(spent);
+          if (!budgetSpent.has(ek))
+            budgetSpent.set(ek, spent);
           continue;
         }
         console.warn(`[loop] ${key} FAILED (infrastructure or API error) \u2014 retrying via its self-loop (${traversals + 1} of ${maxVisits}). No judge score is involved.`);
@@ -75237,9 +75242,12 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       }
       const ek = `${key}\u2192${next}`;
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
-      const unemitted = nextIsFailureRetry ? [] : unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      const exitUnemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      const unemitted = nextIsFailureRetry ? [] : exitUnemitted;
       if (!nextIsFailureRetry) {
-        exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+        exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && exitUnemitted.length > 0);
+      } else if (exitUnemitted.length === 0) {
+        exitNeverPossible.set(ek, false);
       }
       if (unemitted.length > 0 && !exitWarned.has(ek)) {
         exitWarned.add(ek);
@@ -75282,7 +75290,10 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       graphTracker.trackDuration(Date.now() - startMs);
       if (totalTokens.total > 0)
         graphTracker.trackTotalTokens(totalTokens);
-      const clean = !stalledAt && !verificationFailed && !replayDiverged && !loopExhausted && runs.every((r6) => r6.status === "completed");
+      const lastRunByNode = /* @__PURE__ */ new Map();
+      for (const r6 of runs)
+        lastRunByNode.set(r6.configKey, r6);
+      const clean = !stalledAt && !verificationFailed && !replayDiverged && !loopExhausted && [...lastRunByNode.values()].every((r6) => r6.status === "completed");
       if (clean)
         graphTracker.trackInvocationSuccess();
       else

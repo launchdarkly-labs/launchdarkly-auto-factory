@@ -1600,6 +1600,122 @@ describe("walkGraph — loop/metrics merge regressions", () => {
     assert.equal(r.loopExhausted, undefined);
   });
 
+  it("a walk RECOVERED by the failure retry scores an invocation SUCCESS, not a failure", async () => {
+    // The retry's whole purpose is that the walk survives a transient error. Scoring the
+    // recovered walk as a failure makes it indistinguishable from one that died, on every
+    // surface — the mechanism's success case would be invisible in the aggregate.
+    const g = recordingGraphTracker();
+    const r = await walkGraph(
+      graphFrom(selfLoopGraph(1)),
+      new ScriptedRunner({ metrics: [{ status: "failed", tags: {} }, { tags: { needs_tests: "true" } }] }),
+      { PR_NUMBER: "1" },
+      { graphTracker: g.tracker },
+    );
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["research", "metrics", "metrics", "test"]);
+    assert.equal(r.stalledAt, undefined);
+    assert.equal(r.loopExhausted, undefined);
+    assert.ok(g.methods().includes("trackInvocationSuccess"), `got: ${g.methods().join(", ")}`);
+    assert.ok(!g.methods().includes("trackInvocationFailure"), "the failed attempt was superseded by a completed one");
+  });
+
+  it("a node whose LAST run failed is still an invocation failure", async () => {
+    // The counterpart: "recovered" must mean a later run of the SAME node completed, not
+    // "some run somewhere completed".
+    const g = recordingGraphTracker();
+    await walkGraph(
+      graphFrom(selfLoopGraph(1)),
+      new ScriptedRunner({ metrics: { status: "failed", tags: {} } }), // never recovers
+      { PR_NUMBER: "1" },
+      { graphTracker: g.tracker },
+    );
+    assert.ok(g.methods().includes("trackInvocationFailure"), `got: ${g.methods().join(", ")}`);
+    assert.ok(!g.methods().includes("trackInvocationSuccess"));
+  });
+
+  it("the retry does not re-run a node whose failed pass satisfied the loop's OWN exit", async () => {
+    // Same argument as the late-failure case the second pass was built for: a late failure's
+    // tags are real evidence. If they satisfy the self-loop's exit condition, the node has
+    // converged and re-running it is a wasted side-effecting pass.
+    const exitGraph: LDAgentGraphFlagValue = {
+      root: "w",
+      edges: {
+        w: [
+          { key: "w", handoff: { max_visits: 2, skip_if_tags: { done: "true" } } },
+          { key: "after", handoff: { require_tags: { unrelated: "yes" } } },
+        ],
+        after: [],
+      },
+    };
+    const runner = new ScriptedRunner({ w: { status: "failed", tags: { done: "true" } } });
+    const r = await walkGraph(graphFrom(exitGraph), runner, { PR_NUMBER: "1" });
+    assert.equal(countOf(r, "w"), 1, "the exit condition was satisfied — no retry");
+    assert.equal(r.loopExhausted, undefined, "and no budget was spent on it");
+  });
+
+  it("a failure pass that DID emit the exit tag withdraws the never-satisfiable claim", async () => {
+    // MIXED passes, which is what makes this reachable: traversal 1 is a normal pass with the exit
+    // tag unemitted (so the categorical flag is set), traversal 2 is a FAILURE RETRY whose failed
+    // run DID emit the exit tag (as "false" — the tag exists, it just is not satisfied), and the
+    // budget then runs out. "Emitted none of those tags on any pass" is false by then, so it must
+    // not be asserted: it names the SERVED graph as defective when it is not.
+    const g = graphFrom({
+      root: "w",
+      edges: {
+        // BOTH conditions name ROUTING tags, deliberately. The exit must, because
+        // `unemittedExitTags` only counts routing tags — the categorical claim is about tags a
+        // source could emit. The require must, because the loop's freshness rule then matches it
+        // against the just-completed run's OWN tags, and a failed run has none: that is what pushes
+        // the decision down to the failure-retry pass, which is the state this test needs.
+        w: [
+          {
+            key: "w",
+            handoff: { max_visits: 2, require_tags: { risk_level: "high" }, skip_if_tags: { needs_tests: "true" } },
+          },
+        ],
+      },
+    });
+    const runner = new ScriptedRunner({
+      w: [
+        { tags: { risk_level: "high" } },                       // normal pass: exit tag unemitted
+        { status: "failed", tags: { needs_tests: "false" } },    // failure retry — but it DID emit it
+        { tags: { risk_level: "high" } },                       // budget now spent
+      ],
+    });
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+    let r;
+    try {
+      r = await walkGraph(g, runner, { PR_NUMBER: "1" });
+    } finally {
+      console.warn = realWarn;
+    }
+    assert.equal(r.loopExhausted?.reason, "budget", "the loop fired twice and then ran out");
+    assert.equal(countOf(r, "w"), 3);
+    assert.equal(
+      warnings.find((w) => w.includes("never satisfiable")),
+      undefined,
+      `the exit tag was emitted on a retried pass, so the categorical claim is unearned: ${warnings.join(" | ")}`,
+    );
+  });
+
+  it("one exhausted edge is reported ONCE, keeping its condition trigger", async () => {
+    // Both passes can reach the budget check for the same edge. Recording it twice prints the
+    // edge twice on all three report surfaces, and the second write relabels why it fired.
+    const dual: LDAgentGraphFlagValue = {
+      root: "w",
+      edges: { w: [{ key: "w", handoff: { max_visits: 1, require_tags: { again: "yes" } } }] },
+    };
+    const r = await walkGraph(
+      graphFrom(dual),
+      new ScriptedRunner({ w: { status: "failed", tags: { again: "yes" } } }),
+      { PR_NUMBER: "1" },
+    );
+    assert.equal(r.loopExhausted?.exhausted.length, 1, `got: ${JSON.stringify(r.loopExhausted?.exhausted)}`);
+    assert.equal(r.loopBudgetSpent?.length, 1);
+    assert.match(r.loopBudgetSpent?.[0]?.trigger ?? "", /again=yes/, "the condition that fired, not the retry text");
+  });
+
   it("terminal loopExhausted records an invocation FAILURE, for budget AND run-cap", async () => {
     const budget = recordingGraphTracker();
     await walkGraph(

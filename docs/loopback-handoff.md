@@ -406,9 +406,9 @@ Three accepted costs, recorded rather than closed, in the treatment §6 uses:
    One coupling that follows and is not a defect: failure retries and quality retries share one
    per-edge budget, so on `max_visits: 1` an infra failure consumes the pass a later low judge
    score would have used.
-3. **A drifted taxonomy claim that names no LaunchDarkly-subject word at all, sitting next to a
-   Sentry word, still passes the lint.** Narrowing further means guessing at grammar, which the
-   NAMES rule's own history says not to do.
+3. ~~**A drifted taxonomy claim that names no LaunchDarkly-subject word at all, sitting next to a
+   Sentry word, still passes the lint.**~~ **UNDERSTATED — see §7c finding 5.** The hole was wider
+   than this in both directions, and the attribution rule this describes has since been replaced.
 
 Also fixed, without a behavioural test because they are prose or a one-line gate: the restored
 Beacon README sections (main's snapshot said "no retry queue" and omitted `BEACON_PENDING_FILE` and
@@ -416,3 +416,67 @@ the Seer envs, contradicting the ledger the same file documents on line 27); the
 on the `already_running` re-attach (it named the evaluated manifest's variation and the current
 deploy's sha, when what is running is a sibling's earlier release — now repo-only, because an
 imprecise Seer search beats a confidently wrong one); and this file's own trap-7 placement.
+
+## 7c. ADVERSARIAL REVIEW, ROUND TWO, 2026-08-19 — the fixes reviewed, eight findings, all fixed
+
+Round one reviewed the merge; this round reviewed the FIXES, which is where the defects were, and
+found eight. The pattern is worth more than the list: **every serious finding was the fix round
+carrying its own false premise forward one more step.**
+
+- **The retry's success case was scored as a failure.** `clean` used
+  `runs.every(r => r.status === "completed")`, and `runs` is the resume journal, so a failed attempt
+  stays in it forever. A walk that survived a transient error therefore scored EXACTLY like one that
+  died — the new mechanism's entire purpose, invisible in the aggregate every front end feeds. Now
+  keyed on each node's LAST run: recovery is a success, a node whose last run failed is not.
+- **The retry re-ran a node whose failed pass had satisfied the loop's own exit.** Same argument as
+  the late-failure case the second pass was built for — a late failure's tags are real evidence —
+  and the second pass did not apply it to `skip_if_tags`. A satisfied exit means CONVERGED, so the
+  retry now yields to it. What the retry overrides is a missing trigger, never a satisfied exit.
+- **The exit-bookkeeping exemption repeated the "a failed run emits no tags" premise that §7b was
+  written to disprove.** A retried pass that DID emit the exit tag now clears the flag, so the
+  categorical claim at exhaustion ("emitted none of those tags on any pass") cannot be asserted
+  falsely and stop naming the SERVED graph as defective when it is not.
+- **One exhausted edge could be recorded twice**, once per pass, printing it twice on all three
+  report surfaces and relabelling a quality exhaustion as a retry exhaustion. Deduped on the
+  per-iteration array, so `loopExhausted` is still reported when an earlier iteration spent it.
+- **The lint's attribution rule was broken in BOTH directions** (finding 5, and the reason cost 3
+  above is struck out). Nearest-attribution is grammar-blind: front-load a Sentry word and a full
+  second copy of the taxonomy passes; put `flag` nearer than `Seer` and honest prose about Sentry's
+  own 403 is reported — the misfire class §7a says gets a check deleted. Attribution is now GONE.
+  The rule is the one the NAMES check beside it already used: **a status numeral is a taxonomy claim
+  only when a verdict about it sits within the window.** One sentence, no list of whose API a number
+  belongs to, and it decides all four known cases correctly (verified by executing each).
+- **`AgentStatus` has `stopped` and `cancelled`, which the fix round's prose ignored** by saying "a
+  run that fails" as though `failed` were the only non-completion. A turn-capped (`stopped`) run
+  still stalls, deliberately — a turn cap is not transient and the self-loop's envelope carries a
+  SMALLER `max_turns` than the forward edge on the committed graph, so it would stop again having
+  spent a budget unit. Now stated in the code.
+- **Two retained comments contradicted the code beside them** — the class round one was hunting.
+  "A reviewer REJECT is still an invocation success" sat 19 lines above the `!loopExhausted` clause
+  that makes every twice-rejected PR on the committed graph an invocation failure. Rewritten, and
+  see the owner decision below.
+- **`384901c`'s message overstates the re-attach fix**: "for a release it did not start" is wrong for
+  the case its own code comment names (a re-POST after a restart re-attaches to the release this
+  same manifest started, where the discarded context was exactly right). The CODE is still correct —
+  the two cases are indistinguishable at that site, `AutomatedRelease` carries no variation or sha,
+  and a wrong context is worse than a thin one — but the justification was too clean.
+
+**ONE OWNER DECISION, not a defect.** On the committed graph the reviewer's rework loop is its
+source's only edge, so ANY walk whose final verdict is reject ends `loopExhausted` → and now records
+`trackInvocationFailure`. The graph-level metric therefore moves with the business outcome for the
+most ordinary contested case, which `LoopExhaustedInfo`'s docstring supports and main's original
+"a reject is still a success" principle does not. Defensible either way; decide it deliberately
+rather than finding it on a dashboard.
+
+**What survived the round**, so the next reviewer does not repeat it: replay/resume across a failure
+retry (no divergence, with no grant, a halt-position grant, or a mid-journal grant), the approval
+gate (a retry re-enters through the live gate, replayed nodes stay ungated), the `!replaying` gating
+of `trackHandoffFailure` (no real failure goes unrecorded), the metrics behaviour of each front end
+(the Action passes no `resume`, so it is genuinely unaffected), and the restored Beacon README facts.
+
+**A verification lesson to add to §3 in spirit:** the test for the exit-claim finding passed under
+BOTH walkers on its first two drafts — the scenario never reached the retry path, because
+`unemittedExitTags` counts only ROUTING tags and the loop's freshness rule decides which pass sees
+the edge. A test that passes before and after pins nothing. Each of the four behavioural fixes here
+was confirmed to fail against `65459cf` before being accepted.
+

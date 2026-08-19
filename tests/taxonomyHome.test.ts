@@ -375,29 +375,30 @@ describe("the taxonomy has exactly one home", () => {
     // sabotage that "verified" the old gate put its numeral far from any Sentry word, so it
     // tested DISTANCE and reported it as attribution.
     //
-    // So: per prose unit, and NEAREST ATTRIBUTION rather than mere presence. A numeral is exempt
-    // only when a foreign-API word is STRICTLY CLOSER to it than any LaunchDarkly-subject word in
-    // the same unit. Seer's line qualifies ("Seer entitlement" is adjacent, `flag:<flagKey>` is
-    // 120 characters away); the sabotage above does not ("LaunchDarkly's" is adjacent). A unit
-    // that discusses both now resolves per numeral instead of exempting the paragraph.
+    // THE SECOND VERSION — nearest-attribution, `sentry|seer` closer than any LD-subject word —
+    // was ALSO broken, in both directions, by the next review:
     //
-    // Residual, recorded rather than tuned: a drifted claim that names no LD subject word at all
-    // AND sits next to a Sentry word still passes. Narrowing further means guessing at grammar,
-    // which is what the NAMES rule's history says not to do.
-    const FOREIGN_API = /\b(sentry|seer)\b/gi;
-    const LD_SUBJECT = /\b(launchdarkly|ld|flags?|manifests?|prerequisites?|releaseplan|fallthrough)\b/gi;
-    const nearestDistance = (re: RegExp, text: string, at: number): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (const m of text.matchAll(re)) {
-        if (m.index === undefined) continue;
-        best = Math.min(best, Math.abs(m.index - at));
-      }
-      return best;
-    };
-    const stripForeignStatuses = (unit: string): string =>
-      unit.replace(/\b(403|404|405|408|409|429)\b/g, (match: string, _digits: string, at: number) =>
-        nearestDistance(FOREIGN_API, unit, at) < nearestDistance(LD_SUBJECT, unit, at) ? "" : match,
-      );
+    //   PASSED (a full second copy):  "In the same handler that logs Seer's search miss, a 403
+    //                                  from the release-start patch is deterministic and the
+    //                                  manifest is held as content."
+    //   FAILED (honest Sentry prose): "Seer matches on the flag key; a 403 on issue search is
+    //                                  logged and monitoring continues."
+    //
+    // Front-load any Sentry word and the exemption follows regardless of what else the sentence
+    // says; put the word `flag` nearer than `Seer` and honest prose about Sentry's own status is
+    // reported. Attribution-by-distance is grammar-blind, and the second failure is the misfire
+    // class §7a warns gets a check DELETED.
+    //
+    // So attribution is gone, and the rule is the one the NAMES check beside this already uses:
+    // A STATUS NUMERAL IS A TAXONOMY CLAIM ONLY WHEN A VERDICT ABOUT IT SITS WITHIN `WINDOW`.
+    // That is what "being classified" means, it is one sentence long, and it decides both cases
+    // above correctly — the drifted copy carries `deterministic`/`held`/`content`, and both the
+    // Seer lines carry no verdict at all. It needs no list of whose API a number belongs to,
+    // which is the premise both earlier versions got wrong.
+    //
+    // Residual, recorded rather than tuned: honest prose that DOES pair a foreign status with one
+    // of these verdict words — "Sentry's 403 is deterministic" — is now reported. That is a loud,
+    // visible misfire fixed by rewording, not a silent hole, which is the direction to fail in.
     for (const rel of ["packages/beacon/README.md", "docs/loop-seam.md", "packages/beacon/src/server.ts"]) {
       const abs = resolve(repoRoot, rel);
       assert.ok(existsSync(abs), `${rel} is missing — if it moved, update this list rather than deleting the check`);
@@ -405,14 +406,16 @@ describe("the taxonomy has exactly one home", () => {
       assert.match(raw, /PATCH_FAILURE_TAXONOMY/, `${rel} must POINT at the one home`);
 
       for (const unit of proseUnits(rel, strip(raw))) {
-        const numeral = NUMERALS.exec(stripForeignStatuses(unit));
-        assert.equal(
-          numeral,
-          null,
-          `${rel} names a status ('${numeral?.[0]}'). Statuses are classified in one place only: ` +
-            `PATCH_FAILURE_TAXONOMY (${HOME}).`,
-        );
         const flat = unit.replace(/\s+/g, " ");
+        for (const num of flat.matchAll(new RegExp(NUMERALS, "g"))) {
+          const at = num.index ?? 0;
+          const near = flat.slice(Math.max(0, at - WINDOW), at + num[0].length + WINDOW);
+          if (!VERDICT.test(near)) continue;
+          assert.fail(
+            `${rel} classifies a status ('${num[0]}'): "…${near.trim()}…". Statuses are classified ` +
+              `in one place only: PATCH_FAILURE_TAXONOMY (${HOME}) — point at it instead.`,
+          );
+        }
         for (const name of flat.matchAll(new RegExp(NAMES, "gi"))) {
           const at = name.index ?? 0;
           const near = flat.slice(Math.max(0, at - WINDOW), at + name[0].length + WINDOW);
