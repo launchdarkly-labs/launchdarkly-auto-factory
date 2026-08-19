@@ -247,7 +247,8 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
 2. **Then** provision the graph (`npm run bridge -- upgrade`) — still held until after approval, for
    the reason in §2: the walker executes the graph LaunchDarkly serves, which has neither loop edge
    until that runs.
-3. **Delete this file when the branch merges**, as the top of it says.
+3. **Delete this file when the branch merges**, as the top of it says — but first check that
+   nothing in it is still needed. §7d's content is already in issue #20 for exactly that reason.
 
 ## 7a. SETTLED EMPIRICALLY 2026-08-12 — the edge-order finding, and the fix is not the filed one
 
@@ -387,7 +388,8 @@ Three accepted costs, recorded rather than closed, in the treatment §6 uses:
    runs, with tokens from only the live tail. So a graph driven through `--resume` under-reports
    invocations. The GitHub Action re-runs from scratch and is unaffected. Omitting a row beats
    corrupting the aggregate.
-2. **A loop edge pointing elsewhere still stalls on a FAILED source.** The failure retry is
+2. **[CUT — see §7d/issue #20; recorded as history.]** A loop edge pointing elsewhere still
+   stalls on a FAILED source. The failure retry was
    restricted to SELF-loops, where "run it again" needs no tag evidence. `code-reviewer →
    flag-implementer` on a failed reviewer would hand the implementer a rework with no critique, so
    that case still stalls; the fix there is a self-loop on the reviewer, which is a graph change.
@@ -418,6 +420,10 @@ deploy's sha, when what is running is a sibling's earlier release — now repo-o
 imprecise Seer search beats a confidently wrong one); and this file's own trap-7 placement.
 
 ## 7c. ADVERSARIAL REVIEW, ROUND TWO, 2026-08-19 — the fixes reviewed, eight findings, all fixed
+
+> **Read §7d first if you are here about the failure retry.** Round three cut that mechanism from
+> the branch entirely (issue #20), so the retry-specific findings recorded below and in §7b are
+> history: they describe code that is no longer here. Everything else in both sections is live.
 
 Round one reviewed the merge; this round reviewed the FIXES, which is where the defects were, and
 found eight. The pattern is worth more than the list: **every serious finding was the fix round
@@ -479,4 +485,40 @@ BOTH walkers on its first two drafts — the scenario never reached the retry pa
 `unemittedExitTags` counts only ROUTING tags and the loop's freshness rule decides which pass sees
 the edge. A test that passes before and after pins nothing. Each of the four behavioural fixes here
 was confirmed to fail against `65459cf` before being accepted.
+
+## 7d. THE FAILURE RETRY IS CUT — high-priority TODO, tracked in issue #20
+
+A bounded self-loop retry for FAILED node runs was built, reviewed three times, and **removed from
+this branch**. Issue #20 carries the full record: the problem, the design, the four defects to fix
+first, and the verification discipline. This section exists because the notes you are reading get
+deleted when the branch merges, and the issue does not.
+
+**The gap it leaves, stated plainly so nobody assumes otherwise:** a node run with
+`status: "failed"` emits an error string and usually no tags, so nothing routes and **the walk
+stalls — including when the failed node carries a self-loop whose budget then goes unspent**. A
+human re-runs it. `tests/walker.test.ts` → "A FAILED RUN STALLS THE WALK — nothing retries it" pins
+that, so the gap is visible in the suite and not only here.
+
+**Why it was cut rather than fixed here.** It worked, and it was still useless in practice: the
+retried agent received the failed run's ERROR STRING as its brief, labelled by the rework preamble
+as an authoritative change request, and re-entered through the self-loop's rework envelope
+(`max_turns: 20` on the committed graph) after a 100-turn attempt had failed. So it bought a second
+attempt likely to fail for a new reason — and the orphaned-resource exposure it opened traced back
+to that destroyed brief. Two rounds of review had passed over it without either being noticed;
+round three found both. Shipping a recovery mechanism that cannot recover, inside a 99-commit PR
+whose loop work is otherwise twice-reviewed, was the worse trade.
+
+**What stayed behind, deliberately, because each stands without the retry:**
+
+- **`clean` keys on each node's LAST run**, not every run. Recovery is reachable with no retry
+  mechanism at all — a walk can route past a failure whose tags already satisfied an edge, and a
+  later loop can re-enter that node successfully. `runs` is the resume journal, so a failed attempt
+  stays in it forever and `runs.every(completed)` scored recovery exactly like death.
+- **`loopBudgetFor`** as a function with one caller, for the reason `ResumeInput`'s own history
+  gives: restating "floor(max_visits) + grants in force, capped" is how a granted traversal becomes
+  reachable in one place and blocked in another.
+- **The exhaustion-record test**, which is trivially true with one selection pass and kept because a
+  second pass reaching the budget check double-records the edge on all three report surfaces.
+- **The `stopped` / `cancelled` reasoning** now lives in issue #20 rather than in a comment beside
+  code that no longer exists.
 

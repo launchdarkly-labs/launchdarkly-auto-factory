@@ -75100,7 +75100,6 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let next = null;
     let nextHandoff;
     let nextIsLoopEdge = false;
-    let nextIsFailureRetry = false;
     let nextJudgeThreshold;
     const runsConsumed = runs.length;
     const loopBudgetFor = (ek, rawMax) => ({
@@ -75155,35 +75154,6 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       nextIsLoopEdge = rawMax !== void 0;
       nextJudgeThreshold = handoffNumber(h6, "loop_if_judge_below");
       break;
-    }
-    if (!next && result.status === "failed") {
-      for (const edge of node.getEdges()) {
-        if (edge.key !== key)
-          continue;
-        const rawMax = handoffNumber(edge.handoff, "max_visits");
-        if (rawMax === void 0)
-          continue;
-        const exit = handoffTags(edge.handoff, "skip_if_tags");
-        if (exit && tagsMatch(withFreshRouting(accumulatedTags, result.tags), exit))
-          continue;
-        const ek = `${key}\u2192${edge.key}`;
-        const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);
-        const trigger2 = "the previous attempt failed and its retry budget is spent";
-        if (traversals >= maxVisits) {
-          const spent = { source: key, target: edge.key, traversals, maxVisits, trigger: trigger2 };
-          if (!budgetBlocked.some((b6) => b6.source === key && b6.target === edge.key))
-            budgetBlocked.push(spent);
-          if (!budgetSpent.has(ek))
-            budgetSpent.set(ek, spent);
-          continue;
-        }
-        console.warn(`[loop] ${key} FAILED (infrastructure or API error) \u2014 retrying via its self-loop (${traversals + 1} of ${maxVisits}). No judge score is involved.`);
-        next = edge.key;
-        nextHandoff = edge.handoff;
-        nextIsLoopEdge = true;
-        nextIsFailureRetry = true;
-        break;
-      }
     }
     if (!next) {
       const edges = node.getEdges();
@@ -75242,13 +75212,8 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       }
       const ek = `${key}\u2192${next}`;
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
-      const exitUnemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
-      const unemitted = nextIsFailureRetry ? [] : exitUnemitted;
-      if (!nextIsFailureRetry) {
-        exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && exitUnemitted.length > 0);
-      } else if (exitUnemitted.length === 0) {
-        exitNeverPossible.set(ek, false);
-      }
+      const unemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
       if (unemitted.length > 0 && !exitWarned.has(ek)) {
         exitWarned.add(ek);
         console.warn(`[loop] ${key} \u2192 ${next}: iteration taken while its exit named routing tag(s) ${unemitted.join(", ")}, which '${key}' did not emit this pass. If it never emits them, this loop can only end by exhausting its budget.`);
@@ -75256,7 +75221,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
       pendingLoopTrigger = {
         source: key,
-        reason: nextIsFailureRetry ? "the previous attempt FAILED (infrastructure or API error, not a quality verdict) \u2014 retrying" : judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+        reason: judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
         ...nextJudgeThreshold !== void 0 && run.judgeReasoning ? { detail: run.judgeReasoning } : {}
       };
     }
