@@ -452,6 +452,42 @@ describe("routing contract: deterministic handoff shims halt the walk", () => {
     assert.ok(w.skipped.includes(KEYS.metrics));
   });
 
+  it("a FAILED run is not verified — the walk reports the error, not an unverified claim", async () => {
+    // Every shim trigger is a TOOL-set tag, so a run that errors late carries them: the real
+    // `tests_last_run: "fail"` shim fails unconditionally, which an agent whose suite went red and
+    // then timed out mid-fix hits every time. Verifying that run turns "the run errored" into
+    // "the agent claimed something it cannot prove" — the same dead end with the wrong diagnosis.
+    // Mirrors the real `tests_last_run === "fail"` shim: it only makes a claim when that tag is
+    // present, and no claim at all otherwise (the real verifier returns null when nothing matched).
+    const verifiedTagSets: Array<Record<string, string>> = [];
+    const verifier = async ({ configKey, tags }: { configKey: string; tags: Record<string, string> }) => {
+      verifiedTagSets.push(tags);
+      if (tags.tests_last_run !== "fail") return null;
+      return {
+        node: configKey,
+        ok: false,
+        passed: [],
+        failures: [{ name: "tests-green-at-handoff", detail: "the last real run_tests execution FAILED" }],
+      };
+    };
+    const w = await walkGraph(
+      buildChain(),
+      new FakeRunner({
+        [KEYS.research]: { tags: { flag_worthy: "true" } },
+        // Landed a red suite, then the run itself errored.
+        [KEYS.flag]: { status: "failed", tags: { tests_last_run: "fail" } },
+      }),
+      { PR_NUMBER: "1" },
+      { verifier },
+    );
+    assert.equal(verifiedTagSets.length, 1, "the healthy node was still verified; the failed one was not");
+    assert.equal(w.verificationFailed, undefined, "the failed run must not be reported as an unverified claim");
+    // The honest outcome instead: the walk stops at that node because nothing routes.
+    assert.deepEqual(path(w), [KEYS.research, KEYS.flag]);
+    assert.equal(w.runs[1]?.status, "failed");
+    assert.equal(w.stalledAt?.node, KEYS.flag);
+  });
+
   it("a passing verification lets the chain continue; a shim crash never halts", async () => {
     let crashed = 0;
     const verifier = async (run: { configKey: string; tags: Record<string, string> }) => {

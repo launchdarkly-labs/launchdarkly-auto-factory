@@ -1250,7 +1250,23 @@ export async function walkGraph(
     // Skipped on replay: a verification failure is not resumable, so every node in
     // an accepted journal already passed. Re-running the shims against a checkout
     // that may have moved is what the caller's invalidation keys are for.
-    if (verifier && !replaying) {
+    //
+    // SKIPPED ON A FAILED RUN, mirroring the judge sixteen lines above, and for a sharper reason
+    // than symmetry. The shims re-derive the claims a HANDOFF makes; a failed run makes no handoff
+    // — the walk is about to stop — and its tags are whatever its tool calls managed to set before
+    // the error. Every shim trigger is a tool-set tag, so this was reachable and not exotically:
+    // `tests_last_run: "fail"` fails UNCONDITIONALLY (an agent whose run_tests went red and then
+    // timed out mid-fix hits it every time), `metric_event_keys` fails when `create_metric` landed
+    // but the `track()` call did not, and `flag_ready`/`flag_key` fail when `create_flag` landed but
+    // no code was wrapped yet. In each case the walk stops either way — but it stopped reporting
+    // `verificationFailed`, which accuses the agent of an unverified claim, instead of the honest
+    // outcome, which is that the run errored. Same dead end, wrong diagnosis, and the operator is
+    // sent to inspect claims rather than infrastructure.
+    //
+    // `stopped` and `cancelled` still verify, deliberately: those runs EXECUTED (a turn cap, an
+    // external abort) rather than errored, so their claims are real claims and partial work handed
+    // on unverified is exactly what the shims exist to catch.
+    if (verifier && !replaying && result.status !== "failed") {
       try {
         const verification = await verifier({ configKey: key, tags: result.tags });
         if (verification) {
@@ -1363,7 +1379,8 @@ export async function walkGraph(
             const named = Object.keys(handoffTags(h, "skip_if_tags") ?? {}).join(", ");
             console.warn(
               `[loop] ${key} → ${edge.key} exhausted ${traversals} iteration(s) and its exit (${named}) was ` +
-                `never satisfiable — '${key}' emitted none of those tags on any pass. This edge can only ever ` +
+                `never satisfiable — '${key}' did not emit at least one of those tags on any pass. ` +
+                `This edge can only ever ` +
                 `end by budget; check the SERVED graph.`,
             );
           }

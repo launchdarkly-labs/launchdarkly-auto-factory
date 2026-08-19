@@ -75079,7 +75079,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         console.warn(`[judge] '${key}' has a judge-driven loop edge but produced NO usable score (unsampled, failed, or no judge attached) \u2014 the quality loop cannot fire and this run is unverified.`);
       }
     }
-    if (verifier && !replaying) {
+    if (verifier && !replaying && result.status !== "failed") {
       try {
         const verification = await verifier({ configKey: key, tags: result.tags });
         if (verification) {
@@ -75143,7 +75143,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
           budgetBlocked.push(spent);
           if (exitNeverPossible.get(ek) === true) {
             const named = Object.keys(handoffTags(h6, "skip_if_tags") ?? {}).join(", ");
-            console.warn(`[loop] ${key} \u2192 ${edge.key} exhausted ${traversals} iteration(s) and its exit (${named}) was never satisfiable \u2014 '${key}' emitted none of those tags on any pass. This edge can only ever end by budget; check the SERVED graph.`);
+            console.warn(`[loop] ${key} \u2192 ${edge.key} exhausted ${traversals} iteration(s) and its exit (${named}) was never satisfiable \u2014 '${key}' did not emit at least one of those tags on any pass. This edge can only ever end by budget; check the SERVED graph.`);
           }
           budgetSpent.set(`${key}\u2192${edge.key}`, spent);
           continue;

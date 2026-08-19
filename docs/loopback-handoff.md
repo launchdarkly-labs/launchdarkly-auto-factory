@@ -467,12 +467,25 @@ carrying its own false premise forward one more step.**
   the two cases are indistinguishable at that site, `AutomatedRelease` carries no variation or sha,
   and a wrong context is worse than a thin one — but the justification was too clean.
 
-**ONE OWNER DECISION, not a defect.** On the committed graph the reviewer's rework loop is its
-source's only edge, so ANY walk whose final verdict is reject ends `loopExhausted` → and now records
-`trackInvocationFailure`. The graph-level metric therefore moves with the business outcome for the
-most ordinary contested case, which `LoopExhaustedInfo`'s docstring supports and main's original
-"a reject is still a success" principle does not. Defensible either way; decide it deliberately
-rather than finding it on a dashboard.
+**ONE OWNER DECISION, now DECIDED — keep it, and do not "fix" the graph for it.** On the committed
+graph the reviewer's rework loop is its source's only edge, so ANY walk whose final verdict is reject
+ends `loopExhausted` → and records `trackInvocationFailure`. The graph-level metric therefore moves
+with the business outcome for the most ordinary contested case, which `LoopExhaustedInfo`'s docstring
+supports and main's original "a reject is still a success" principle does not.
+
+Round three recommended keeping the predicate and giving `code-reviewer` a terminal forward edge so a
+final reject falls through and ends cleanly. **Declined, for two reasons.** It cannot ship from this
+branch anyway — a graph change needs provisioning, which §2 holds until after review. And more
+importantly, "a twice-rejected PR reports INCOMPLETE and needs a human" is OPERATIONALLY RIGHT: that
+PR does need attention, and `loopExhausted` is the thing that says so. Metric purity (machinery
+versus business outcome) is a real concern but a smaller one than losing that signal. Revisit only if
+dashboards prove noisy — it is one predicate clause and one graph edge, cheap to change later.
+
+**A SECOND OWNER-VISIBLE CONSEQUENCE, left as is.** A walk that routes PAST a late failure and ships
+end-to-end still records `trackInvocationFailure`: `clean` keys on each node's last run, and that
+node's last run failed. Pessimistic rather than wrong — a node did fail during that invocation — and
+unchanged from the pre-fix behaviour. Detecting "failed but shipped anyway" needs new mechanism,
+which is not what this branch should be growing.
 
 **What survived the round**, so the next reviewer does not repeat it: replay/resume across a failure
 retry (no divergence, with no grant, a halt-position grant, or a mid-journal grant), the approval
@@ -507,6 +520,20 @@ attempt likely to fail for a new reason — and the orphaned-resource exposure i
 to that destroyed brief. Two rounds of review had passed over it without either being noticed;
 round three found both. Shipping a recovery mechanism that cannot recover, inside a 99-commit PR
 whose loop work is otherwise twice-reviewed, was the worse trade.
+
+**Two round-three findings outlived the cut and were fixed on their own merits:**
+
+- **The handoff verifier no longer runs on a FAILED run**, mirroring the judge. Every shim trigger is
+  a tool-set tag, so a late error carried them and the walk reported `verificationFailed` — accusing
+  the agent of an unverified claim — instead of the honest "the run errored". Reachable without
+  contrivance: `tests_last_run: "fail"` fails unconditionally, which an agent whose suite went red
+  and then timed out mid-fix hits every time. `stopped`/`cancelled` still verify: those runs
+  EXECUTED, so their partial claims are exactly what the shims exist to catch.
+- **The exhaustion warning stopped over-claiming.** With a multi-tag exit it named every tag and said
+  the source "emitted none of those tags on any pass", which is false when one was emitted every
+  pass. Now "did not emit at least one of those tags" — true without new state. Naming precisely
+  which tags were never emitted would mean replacing the per-edge boolean that also GATES the
+  warning, and this branch's history says that is where regressions come from.
 
 **What stayed behind, deliberately, because each stands without the retry:**
 
