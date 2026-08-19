@@ -363,14 +363,27 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     const evaluateManifest = async (flag: DiscoveredFlag): Promise<FlagOutcome> => {
       const scope = flag.scope ?? "frontend";
       // What Seer needs if this release later REVERTS (ADR 0014): the repo to search, the sha
-      // that started it, and the variation. Built once — both hook call sites below (the
-      // re-attach and the fresh staged release) pass the same context, and two literals is how
-      // one of them silently loses a field.
+      // that started it, and the variation.
+      //
+      // TWO contexts, not one, because the two hook call sites below watch DIFFERENT releases.
+      // The fresh-release site starts the rollout this manifest asked for, so the manifest's
+      // sha and targetVariation describe it exactly. The re-attach site does not: it attaches to
+      // a release that was ALREADY running, which on this branch is the documented steady state
+      // — "a manifest asking for v2 hits already_running on v1's rollout". Passing the manifest's
+      // context there tells Seer that v2 and the CURRENT deploy's sha are what reverted, when
+      // what reverted is v1, started by an earlier commit. Seer would then root-cause the wrong
+      // variation and the wrong diff. `RevertAutofixContext.sha` is documented as the sha that
+      // STARTED the release, and nothing on the re-attach path knows it.
+      //
+      // So the re-attach passes only what it can stand behind: the repo. Seer still runs — it
+      // matches on flag key and environment, which are always right — with less to narrow by.
+      // An imprecise search beats a confidently wrong one.
       const monitorCtx: ReleaseMonitorContext = {
         repoFullName: `${service.repo.owner}/${service.repo.name}`,
         sha: n.sha,
         ...(flag.targetVariation ? { targetVariation: flag.targetVariation } : {}),
       };
+      const reattachCtx: ReleaseMonitorContext = { repoFullName: monitorCtx.repoFullName };
       const decision = decideScope(scope, service.side);
 
       if (decision === "skip") {
@@ -488,7 +501,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
           };
         }
         if (active) {
-          onReleaseStarted(flag.flagKey, n.environment, monitorCtx); // re-attach monitoring (e.g. after a Beacon restart)
+          onReleaseStarted(flag.flagKey, n.environment, reattachCtx); // re-attach monitoring (e.g. after a Beacon restart)
           return { flag: flag.flagKey, sourceFile: flag.sourceFile, scope, action: "already_running", detail: { releaseId: active.id } };
         }
         // A REPEAT evaluation of an already-processed sha must not re-release a flag whose

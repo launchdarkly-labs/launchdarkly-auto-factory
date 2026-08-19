@@ -1505,3 +1505,156 @@ class NeverRunnerForJudges implements AgentRunner {
     throw new Error(`runner must not be called during replay (reached '${req.configKey}')`);
   }
 }
+
+/** review → flag rework loop, for the metric assertions below. */
+const loopGraphForMetrics = (maxVisits: number): LDAgentGraphFlagValue => ({
+  root: "research",
+  edges: {
+    research: [{ key: "flag" }],
+    flag: [{ key: "review" }],
+    review: [{ key: "flag", handoff: { max_visits: maxVisits, skip_if_tags: { review_approved: "approve" } } }],
+  },
+});
+
+/**
+ * Regressions from merging `main` (the graph-level metrics commit) into the loop machinery.
+ * Every case here was either created by that merge or found by review of it, and each one is
+ * pinned because it is invisible in normal operation: three of them are metric values and one
+ * is a walk that ends early with its retry budget unspent.
+ */
+describe("walkGraph — loop/metrics merge regressions", () => {
+  // A node that both carries a self-loop (quality retry) and has a forward edge gated on a tag
+  // it must emit — the committed metrics-author shape.
+  const selfLoopGraph = (maxVisits: number): LDAgentGraphFlagValue => ({
+    root: "research",
+    edges: {
+      research: [{ key: "metrics" }],
+      metrics: [
+        { key: "metrics", handoff: { max_visits: maxVisits, loop_if_judge_below: 0.7 } },
+        { key: "test", handoff: { require_tags: { needs_tests: "true" } } },
+      ],
+      test: [],
+    },
+  });
+
+  it("a FAILED run retries its self-loop instead of stalling with budget unspent", async () => {
+    // Fails on attempt 1 (an API timeout emits no tags), succeeds on attempt 2.
+    const runner = new ScriptedRunner({
+      metrics: [{ status: "failed", tags: {} }, { tags: { needs_tests: "true" } }],
+    });
+    const r = await walkGraph(graphFrom(selfLoopGraph(1)), runner, { PR_NUMBER: "1" });
+    assert.equal(countOf(r, "metrics"), 2, "the failed attempt was retried");
+    assert.deepEqual(
+      r.runs.map((x) => x.configKey),
+      ["research", "metrics", "metrics", "test"],
+      "the walk recovered and reached the forward node",
+    );
+    assert.equal(r.stalledAt, undefined, "no stall: the retry produced the tag the forward edge needs");
+    // The retry is attributed to the failure, not to a quality verdict nobody made.
+    assert.match(runner.promptsByKey["metrics"]?.[1] ?? "", /previous attempt FAILED/i);
+  });
+
+  it("the failure retry is BOUNDED by the same budget, and reports exhaustion not a stall", async () => {
+    const runner = new ScriptedRunner({ metrics: { status: "failed", tags: {} } }); // always fails
+    const r = await walkGraph(graphFrom(selfLoopGraph(2)), runner, { PR_NUMBER: "1" });
+    assert.equal(countOf(r, "metrics"), 3, "1 initial + max_visits(2) retries, then stop");
+    assert.equal(r.loopExhausted?.reason, "budget");
+    assert.equal(r.stalledAt, undefined);
+    // A failed run emits no tags, so every exit tag reads as unemitted. That must NOT be
+    // recorded as the categorical "this exit was never satisfiable" claim.
+    assert.equal(r.loopExhausted?.exhausted[0]?.source, "metrics");
+  });
+
+  it("a loop edge pointing ELSEWHERE does not fire on a failure (no critique to hand back)", async () => {
+    // review → flag on a rejected review: firing this on a FAILED reviewer would send the
+    // implementer back to work with no findings. A stall is the honest outcome.
+    const g: LDAgentGraphFlagValue = {
+      root: "flag",
+      edges: {
+        flag: [{ key: "review", handoff: { require_tags: { flag_ready: "true" } } }],
+        review: [{ key: "flag", handoff: { max_visits: 2, require_tags: { review_approved: "false" } } }],
+      },
+    };
+    const runner = new ScriptedRunner({
+      flag: { tags: { flag_ready: "true" } },
+      review: { status: "failed", tags: {} },
+    });
+    const r = await walkGraph(graphFrom(g), runner, { PR_NUMBER: "1" });
+    assert.equal(countOf(r, "flag"), 1, "the implementer was NOT sent back");
+    assert.equal(countOf(r, "review"), 1);
+    assert.equal(r.loopExhausted, undefined);
+  });
+
+  it("terminal loopExhausted records an invocation FAILURE, for budget AND run-cap", async () => {
+    const budget = recordingGraphTracker();
+    await walkGraph(
+      graphFrom(loopGraphForMetrics(1)),
+      new ScriptedRunner({ review: { tags: { review_approved: "reject" } } }),
+      { PR_NUMBER: "1" },
+      { graphTracker: budget.tracker },
+    );
+    assert.ok(budget.methods().includes("trackInvocationFailure"), `budget: ${budget.methods().join(", ")}`);
+    assert.ok(!budget.methods().includes("trackInvocationSuccess"), "a spent budget ended the walk early");
+
+    // An untagged cycle: no max_visits anywhere, so only the run-level backstop stops it. A
+    // graph that cannot terminate must never report a clean invocation.
+    const capped = recordingGraphTracker();
+    const r = await walkGraph(
+      graphFrom({ root: "a", edges: { a: [{ key: "b" }], b: [{ key: "a" }] } }),
+      new ScriptedRunner({}),
+      { PR_NUMBER: "1" },
+      { graphTracker: capped.tracker },
+    );
+    assert.equal(r.loopExhausted?.reason, "run-cap");
+    assert.ok(capped.methods().includes("trackInvocationFailure"), `run-cap: ${capped.methods().join(", ")}`);
+    assert.ok(!capped.methods().includes("trackInvocationSuccess"));
+  });
+
+  it("a RESUME emits no graph-level metrics: the original walk already scored the invocation", async () => {
+    const g = () => graphFrom(loopGraphForMetrics(1));
+    const rejecting = { review: { tags: { review_approved: "reject" } } };
+    const first = recordingGraphTracker();
+    const r1 = await walkGraph(g(), new ScriptedRunner(rejecting), { PR_NUMBER: "1" }, { graphTracker: first.tracker });
+    assert.equal(r1.loopExhausted?.reason, "budget");
+    assert.equal(first.methods().filter((m) => m === "trackInvocationFailure").length, 1, "scored once, here");
+
+    const second = recordingGraphTracker();
+    const r2 = await walkGraph(g(), new ScriptedRunner({ review: { tags: { review_approved: "approve" } } }), { PR_NUMBER: "1" }, {
+      graphTracker: second.tracker,
+      resume: { journal: r1.runs, grants: [{ edge: "review→flag", visits: 1, effectiveAfterRuns: r1.runs.length }] },
+    });
+    assert.equal(r2.replayDiverged, undefined, "the journal replayed cleanly");
+    assert.equal(r2.loopExhausted, undefined, "the grant let it converge");
+    const global = second
+      .methods()
+      .filter((m) => ["trackInvocationSuccess", "trackInvocationFailure", "trackDuration", "trackTotalTokens", "trackPath"].includes(m));
+    assert.deepEqual(
+      global,
+      [],
+      `a resume must not emit a SECOND invocation, nor a path/duration/token figure for a walk ` +
+        `that only partly happened in this process, got: ${global.join(", ")}`,
+    );
+  });
+
+  it("a replayed node's blocked edge is not a handoff failure on this walk", async () => {
+    // Journal from a converged walk, replayed against a graph whose forward edge now demands a
+    // tag the journal never recorded — the block belongs to the original decision, not to this one.
+    const first = await walkGraph(
+      graphFrom({ root: "a", edges: { a: [{ key: "b" }], b: [] } }),
+      new ScriptedRunner({}),
+      { PR_NUMBER: "1" },
+    );
+    assert.equal(first.runs.length, 2);
+    const t = recordingGraphTracker();
+    await walkGraph(
+      graphFrom({ root: "a", edges: { a: [{ key: "b", handoff: { require_tags: { never_emitted: "true" } } }], b: [] } }),
+      new ScriptedRunner({}),
+      { PR_NUMBER: "1" },
+      { graphTracker: t.tracker, resume: { journal: first.runs } },
+    );
+    assert.ok(
+      !t.methods().includes("trackHandoffFailure"),
+      `a replayed node must not re-record handoff outcomes, got: ${t.methods().join(", ")}`,
+    );
+  });
+});

@@ -52,7 +52,7 @@ branch merges.
 
 ## 3. How verification silently lies here — read before trusting any green suite
 
-Six distinct traps, each of which has produced a wrong conclusion in this branch's history:
+Seven distinct traps, each of which has produced a wrong conclusion in this branch's history:
 
 1. **`npm test` runs against built `dist/`.** Tests import workspace packages by name
    (`@auto-factory/beacon`), which resolve to compiled output. Editing `src/` and running
@@ -76,6 +76,14 @@ Six distinct traps, each of which has produced a wrong conclusion in this branch
    this happened with an unguarded index access under `noUncheckedIndexedAccess` (`m[1]` on a regex
    match), which `npm test` reported as 680/680 green. The two commands answer different questions:
    **run both, and do not report a suite as clean until `npm run typecheck` has also passed.**
+
+7. **A fixture's shape can come from git config, so a green suite on a dev box says nothing.**
+   `git init` in a test fixture inherits the machine's `init.defaultBranch`, so walkState's
+   throwaway repo was `main` locally and `master` on the CI runner. Its "origin/main becoming
+   unresolvable falls through to LOCAL main" test therefore had no local `main` to fall through
+   TO on CI, and asserted a refusal it never reached — passing locally, failing on the runner,
+   and testing nothing in either place. Fixed by pinning `git init -b main`. CI found this, not
+   the suite; the same class covers any fixture that reads ambient git or shell config.
 
 **The discipline that works:** sabotage the mechanism, `npx tsc --build --force`, run the full
 suite, and confirm the *predicted* test failed.
@@ -241,12 +249,6 @@ Each was raised, considered, and deferred. `docs/loop-seam.md` carries the reaso
    until that runs.
 3. **Delete this file when the branch merges**, as the top of it says.
 
-One trap CI found that §3 had not: `git init` in a test fixture inherits the machine's
-`init.defaultBranch`, so walkState's fixture was `main` locally and `master` on the runner — and the
-"falls through to LOCAL main" test asserted a refusal it was not reaching. Fixed by pinning
-`-b main`. The general form belongs with the other five: **a green suite on a dev box says nothing
-about a fixture whose shape comes from git config.**
-
 ## 7a. SETTLED EMPIRICALLY 2026-08-12 — the edge-order finding, and the fix is not the filed one
 
 Run live against a separate LaunchDarkly project (`abram-factory-testbed`, the owner's persistent
@@ -353,3 +355,50 @@ of the §6 narrowing in `PATCH_SITES`), and two lint tuning risks recorded in
 LaunchDarkly RBAC vocabulary (`role action`), so an honest future comment can trip it. That is the
 misfire class the test itself warns gets a lint deleted; if it happens, gate the term rather than
 deleting the check.
+
+## 7b. ADVERSARIAL REVIEW OF THE `main` MERGE, 2026-08-19 — nine findings, all fixed
+
+An independent adversarial review of the merge commit found nine defects. All are fixed; the four
+that changed behaviour are pinned by tests in `tests/walker.test.ts`
+("loop/metrics merge regressions"), each verified to FAIL against the pre-fix walker — five
+predicted failures, five observed, no others.
+
+The two worth knowing about as a reader, because both were WRONG CLAIMS made confidently:
+
+- **The taxonomy lint's first gate was too wide, and its own sabotage proof was worthless.** It
+  exempted a status numeral when `sentry|seer` appeared within 80 characters of it *anywhere in the
+  raw file*, so proximity bought the exemption and it leaked across paragraphs. The sentence
+  "Seer aside: LaunchDarkly's 403 on the release patch is deterministic and the manifest is held as
+  content" — a complete second copy of the taxonomy, attributed to LaunchDarkly — passed. The
+  sabotage that "verified" the gate had placed its numeral far from any Sentry word, so it tested
+  distance and reported it as attribution. Now per prose unit, exempt only when a foreign-API word
+  is STRICTLY CLOSER than any LaunchDarkly-subject word. **The lesson is §3's, one level up: a
+  sabotage proves what it actually varied, not what you meant it to vary.**
+- **`sentry_guardrail`'s stated reason for being in `ROUTING_TAGS` was false.** The handoff-verifier
+  scenario it cited cannot happen: the verifier reads `result.tags`, never `accumulatedTags`, and on
+  a self-loop the rewind re-overlays the source's own routing tags anyway. The classification is
+  right (check-configs 6c forces it); only the argument was wrong.
+
+Three accepted costs, recorded rather than closed, in the treatment §6 uses:
+
+1. **A CLI `--resume` emits NO graph-level metrics.** The metrics block is now gated on
+   `!anyReplayed`, because every quantity in it describes a whole walk: measured, one loop-exhausted
+   walk plus one resume produced two `trackInvocationSuccess` calls and a 10-entry path for 6 node
+   runs, with tokens from only the live tail. So a graph driven through `--resume` under-reports
+   invocations. The GitHub Action re-runs from scratch and is unaffected. Omitting a row beats
+   corrupting the aggregate.
+2. **A loop edge pointing elsewhere still stalls on a FAILED source.** The failure retry is
+   restricted to SELF-loops, where "run it again" needs no tag evidence. `code-reviewer →
+   flag-implementer` on a failed reviewer would hand the implementer a rework with no critique, so
+   that case still stalls; the fix there is a self-loop on the reviewer, which is a graph change.
+   `tests/walker.test.ts` pins the restriction so it cannot widen unnoticed.
+3. **A drifted taxonomy claim that names no LaunchDarkly-subject word at all, sitting next to a
+   Sentry word, still passes the lint.** Narrowing further means guessing at grammar, which the
+   NAMES rule's own history says not to do.
+
+Also fixed, without a behavioural test because they are prose or a one-line gate: the restored
+Beacon README sections (main's snapshot said "no retry queue" and omitted `BEACON_PENDING_FILE` and
+the Seer envs, contradicting the ledger the same file documents on line 27); the Seer revert context
+on the `already_running` re-attach (it named the evaluated manifest's variation and the current
+deploy's sha, when what is running is a sibling's earlier release — now repo-only, because an
+imprecise Seer search beats a confidently wrong one); and this file's own trap-7 placement.

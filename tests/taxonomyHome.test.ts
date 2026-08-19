@@ -356,22 +356,48 @@ describe("the taxonomy has exactly one home", () => {
     const VERDICT = /\b(held|content|transient|deterministic|per-flag|slot|reject\w*|classif\w*|throw\w*|refusals?)\b/i;
     // `non-404` is the fullstack readiness check's own vocabulary (a GitHub error that is not a 404),
     // unrelated to the patch taxonomy.
-    //
+    const strip = (s: string): string => s.replace(/non-404/g, "");
     // A status ATTRIBUTED TO ANOTHER API is the same class, and this is the misfire
     // docs/loopback-handoff.md §7a predicted for this lint: merging `main` brought Seer's
     // "A 403 on issue search is logged explicitly" into the beacon README (ADR 0014), which is
     // Sentry's status, not LaunchDarkly's. §7a names the right response — gate the term, do not
-    // delete the check — so attribution is windowed the way the NAMES rule windows its verdicts:
-    // "Sentry" or "Seer" within 80 characters means the numeral belongs to that API. A unit that
-    // mentions Sentry AND separately classifies an LD patch status still fails, because the
-    // window is per-numeral rather than per-unit.
-    const FOREIGN_API = /\b(sentry|seer)\b/i;
-    const strip = (s: string): string =>
-      s
-        .replace(/non-404/g, "")
-        .replace(/\b(403|404|405|408|409|429)\b/g, (match: string, _digits: string, at: number) =>
-          FOREIGN_API.test(s.slice(Math.max(0, at - 80), at + 80)) ? "" : match,
-        );
+    // delete the check.
+    //
+    // THE FIRST VERSION OF THIS GATE WAS TOO WIDE, and an adversarial review broke it: it asked
+    // whether `sentry|seer` appeared within 80 characters IN THE WHOLE RAW FILE, so proximity
+    // alone bought an exemption and the window leaked across paragraph boundaries in both
+    // directions. This sentence, placed beside the Seer paragraph, passed the check —
+    //
+    //   "Seer aside: LaunchDarkly's 403 on the release patch is deterministic and the manifest
+    //    is held as content."
+    //
+    // — a complete second copy of the taxonomy, explicitly attributed to LaunchDarkly. The
+    // sabotage that "verified" the old gate put its numeral far from any Sentry word, so it
+    // tested DISTANCE and reported it as attribution.
+    //
+    // So: per prose unit, and NEAREST ATTRIBUTION rather than mere presence. A numeral is exempt
+    // only when a foreign-API word is STRICTLY CLOSER to it than any LaunchDarkly-subject word in
+    // the same unit. Seer's line qualifies ("Seer entitlement" is adjacent, `flag:<flagKey>` is
+    // 120 characters away); the sabotage above does not ("LaunchDarkly's" is adjacent). A unit
+    // that discusses both now resolves per numeral instead of exempting the paragraph.
+    //
+    // Residual, recorded rather than tuned: a drifted claim that names no LD subject word at all
+    // AND sits next to a Sentry word still passes. Narrowing further means guessing at grammar,
+    // which is what the NAMES rule's history says not to do.
+    const FOREIGN_API = /\b(sentry|seer)\b/gi;
+    const LD_SUBJECT = /\b(launchdarkly|ld|flags?|manifests?|prerequisites?|releaseplan|fallthrough)\b/gi;
+    const nearestDistance = (re: RegExp, text: string, at: number): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (const m of text.matchAll(re)) {
+        if (m.index === undefined) continue;
+        best = Math.min(best, Math.abs(m.index - at));
+      }
+      return best;
+    };
+    const stripForeignStatuses = (unit: string): string =>
+      unit.replace(/\b(403|404|405|408|409|429)\b/g, (match: string, _digits: string, at: number) =>
+        nearestDistance(FOREIGN_API, unit, at) < nearestDistance(LD_SUBJECT, unit, at) ? "" : match,
+      );
     for (const rel of ["packages/beacon/README.md", "docs/loop-seam.md", "packages/beacon/src/server.ts"]) {
       const abs = resolve(repoRoot, rel);
       assert.ok(existsSync(abs), `${rel} is missing — if it moved, update this list rather than deleting the check`);
@@ -379,7 +405,7 @@ describe("the taxonomy has exactly one home", () => {
       assert.match(raw, /PATCH_FAILURE_TAXONOMY/, `${rel} must POINT at the one home`);
 
       for (const unit of proseUnits(rel, strip(raw))) {
-        const numeral = NUMERALS.exec(unit);
+        const numeral = NUMERALS.exec(stripForeignStatuses(unit));
         assert.equal(
           numeral,
           null,

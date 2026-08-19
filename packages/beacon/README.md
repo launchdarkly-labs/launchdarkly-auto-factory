@@ -187,9 +187,18 @@ Read from the repo `config/` dir + env:
   - `GITHUB_TOKEN` (required) — reads `.release-flags/` via the Contents API.
   - LD connection: `LD_API_KEY`, `LD_PROJECT_KEY` (the **app** project),
     `LD_BASE_URL` (optional), `LD_ENVIRONMENT_KEY` (default `production`).
-  - `BEACON_STATE_FILE` (default `beacon-state.json`).
+  - `BEACON_STATE_FILE` (default `beacon-state.json`) — the deploy-state store.
+  - `BEACON_PENDING_FILE` (default `beacon-pending.json`) — the re-evaluation ledger.
+    Mount persistent storage for BOTH if the host filesystem is ephemeral: on ENOENT they
+    start empty, which reads as "nothing is pending" rather than as "state was lost".
   - `BEACON_MONITOR` (`false` disables), `BEACON_MONITOR_POLL_MS` (default
     10000), `BEACON_MONITOR_TIMEOUT_MS` (default 24h).
+  - Seer Autofix on a revert (ADR 0014, off by default): `BEACON_SEER_AUTOFIX=true`,
+    `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT`, `SENTRY_API_BASE` (default
+    `https://sentry.io`), `BEACON_SEER_STOPPING_POINT` (default `open_pr`). Incomplete
+    Sentry settings log and skip; they never fail a release.
+  - `config/services.yaml` may mark a service `privateNetwork: true` — its readiness
+    check is skipped rather than read as a failed read.
 
 ## Deploying
 
@@ -211,9 +220,15 @@ currently-deployed SHA already contains the same `.release-flags/` file. If yes,
 both services have the code and the release triggers; if no, it waits for the
 other service's deploy notification to re-evaluate.
 
-> **No retry queue (prototype).** A "waiting" flag is released only when the OTHER
-> service's deploy notification arrives and re-evaluates. Beacon logs each waiting
-> outcome (`[beacon] WAITING: …`) with the flag, file, and service so a lost
-> notification is visible. **Manual re-trigger:** once both services are deployed,
-> re-POST `/flag-releases` for the service (same `sha`/`service`) to re-run discovery
-> and release the now-ready flag — the state store re-resolves the same diff range.
+> **The ledger is the retry queue.** This paragraph used to say there wasn't one, and that
+> a `waiting` flag was released ONLY when the other service's own notification arrived. That
+> is no longer true: `waiting` is one of the ledger's re-checked outcomes (with `held`,
+> `error` and `already_running`), so ANY later deploy notification for the service re-evaluates
+> it — the other side's deploy is the common trigger, not the only one. Beacon still logs each
+> waiting outcome (`[beacon] WAITING: …`) with the flag, file and service, so a lost
+> notification is visible.
+>
+> What the ledger does NOT add is a timer: it is webhook-gated by decision, so with no deploys
+> arriving at all nothing re-checks. **Manual re-trigger** therefore still works and is still
+> the way out of that case: re-POST `/flag-releases` for the service (same `sha`/`service`) to
+> re-run discovery — the state store re-resolves the same diff range.

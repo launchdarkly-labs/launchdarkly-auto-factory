@@ -74699,12 +74699,7 @@ var ROUTING_TAGS = /* @__PURE__ */ new Set([
   "review_approved",
   "risk_level",
   "risk_score",
-  // Arrived with the Sentry guardrail work (ADR 0014) on `main`, which had no loop to
-  // rewind for. It belongs here rather than in FACT_TAGS: it is the metrics-author's
-  // CLAIM about the pass it just made, and that node carries the judge-driven self-loop.
-  // Left un-rewound, iteration 1's `true` would make the handoff verifier check
-  // `launchdarklyContext` for an iteration that attached no Sentry-backed metric — a
-  // stale claim verified as a fresh one.
+  // See the note above this Set for why (ADR 0014).
   "sentry_guardrail"
 ]);
 var FACT_TAGS = /* @__PURE__ */ new Set([
@@ -74954,6 +74949,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
   const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
   let totalRuns = 0;
   const startMs = Date.now();
+  let anyReplayed = false;
   const totalTokens = { total: 0, input: 0, output: 0 };
   let node = graphDef.rootNode();
   let inboundHandoff;
@@ -74968,6 +74964,8 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     const key = node.getKey();
     const replayEntry = runs.length < journal.length ? journal[runs.length] : void 0;
     const replaying = replayEntry !== void 0;
+    if (replaying)
+      anyReplayed = true;
     if (!replaying && gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
       pendingApproval = { node: key };
       onEvent?.({ type: "awaiting-approval", node: key });
@@ -75102,6 +75100,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let next = null;
     let nextHandoff;
     let nextIsLoopEdge = false;
+    let nextIsFailureRetry = false;
     let nextJudgeThreshold;
     const runsConsumed = runs.length;
     const budgetBlocked = [];
@@ -75111,21 +75110,24 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const isLoop = handoffNumber(h6, "max_visits") !== void 0;
       warnIfMalformedNumericHandoff(key, edge.key, h6, malformedHandoffWarned);
       const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
-      const require2 = handoffTags(h6, "require_tags");
-      if (require2 && !tagsMatch(matchAgainst, require2)) {
-        warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require2, accumulatedTags, matchAgainst);
-        continue;
-      }
-      const skip = handoffTags(h6, "skip_if_tags");
-      if (skip && tagsMatch(matchAgainst, skip))
-        continue;
-      const below = handoffNumber(h6, "loop_if_judge_below");
-      if (below !== void 0) {
-        const score = routingJudgeScore(run.judgeScores);
-        if (score === void 0 || score >= below)
-          continue;
-      }
       const rawMax = handoffNumber(h6, "max_visits");
+      const retryAfterFailure = result.status === "failed" && rawMax !== void 0 && edge.key === key;
+      if (!retryAfterFailure) {
+        const require2 = handoffTags(h6, "require_tags");
+        if (require2 && !tagsMatch(matchAgainst, require2)) {
+          warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require2, accumulatedTags, matchAgainst);
+          continue;
+        }
+        const skip = handoffTags(h6, "skip_if_tags");
+        if (skip && tagsMatch(matchAgainst, skip))
+          continue;
+        const below = handoffNumber(h6, "loop_if_judge_below");
+        if (below !== void 0) {
+          const score = routingJudgeScore(run.judgeScores);
+          if (score === void 0 || score >= below)
+            continue;
+        }
+      }
       if (rawMax !== void 0) {
         const ek = `${key}\u2192${edge.key}`;
         const grant = grantedVisits(resume?.grants, ek, runsConsumed);
@@ -75153,6 +75155,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       nextHandoff = h6;
       nextIsLoopEdge = rawMax !== void 0;
       nextJudgeThreshold = handoffNumber(h6, "loop_if_judge_below");
+      nextIsFailureRetry = retryAfterFailure;
       break;
     }
     if (!next) {
@@ -75186,8 +75189,9 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         onEvent?.({ type: "loop-exhausted", info: loopExhausted });
       } else if (unmet.length > 0) {
         stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
-        for (const u of unmet)
-          graphTracker?.trackHandoffFailure(key, u.target);
+        if (!replaying)
+          for (const u of unmet)
+            graphTracker?.trackHandoffFailure(key, u.target);
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
     }
@@ -75211,8 +75215,10 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       }
       const ek = `${key}\u2192${next}`;
       edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
-      const unemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
-      exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+      const unemitted = nextIsFailureRetry ? [] : unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      if (!nextIsFailureRetry) {
+        exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+      }
       if (unemitted.length > 0 && !exitWarned.has(ek)) {
         exitWarned.add(ek);
         console.warn(`[loop] ${key} \u2192 ${next}: iteration taken while its exit named routing tag(s) ${unemitted.join(", ")}, which '${key}' did not emit this pass. If it never emits them, this loop can only end by exhausting its budget.`);
@@ -75220,7 +75226,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
       pendingLoopTrigger = {
         source: key,
-        reason: judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+        reason: nextIsFailureRetry ? "the previous attempt FAILED (infrastructure or API error, not a quality verdict) \u2014 retrying" : judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
         ...nextJudgeThreshold !== void 0 && run.judgeReasoning ? { detail: run.judgeReasoning } : {}
       };
     }
@@ -75248,13 +75254,13 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     };
     onEvent?.({ type: "replay-diverged", info: replayDiverged });
   }
-  if (graphTracker && !pendingApproval && runs.length > 0) {
+  if (graphTracker && !pendingApproval && !anyReplayed && runs.length > 0) {
     try {
       graphTracker.trackPath(runs.map((r6) => r6.configKey));
       graphTracker.trackDuration(Date.now() - startMs);
       if (totalTokens.total > 0)
         graphTracker.trackTotalTokens(totalTokens);
-      const clean = !stalledAt && !verificationFailed && !replayDiverged && runs.every((r6) => r6.status === "completed");
+      const clean = !stalledAt && !verificationFailed && !replayDiverged && !loopExhausted && runs.every((r6) => r6.status === "completed");
       if (clean)
         graphTracker.trackInvocationSuccess();
       else

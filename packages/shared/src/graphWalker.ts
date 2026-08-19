@@ -66,6 +66,21 @@ export function declaredMaxVisits(graphDef: AgentGraphDefinition, edgeKey: strin
  * a node, so a re-run starts from the routing state that preceded the target's
  * last run rather than inheriting stale downstream decisions. Mirrors tags.json
  * `production: "llm"`. A check-configs case asserts this stays in sync.
+ *
+ * KEEP QUOTED LOWERCASE STRINGS OUT OF THE SET BODY BELOW, comments included: check-configs
+ * parses the members with a regex over the literal, so a comment quoting a tag class read as a
+ * member and failed the build with `ROUTING_TAGS has 'llm'`. That is the cost of a source-text
+ * lint, and the reason the prose about individual members lives up here.
+ *
+ * `sentry_guardrail` arrived with the Sentry guardrail work (ADR 0014) on `main`, which had no
+ * loop to rewind for. It belongs in this class because it is LLM-produced and is the
+ * metrics-author's claim about the pass it just made, not a durable fact about a created
+ * resource. An earlier note here justified it instead with a handoff-verifier scenario — a stale
+ * `true` verified as fresh on iteration 2 — and that scenario is FALSE twice over: the verifier
+ * is called with `result.tags`, the just-completed run's own tags, so nothing left in
+ * `accumulatedTags` can reach it whatever its class; and on the metrics-author SELF-loop the
+ * rewind re-overlays the source's own routing tags afterwards, so the value survives regardless.
+ * The classification is right; the argument for it was not.
  */
 const ROUTING_TAGS = new Set<string>([
   "skip_flagging",
@@ -75,12 +90,7 @@ const ROUTING_TAGS = new Set<string>([
   "review_approved",
   "risk_level",
   "risk_score",
-  // Arrived with the Sentry guardrail work (ADR 0014) on `main`, which had no loop to
-  // rewind for. It belongs here rather than in FACT_TAGS: it is the metrics-author's
-  // CLAIM about the pass it just made, and that node carries the judge-driven self-loop.
-  // Left un-rewound, iteration 1's `true` would make the handoff verifier check
-  // `launchdarklyContext` for an iteration that attached no Sentry-backed metric — a
-  // stale claim verified as a fresh one.
+  // See the note above this Set for why (ADR 0014).
   "sentry_guardrail",
 ]);
 
@@ -1003,6 +1013,9 @@ export async function walkGraph(
   const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
   let totalRuns = 0;
   const startMs = Date.now();
+  // Did ANY node come from the journal rather than run here? Gates the graph-level metrics
+  // below, which describe a whole walk and cannot describe half of one.
+  let anyReplayed = false;
   // Aggregate token usage across the whole walk, summed from each node
   // tracker's summary after its run (the runner records tokens on the tracker).
   const totalTokens: LDTokenUsage = { total: 0, input: 0, output: 0 };
@@ -1027,6 +1040,7 @@ export async function walkGraph(
     // ran before.
     const replayEntry = runs.length < journal.length ? journal[runs.length] : undefined;
     const replaying = replayEntry !== undefined;
+    if (replaying) anyReplayed = true;
 
     // Approval gate: before running a gated node, ask the controller — passing
     // the tags accumulated so far, so risk-conditional gates can consult the
@@ -1259,6 +1273,10 @@ export async function walkGraph(
     let next: string | null = null;
     let nextHandoff: Record<string, unknown> | undefined;
     let nextIsLoopEdge = false;
+    // Set when this edge was taken because the source run FAILED rather than because a
+    // condition matched — the trigger message and the exit-tag bookkeeping both need to know,
+    // since neither has any tag evidence to describe.
+    let nextIsFailureRetry = false;
     // The judge threshold the taken loop edge fired on, for the trigger message.
     let nextJudgeThreshold: number | undefined;
     // Runs recorded so far. Both the frontier test and each grant's effective point are
@@ -1300,22 +1318,46 @@ export async function walkGraph(
       // tags are exempt: they're never rewound and legitimately come from upstream
       // nodes, so a loop edge may still gate on e.g. flag_ready.
       const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
-      const require = handoffTags(h, "require_tags");
-      if (require && !tagsMatch(matchAgainst, require)) {
-        warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require, accumulatedTags, matchAgainst);
-        continue;
-      }
-      const skip = handoffTags(h, "skip_if_tags");
-      if (skip && tagsMatch(matchAgainst, skip)) continue;
-      // Quality gate: take this edge only when the just-completed node scored BELOW
-      // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
-      // not taken (an unsampled or broken judge must never trigger rework).
-      const below = handoffNumber(h, "loop_if_judge_below");
-      if (below !== undefined) {
-        const score = routingJudgeScore(run.judgeScores);
-        if (score === undefined || score >= below) continue;
-      }
       const rawMax = handoffNumber(h, "max_visits");
+      // RETRY AFTER A FAILED RUN, and it is a SELF-loop only.
+      //
+      // A failed run emits NO tags (its output is an error string), so every tag condition on
+      // every outgoing edge is unmet and every judge condition fails open. Before this, one
+      // transient API failure on a loop-carrying node therefore STALLED the walk with its retry
+      // budget completely unspent — the loop that exists to buy another attempt could not buy
+      // one, because the evidence it routes on is exactly what a failure destroys. Reproduced
+      // against the committed graph's shape: metrics-author failing once ended the walk at a
+      // stall, where the same graph pre-loop recovered on the next iteration.
+      //
+      // Restricted to `edge.key === key` deliberately. A self-loop needs no tag evidence to
+      // justify it — "run it again" is the whole meaning of the edge. A loop edge pointing
+      // ELSEWHERE does: code-reviewer → flag-implementer means "rework this, here is the
+      // critique", and firing it on a reviewer that never produced a critique would send the
+      // implementer back to work with no findings and burn a real iteration on it. That case
+      // still stalls, which is the honest outcome — the fix there is a self-loop on the
+      // reviewer, a graph change, not a walker guess.
+      //
+      // The budget is NOT bypassed: the max_visits block below runs unchanged, so retries are
+      // bounded by the same per-edge budget and grants, and a spent budget now reports
+      // loopExhausted (recorded as an invocation FAILURE) instead of a stall.
+      const retryAfterFailure = result.status === "failed" && rawMax !== undefined && edge.key === key;
+      if (!retryAfterFailure) {
+        const require = handoffTags(h, "require_tags");
+        if (require && !tagsMatch(matchAgainst, require)) {
+          warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require, accumulatedTags, matchAgainst);
+          continue;
+        }
+        const skip = handoffTags(h, "skip_if_tags");
+        if (skip && tagsMatch(matchAgainst, skip)) continue;
+        // Quality gate: take this edge only when the just-completed node scored BELOW
+        // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
+        // not taken (an unsampled or broken judge must never trigger rework).
+        const below = handoffNumber(h, "loop_if_judge_below");
+        if (below !== undefined) {
+          const score = routingJudgeScore(run.judgeScores);
+          if (score === undefined || score >= below) continue;
+        }
+      }
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
         // Sum only the grants that were in force at THIS point of the walk. Replay then
@@ -1357,6 +1399,7 @@ export async function walkGraph(
       nextHandoff = h;
       nextIsLoopEdge = rawMax !== undefined;
       nextJudgeThreshold = handoffNumber(h, "loop_if_judge_below");
+      nextIsFailureRetry = retryAfterFailure;
       break;
     }
 
@@ -1401,7 +1444,13 @@ export async function walkGraph(
         // Record each blocked edge as a failed handoff (the counterpart of the
         // trackHandoffSuccess fired when an edge IS taken). Intentional
         // skip_if short-circuits were filtered out above and are not failures.
-        for (const u of unmet) graphTracker?.trackHandoffFailure(key, u.target);
+        //
+        // `!replaying` for the SAME reason the success side carries it, which this line was
+        // missing: a replayed node's edges were already decided and recorded by the original
+        // walk, so re-recording them double-counts. It mattered more here than on the success
+        // side — a replay against a changed graph stalls at a replayed node, which is a
+        // divergence to report, not a handoff that failed on this walk.
+        if (!replaying) for (const u of unmet) graphTracker?.trackHandoffFailure(key, u.target);
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
     }
@@ -1438,10 +1487,20 @@ export async function walkGraph(
       // conditional ("if it never emits") rather than the categorical "can never exit",
       // because a tag emitted only on affirmative passes is legitimate — the definitive
       // version is asserted at exhaustion, where "never" is a record and not a prediction.
-      const unemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      //
+      // A FAILURE RETRY is exempt from all of it. A failed run emits no tags, so every exit tag
+      // reads as "unemitted" — which would let one infra failure prove the categorical "this
+      // exit was never satisfiable" claim at exhaustion, about an exit that was never tested.
+      // The claim must rest on passes that actually ran.
+      const unemitted = nextIsFailureRetry
+        ? []
+        : unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
       // AND across traversals: true only if EVERY pass took this edge with its exit tag
-      // unemitted. That turns "never" into a record by the time the budget runs out.
-      exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+      // unemitted. That turns "never" into a record by the time the budget runs out. A failure
+      // retry neither sets nor clears it — it is not evidence either way.
+      if (!nextIsFailureRetry) {
+        exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+      }
       if (unemitted.length > 0 && !exitWarned.has(ek)) {
         exitWarned.add(ek);
         console.warn(
@@ -1453,7 +1512,9 @@ export async function walkGraph(
       const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
       pendingLoopTrigger = {
         source: key,
-        reason: judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+        reason: nextIsFailureRetry
+          ? "the previous attempt FAILED (infrastructure or API error, not a quality verdict) — retrying"
+          : judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
         ...(nextJudgeThreshold !== undefined && run.judgeReasoning ? { detail: run.judgeReasoning } : {}),
       };
     }
@@ -1502,7 +1563,24 @@ export async function walkGraph(
   // fresh tracker (fresh runId) and reports the complete run. Likewise skip
   // when nothing ran (e.g. a disabled graph): there is no invocation to score.
   // Defensive try/catch: metric emission must never fail the walk.
-  if (graphTracker && !pendingApproval && runs.length > 0) {
+  //
+  // `!anyReplayed` is the third condition, and it is the one that arrived with the loop
+  // machinery rather than with these metrics. Every quantity here describes A WALK, and on a
+  // resume only part of the walk happened in this process: `trackDuration` would time the tail
+  // while `trackPath` reported the whole chain, `trackTotalTokens` would count only the live
+  // runs (replayed nodes get no tracker), and the invocation verdict would be the SECOND one
+  // emitted for one logical run — the original walk already emitted its own before it halted.
+  // Measured, not feared: a loop-exhausted walk plus one `--resume` produced two
+  // trackInvocationSuccess calls and a 10-entry path for 6 node runs.
+  //
+  // So a replaying walk emits nothing graph-level, the same treatment a pause gets, and for the
+  // same reason: it is not a whole invocation. The cost is real and worth stating — a CLI
+  // `--resume` that finishes the work contributes no graph-level metrics, so a graph routinely
+  // driven through --resume under-reports invocations. The GitHub Action front end re-runs from
+  // scratch (no journal), so it is unaffected. Double-counting one PR as two invocations, and
+  // attributing the whole path's tokens to its tail, is the worse error: it corrupts the
+  // aggregate for every consumer rather than omitting one row.
+  if (graphTracker && !pendingApproval && !anyReplayed && runs.length > 0) {
     try {
       graphTracker.trackPath(runs.map((r) => r.configKey));
       graphTracker.trackDuration(Date.now() - startMs);
@@ -1515,15 +1593,24 @@ export async function walkGraph(
       // `replayDiverged` joins that list because a divergent replay is not an
       // invocation at all: the walk is abandoned fail-closed and a fresh run is
       // required, so scoring it as a success would count one PR's machinery twice
-      // and score the abandoned half clean.
+      // and score the abandoned half clean. (Belt and braces now that the block is
+      // gated on `!anyReplayed` — a divergence always involves a replayed run.)
       //
-      // `loopExhausted` deliberately does NOT: exhausting a bounded retry budget is
-      // the loop working as specified — the cap fired — and the run's quality verdict
-      // is carried by tags and judge scores, exactly as a reviewer REJECT is. Folding
-      // it in here would make every graph that uses its full budget report the
-      // machinery as broken.
+      // `loopExhausted` JOINS THE LIST TOO, and an earlier version of this comment argued the
+      // opposite — that a spent budget is "the loop working as specified". That defends
+      // `loopBudgetSpent`, which is ADVISORY and fires while the walk continues past an
+      // advisory loop. This is the TERMINAL case: a loop edge passed its conditions, had no
+      // budget left, and the walk ended there with downstream nodes never run.
+      // `LoopExhaustedInfo`'s own docstring, twenty lines up, says the caller must NOT report
+      // it as a clean success, and for `reason: "run-cap"` — the backstop against an untagged
+      // or dashboard-corrupted cycle — reporting success would put a graph that cannot
+      // terminate at a 100% invocation success rate.
       const clean =
-        !stalledAt && !verificationFailed && !replayDiverged && runs.every((r) => r.status === "completed");
+        !stalledAt &&
+        !verificationFailed &&
+        !replayDiverged &&
+        !loopExhausted &&
+        runs.every((r) => r.status === "completed");
       if (clean) graphTracker.trackInvocationSuccess();
       else graphTracker.trackInvocationFailure();
     } catch (e) {
