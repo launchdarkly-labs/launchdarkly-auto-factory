@@ -75103,6 +75103,10 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let nextIsFailureRetry = false;
     let nextJudgeThreshold;
     const runsConsumed = runs.length;
+    const loopBudgetFor = (ek, rawMax) => ({
+      traversals: edgeCounts.get(ek) ?? 0,
+      maxVisits: Math.min(Math.max(1, Math.floor(rawMax)) + grantedVisits(resume?.grants, ek, runsConsumed), MAX_VISITS_HARD_CAP)
+    });
     const budgetBlocked = [];
     recordShadowedLoopEdges(key, node, loopEdgeShadowed, shadowWarned);
     for (const edge of node.getEdges()) {
@@ -75110,29 +75114,24 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       const isLoop = handoffNumber(h6, "max_visits") !== void 0;
       warnIfMalformedNumericHandoff(key, edge.key, h6, malformedHandoffWarned);
       const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
-      const rawMax = handoffNumber(h6, "max_visits");
-      const retryAfterFailure = result.status === "failed" && rawMax !== void 0 && edge.key === key;
-      if (!retryAfterFailure) {
-        const require2 = handoffTags(h6, "require_tags");
-        if (require2 && !tagsMatch(matchAgainst, require2)) {
-          warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require2, accumulatedTags, matchAgainst);
-          continue;
-        }
-        const skip = handoffTags(h6, "skip_if_tags");
-        if (skip && tagsMatch(matchAgainst, skip))
-          continue;
-        const below = handoffNumber(h6, "loop_if_judge_below");
-        if (below !== void 0) {
-          const score = routingJudgeScore(run.judgeScores);
-          if (score === void 0 || score >= below)
-            continue;
-        }
+      const require2 = handoffTags(h6, "require_tags");
+      if (require2 && !tagsMatch(matchAgainst, require2)) {
+        warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require2, accumulatedTags, matchAgainst);
+        continue;
       }
+      const skip = handoffTags(h6, "skip_if_tags");
+      if (skip && tagsMatch(matchAgainst, skip))
+        continue;
+      const below = handoffNumber(h6, "loop_if_judge_below");
+      if (below !== void 0) {
+        const score = routingJudgeScore(run.judgeScores);
+        if (score === void 0 || score >= below)
+          continue;
+      }
+      const rawMax = handoffNumber(h6, "max_visits");
       if (rawMax !== void 0) {
         const ek = `${key}\u2192${edge.key}`;
-        const grant = grantedVisits(resume?.grants, ek, runsConsumed);
-        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
-        const traversals = edgeCounts.get(ek) ?? 0;
+        const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);
         if (traversals >= maxVisits) {
           const trig = describeJudgeCondition(h6, run.judgeScores) ?? describeLoopCondition(h6);
           const spent = {
@@ -75155,8 +75154,31 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
       nextHandoff = h6;
       nextIsLoopEdge = rawMax !== void 0;
       nextJudgeThreshold = handoffNumber(h6, "loop_if_judge_below");
-      nextIsFailureRetry = retryAfterFailure;
       break;
+    }
+    if (!next && result.status === "failed") {
+      for (const edge of node.getEdges()) {
+        if (edge.key !== key)
+          continue;
+        const rawMax = handoffNumber(edge.handoff, "max_visits");
+        if (rawMax === void 0)
+          continue;
+        const ek = `${key}\u2192${edge.key}`;
+        const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);
+        const trigger2 = "the previous attempt failed and its retry budget is spent";
+        if (traversals >= maxVisits) {
+          const spent = { source: key, target: edge.key, traversals, maxVisits, trigger: trigger2 };
+          budgetBlocked.push(spent);
+          budgetSpent.set(ek, spent);
+          continue;
+        }
+        console.warn(`[loop] ${key} FAILED (infrastructure or API error) \u2014 retrying via its self-loop (${traversals + 1} of ${maxVisits}). No judge score is involved.`);
+        next = edge.key;
+        nextHandoff = edge.handoff;
+        nextIsLoopEdge = true;
+        nextIsFailureRetry = true;
+        break;
+      }
     }
     if (!next) {
       const edges = node.getEdges();

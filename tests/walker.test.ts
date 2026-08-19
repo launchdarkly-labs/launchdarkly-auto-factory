@@ -1565,6 +1565,21 @@ describe("walkGraph — loop/metrics merge regressions", () => {
     assert.equal(r.loopExhausted?.exhausted[0]?.source, "metrics");
   });
 
+  it("a run that FAILED but still emitted the forward tag proceeds — it is not re-run", async () => {
+    // The real runners return `tags: {...executor.tags}` on the failure path too, so a node that
+    // fails LATE carries the tags its tool calls already produced. On the committed graph the
+    // self-loop is declared BEFORE the forward edge (the ordering invariant requires it), so a
+    // retry that outranks edge selection would re-run a node whose work was done and whose
+    // forward path was open — burning the budget and re-entering a node for nothing.
+    const runner = new ScriptedRunner({
+      metrics: { status: "failed", tags: { needs_tests: "true" } },
+    });
+    const r = await walkGraph(graphFrom(selfLoopGraph(1)), runner, { PR_NUMBER: "1" });
+    assert.equal(countOf(r, "metrics"), 1, "not re-run: the forward edge's condition was satisfied");
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["research", "metrics", "test"]);
+    assert.equal(r.loopExhausted, undefined);
+  });
+
   it("a loop edge pointing ELSEWHERE does not fire on a failure (no critique to hand back)", async () => {
     // review → flag on a rejected review: firing this on a FAILED reviewer would send the
     // implementer back to work with no findings. A stall is the honest outcome.

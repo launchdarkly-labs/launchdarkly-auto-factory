@@ -1283,6 +1283,19 @@ export async function walkGraph(
     // expressed against this — see LoopGrant.effectiveAfterRuns for why it is entries
     // CONSUMED rather than an entry index.
     const runsConsumed = runs.length;
+    // THE budget rule, read by both selection passes below (conditions, then failure-retry).
+    // Extracted rather than restated: two copies of "floor(max_visits) + grants, capped" is
+    // exactly how a granted traversal becomes reachable in one pass and blocked in the other,
+    // which the grant-POSITION history in `ResumeInput` says is the bug that took longest to
+    // find. Sums only the grants in force at THIS point of the walk, so a replay re-derives
+    // the original decisions with no premise about the graph's shape.
+    const loopBudgetFor = (ek: string, rawMax: number): { traversals: number; maxVisits: number } => ({
+      traversals: edgeCounts.get(ek) ?? 0,
+      maxVisits: Math.min(
+        Math.max(1, Math.floor(rawMax)) + grantedVisits(resume?.grants, ek, runsConsumed),
+        MAX_VISITS_HARD_CAP,
+      ),
+    });
     const budgetBlocked: LoopExhaustedInfo["exhausted"] = [];
     // The SERVED counterpart of check-configs 6e (see LOOP_EDGE_SHADOWED_RULE): a loop
     // edge declared after a non-loop edge from the same source may never be reached,
@@ -1318,54 +1331,25 @@ export async function walkGraph(
       // tags are exempt: they're never rewound and legitimately come from upstream
       // nodes, so a loop edge may still gate on e.g. flag_ready.
       const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
-      const rawMax = handoffNumber(h, "max_visits");
-      // RETRY AFTER A FAILED RUN, and it is a SELF-loop only.
-      //
-      // A failed run emits NO tags (its output is an error string), so every tag condition on
-      // every outgoing edge is unmet and every judge condition fails open. Before this, one
-      // transient API failure on a loop-carrying node therefore STALLED the walk with its retry
-      // budget completely unspent — the loop that exists to buy another attempt could not buy
-      // one, because the evidence it routes on is exactly what a failure destroys. Reproduced
-      // against the committed graph's shape: metrics-author failing once ended the walk at a
-      // stall, where the same graph pre-loop recovered on the next iteration.
-      //
-      // Restricted to `edge.key === key` deliberately. A self-loop needs no tag evidence to
-      // justify it — "run it again" is the whole meaning of the edge. A loop edge pointing
-      // ELSEWHERE does: code-reviewer → flag-implementer means "rework this, here is the
-      // critique", and firing it on a reviewer that never produced a critique would send the
-      // implementer back to work with no findings and burn a real iteration on it. That case
-      // still stalls, which is the honest outcome — the fix there is a self-loop on the
-      // reviewer, a graph change, not a walker guess.
-      //
-      // The budget is NOT bypassed: the max_visits block below runs unchanged, so retries are
-      // bounded by the same per-edge budget and grants, and a spent budget now reports
-      // loopExhausted (recorded as an invocation FAILURE) instead of a stall.
-      const retryAfterFailure = result.status === "failed" && rawMax !== undefined && edge.key === key;
-      if (!retryAfterFailure) {
-        const require = handoffTags(h, "require_tags");
-        if (require && !tagsMatch(matchAgainst, require)) {
-          warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require, accumulatedTags, matchAgainst);
-          continue;
-        }
-        const skip = handoffTags(h, "skip_if_tags");
-        if (skip && tagsMatch(matchAgainst, skip)) continue;
-        // Quality gate: take this edge only when the just-completed node scored BELOW
-        // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
-        // not taken (an unsampled or broken judge must never trigger rework).
-        const below = handoffNumber(h, "loop_if_judge_below");
-        if (below !== undefined) {
-          const score = routingJudgeScore(run.judgeScores);
-          if (score === undefined || score >= below) continue;
-        }
+      const require = handoffTags(h, "require_tags");
+      if (require && !tagsMatch(matchAgainst, require)) {
+        warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require, accumulatedTags, matchAgainst);
+        continue;
       }
+      const skip = handoffTags(h, "skip_if_tags");
+      if (skip && tagsMatch(matchAgainst, skip)) continue;
+      // Quality gate: take this edge only when the just-completed node scored BELOW
+      // the threshold. FAIL-OPEN — no usable score means no signal, so the edge is
+      // not taken (an unsampled or broken judge must never trigger rework).
+      const below = handoffNumber(h, "loop_if_judge_below");
+      if (below !== undefined) {
+        const score = routingJudgeScore(run.judgeScores);
+        if (score === undefined || score >= below) continue;
+      }
+      const rawMax = handoffNumber(h, "max_visits");
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
-        // Sum only the grants that were in force at THIS point of the walk. Replay then
-        // re-derives the original budget decisions exactly, with no premise about the
-        // graph's shape — which is what the previous two shapes got wrong.
-        const grant = grantedVisits(resume?.grants, ek, runsConsumed);
-        const maxVisits = Math.min(Math.max(1, Math.floor(rawMax)) + grant, MAX_VISITS_HARD_CAP);
-        const traversals = edgeCounts.get(ek) ?? 0;
+        const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);
         if (traversals >= maxVisits) {
           const trig = describeJudgeCondition(h, run.judgeScores) ?? describeLoopCondition(h);
           const spent = {
@@ -1399,8 +1383,62 @@ export async function walkGraph(
       nextHandoff = h;
       nextIsLoopEdge = rawMax !== undefined;
       nextJudgeThreshold = handoffNumber(h, "loop_if_judge_below");
-      nextIsFailureRetry = retryAfterFailure;
       break;
+    }
+
+    // RETRY A FAILED RUN — and this is a SECOND PASS, which is the whole point.
+    //
+    // A run that fails emits an error string as its output, and its tag conditions and judge
+    // score are usually absent, so nothing routes: one transient API error on a loop-carrying
+    // node STALLED the walk with its retry budget completely unspent, where the same graph
+    // pre-loop recovered on the next iteration. The loop that exists to buy another attempt
+    // could not buy one, because a failure destroys exactly the evidence it routes on.
+    //
+    // WHY A SECOND PASS, and the first implementation got this wrong: expressed inside the
+    // selection loop as a condition-bypass, the retry OUTRANKS every other edge — and on the
+    // committed graph the self-loop is declared BEFORE the forward edge, because the ordering
+    // invariant requires it. The runners return `tags: {...executor.tags}` on the failure path
+    // too, so a node that fails LATE still carries the tags its tool calls produced; that node's
+    // forward path is open and its work is done, and the bypass re-ran it anyway. Asking only
+    // "did anything else route?" cannot be done from inside the loop that decides it — the same
+    // shape as the shadowed-loop detection in §7a.1 of the handoff notes, which had to become a
+    // separate pass for the same reason.
+    //
+    // SELF-loops only (`edge.key === key`). "Run it again" needs no tag evidence to justify it.
+    // A loop edge pointing ELSEWHERE does: code-reviewer → flag-implementer means "rework this,
+    // here is the critique", and firing it for a reviewer that produced no critique would send
+    // the implementer back to work with no findings. That case still stalls, which is honest —
+    // the fix there is a self-loop on the reviewer, a graph change, not a walker guess.
+    //
+    // Budget: the SAME per-edge budget and grants as any other traversal (`loopBudgetFor`), so
+    // retries are bounded, and a spent budget records `budgetBlocked` here so the walk reports
+    // loopExhausted — an invocation FAILURE — rather than a stall. Note the shared budget is a
+    // real coupling worth knowing: on `max_visits: 1`, one infra failure consumes the pass a
+    // later low judge score would have used.
+    if (!next && result.status === "failed") {
+      for (const edge of node.getEdges()) {
+        if (edge.key !== key) continue;
+        const rawMax = handoffNumber(edge.handoff, "max_visits");
+        if (rawMax === undefined) continue;
+        const ek = `${key}→${edge.key}`;
+        const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);
+        const trigger = "the previous attempt failed and its retry budget is spent";
+        if (traversals >= maxVisits) {
+          const spent = { source: key, target: edge.key, traversals, maxVisits, trigger };
+          budgetBlocked.push(spent);
+          budgetSpent.set(ek, spent);
+          continue;
+        }
+        console.warn(
+          `[loop] ${key} FAILED (infrastructure or API error) — retrying via its self-loop ` +
+            `(${traversals + 1} of ${maxVisits}). No judge score is involved.`,
+        );
+        next = edge.key;
+        nextHandoff = edge.handoff;
+        nextIsLoopEdge = true;
+        nextIsFailureRetry = true;
+        break;
+      }
     }
 
     // No edge taken: distinguish a loop that exhausted its budget (a loop edge

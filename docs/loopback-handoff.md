@@ -392,6 +392,20 @@ Three accepted costs, recorded rather than closed, in the treatment §6 uses:
    flag-implementer` on a failed reviewer would hand the implementer a rework with no critique, so
    that case still stalls; the fix there is a self-loop on the reviewer, which is a graph change.
    `tests/walker.test.ts` pins the restriction so it cannot widen unnoticed.
+
+   **AND ITS FIRST IMPLEMENTATION WAS WRONG, which is the trap worth keeping.** Written as a
+   condition-bypass INSIDE the edge-selection loop, the retry outranked every other edge — and the
+   ordering invariant puts the self-loop BEFORE the forward edge, so it always won. The premise
+   stated in its comment, "a failed run emits no tags", is false: every runner returns
+   `tags: {...executor.tags}` on the failure path too, so a node that fails LATE carries the tags
+   its tool calls already produced, its forward path is open, and it was re-run anyway. Asking "did
+   anything else route?" cannot be answered from inside the loop that decides it — the SAME shape
+   as the shadowed-loop detection in §7a.1, which had to become a separate pass for the same
+   reason. It is now a second pass, and a test pins the late-failure case.
+
+   One coupling that follows and is not a defect: failure retries and quality retries share one
+   per-edge budget, so on `max_visits: 1` an infra failure consumes the pass a later low judge
+   score would have used.
 3. **A drifted taxonomy claim that names no LaunchDarkly-subject word at all, sitting next to a
    Sentry word, still passes the lint.** Narrowing further means guessing at grammar, which the
    NAMES rule's own history says not to do.
