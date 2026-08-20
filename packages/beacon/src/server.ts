@@ -635,10 +635,21 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         //    entry is non-final in the ledger) and by then the releases listing says what actually
         //    happened, so the deferred sibling loses one deploy rather than its release.
         //  - PRE-WRITE throws from `triggerRelease` itself, which carry no status at all: no
-        //    true/false pair on a boolean flag, no vN lineage on a flag whose manifest named no
-        //    target, no resolvable served variation, or a failed `getFlag` read. Every sibling
-        //    manifest for that flag hits the same throw on the same read, so none of them could have
-        //    released and the claim costs nobody anything.
+        //    true/false pair on a boolean flag, no resolvable served variation, or a failed `getFlag`
+        //    read. These are properties of the FLAG, so every sibling manifest for it hits the same
+        //    throw on the same read; none of them could have released, and the claim costs nobody
+        //    anything.
+        //
+        //    THE LIST USED TO INCLUDE A FOURTH — "no vN lineage on a flag whose manifest named no
+        //    target" — and the shared-fate argument was false for it. That branch is reached only
+        //    when a manifest names NO target, so a sibling naming an existing variation resolved
+        //    normally and would have released; and because `targetRank` ranks an absent target as
+        //    the TIP, the tipless manifest was evaluated FIRST every deploy, threw deterministically,
+        //    and took the slot from it. `trigger.ts` now answers that one at source instead — see
+        //    `PATCH_FAILURE_TAXONOMY` for how the width of a refusal decides its answer; this file
+        //    does not restate it. The lesson generalises: before adding a throw to this list, check
+        //    that it cannot be reached by one manifest while a sibling resolves — "same read" is not
+        //    the same thing as "same outcome".
         //
         // Everything else is a refusal LaunchDarkly answered, and `trigger.ts` answers those at
         // source — returning `held` where it can, and throwing where it deliberately will not
@@ -865,15 +876,7 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       return { ...outcome, viaLedger: true };
     };
 
-    // HIGHEST TARGET VARIATION FIRST, in both passes — see `highestTargetFirst`. Only one
-    // variation of a flag can be releasing at a time, so whichever manifest is evaluated first
-    // decides what production gets; filename order and Map insertion order both mean "oldest
-    // wins", which for a lineage is exactly backwards.
-    for (const flag of highestTargetFirst(discovered, (f) => f.targetVariation)) {
-      outcomes.push(await processFlag(flag));
-    }
-
-    // The ledger pass: unfinished work from EARLIER deploys, re-checked on this one. Skips
+    // The ledger's candidates: unfinished work from EARLIER deploys, re-checked on this one. Skips
     // anything discovery already handled this round, so a flag is evaluated at most once.
     // Keyed on the manifest ADDRESS, matching the ledger. This was the last flagKey-keyed
     // identity comparison in Beacon, and it was wrong in both directions: an entry for
@@ -934,7 +937,33 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
       }
       acting.push({ entry, parsed });
     }
-    const ordered = highestTargetFirst(acting, (a) => a.parsed.targetVariation);
+    // HIGHEST TARGET VARIATION FIRST, ACROSS BOTH SOURCES AT ONCE — one list, one sort, one
+    // evaluation loop. Only one variation of a flag may be releasing at a time, so whichever
+    // manifest is evaluated first decides what production gets; filename order and Map insertion
+    // order both mean "oldest wins", which for a lineage is exactly backwards.
+    //
+    // THE SLOT IS GLOBAL, AND THAT IS WHY THIS CANNOT BE TWO SORTED PASSES. It was, and each pass
+    // was correctly ordered within itself — which is not the same property, and the comment here
+    // claimed it was ("highest target variation first, in both passes"). The seam between them was
+    // reachable in the documented steady state: merge order is not PR order, so a newly discovered
+    // pr-40 (target v1) could be evaluated while pr-41 (target v2) sat pending from an earlier
+    // deploy. Discovery ran to completion first, so v1 took the slot and started a full progressive
+    // rollout of a SUPERSEDED variation to production, v2 deferred, and both outcomes reported as
+    // ordinary successes. v2 then hit `already_running` on every deploy until v1's rollout finished.
+    //
+    // Ties keep discovery first: `highestTargetFirst` is a stable sort and the discovered entries
+    // are appended first, so equal-target work is evaluated in the order it was before.
+    type Candidate =
+      | { readonly kind: "discovered"; readonly flag: DiscoveredFlag }
+      | { readonly kind: "ledger"; readonly entry: PendingEntry; readonly parsed: ReleaseFlagFile };
+    const work: Candidate[] = [
+      ...discovered.map((flag) => ({ kind: "discovered" as const, flag })),
+      ...acting.map(({ entry, parsed }) => ({ kind: "ledger" as const, entry, parsed })),
+    ];
+    const orderedWork = highestTargetFirst(work, (c) =>
+      c.kind === "discovered" ? c.flag.targetVariation : c.parsed.targetVariation,
+    );
+    const ordered = orderedWork.filter((c): c is Extract<Candidate, { kind: "ledger" }> => c.kind === "ledger");
     if (ordered.length > 0) {
       console.log(
         `[beacon] ledger: ${ordered.length} unfinished manifest(s) from earlier deploys → ` +
@@ -950,8 +979,10 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
             .join(", "),
       );
     }
-    for (const { entry, parsed } of ordered) {
-      outcomes.push(await reEvaluate(entry, parsed));
+    // ONE loop over the merged order. A discovered manifest and a pending one now compete for the
+    // flag's slot on the target each asks for, not on which list it arrived in.
+    for (const c of orderedWork) {
+      outcomes.push(c.kind === "discovered" ? await processFlag(c.flag) : await reEvaluate(c.entry, c.parsed));
     }
 
     // Fold every outcome back into the ledger: remember what is unfinished, forget what is
@@ -1015,13 +1046,32 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     if (!sha || !service) {
       return res.status(400).json({ error: "missing required fields: sha, service" });
     }
-    const { status, body: out } = await handleDeploy({
-      service,
-      sha,
-      previousSha: body.previousSha ?? body.previous_sha,
-      environment: body.environment ?? cfg.ldEnvironmentKey,
-    });
-    return res.status(status).json(out);
+    // EXPRESS 4 DOES NOT FORWARD ASYNC REJECTIONS, and Node kills the process on an unhandled
+    // one — so a throw from anywhere in here took the whole service down with it, answering
+    // NOTHING (not a 5xx) and killing every detached release monitor in flight with it: the
+    // completion path that repoints child flags, and the revert path that starts Seer. The
+    // reachable trigger is not exotic — both stores write to disk on every notification
+    // (`state.record`, and the ledger once per outcome), and Beacon documents itself as running on
+    // an ephemeral filesystem, so ENOSPC or a read-only mount is an ordinary production failure.
+    //
+    // 500 is the honest answer: if `record` did not commit, the sha was NOT processed, and the next
+    // notification re-diffs the same range correctly. The notifier logs and exits, which is the
+    // same recovery shape as the documented 503 path.
+    try {
+      const { status, body: out } = await handleDeploy({
+        service,
+        sha,
+        previousSha: body.previousSha ?? body.previous_sha,
+        environment: body.environment ?? cfg.ldEnvironmentKey,
+      });
+      return res.status(status).json(out);
+    } catch (e) {
+      console.error(
+        `[beacon] FAILED to handle the notification for '${service}' at ${sha} — nothing was recorded for this ` +
+          `sha, so a re-POST (or the next deploy) re-diffs the same range: ${e instanceof Error ? e.stack ?? e.message : String(e)}`,
+      );
+      return res.status(500).json({ error: "notification handling failed", detail: e instanceof Error ? e.message : String(e) });
+    }
   });
 
   // Railway adapter: translate Railway's deploy webhook into the same handling.
@@ -1043,12 +1093,21 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
     }
     // Railway environment names are Railway-side concepts; releases target the
     // configured LD environment. (Map per-environment here if that ever differs.)
-    const { status, body: out } = await handleDeploy({
-      service: parsed.service,
-      sha: parsed.sha,
-      environment: cfg.ldEnvironmentKey,
-    });
-    return res.status(status).json(out);
+    // Same reason as the generic route above: an async rejection here would kill the process.
+    try {
+      const { status, body: out } = await handleDeploy({
+        service: parsed.service,
+        sha: parsed.sha,
+        environment: cfg.ldEnvironmentKey,
+      });
+      return res.status(status).json(out);
+    } catch (e) {
+      console.error(
+        `[beacon] FAILED to handle the Railway webhook for '${parsed.service}' at ${parsed.sha} — nothing was ` +
+          `recorded for this sha: ${e instanceof Error ? e.stack ?? e.message : String(e)}`,
+      );
+      return res.status(500).json({ error: "notification handling failed", detail: e instanceof Error ? e.message : String(e) });
+    }
   });
 
   return app;

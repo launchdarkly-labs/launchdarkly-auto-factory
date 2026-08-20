@@ -1589,6 +1589,23 @@ describe("walkGraph — loop/metrics merge regressions", () => {
     assert.ok(!g.methods().includes("trackInvocationSuccess"));
   });
 
+  it("a served max_visits of 0 is not a loop edge, and says so", async () => {
+    // The natural dashboard spelling of "disable this loop". It used to be clamped UP to a budget of
+    // one, so the loop stayed alive with no warning — 0 is a number, so the malformed-handoff check
+    // stayed quiet too. check-configs 6a rejects it in the committed file; this is the served half.
+    const g = graphFrom({
+      root: "w",
+      edges: { w: [{ key: "w", handoff: { max_visits: 0 } }, { key: "after" }], after: [] },
+    });
+    const r = await walkGraph(g, new ScriptedRunner({}), { PR_NUMBER: "1" });
+    assert.equal(countOf(r, "w"), 1, "no traversal was granted");
+    assert.deepEqual(r.runs.map((x) => x.configKey), ["w", "after"], "the forward edge decided instead");
+    assert.equal(r.loopExhausted, undefined, "an edge was taken, so the walk did not end on exhaustion");
+    // Recorded rather than silent: a zero budget is a spent budget.
+    assert.equal(r.loopBudgetSpent?.length, 1, `expected the edge recorded as spent: ${JSON.stringify(r.loopBudgetSpent)}`);
+    assert.equal(r.loopBudgetSpent?.[0]?.maxVisits, 0);
+  });
+
   it("one exhausted edge is reported ONCE, keeping its condition trigger", async () => {
     // Trivially true with one selection pass, and KEPT for the reason it was written: a second
     // pass that also reaches the budget check records the edge twice, printing it twice on all

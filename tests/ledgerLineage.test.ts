@@ -1147,6 +1147,41 @@ describe("highest target variation acts first", () => {
     assert.match(String(outcomeFor(r.json, 40).detail), /deferred/);
   });
 
+  it("orders ACROSS the two sources: a newly discovered v1 does not outrank a pending v2", async () => {
+    // THE SEAM. Each source was sorted correctly within itself, which is not the same property as
+    // the slot being given to the highest target — the slot is global. Discovery used to run to
+    // completion first, so a v1 manifest merged AFTER v2 was already pending took the slot and
+    // rolled a superseded variation to production while v2 deferred.
+    //
+    // Reachable in the documented steady state, because merge order is not PR order: pr-41 (v2) is
+    // pending from an earlier deploy, and pr-40 (v1) only appears in the listing at sha2.
+    const state = mvState();
+    const h = await harness(
+      ghAt(
+        { sha1: [`pr-41.json`], sha2: [`pr-40.json`, `pr-41.json`] },
+        { [path(40)]: manifest("v1"), [path(41)]: manifest("v2") },
+      ),
+      state,
+    );
+    h.seed(41, "v2"); // unfinished from the earlier deploy
+
+    const r = await h.post("sha2", "sha1");
+    assert.equal(r.json.discovered, 1, "pr-40 is the newly discovered one");
+    assert.equal(h.starts().length, 1, "only one manifest may act on the flag");
+    assert.equal(
+      h.starts()[0]?.targetVariationId,
+      "id-v2",
+      "THE DISCRIMINATOR: the pending v2 took the slot, not the freshly discovered v1",
+    );
+    const forty = outcomeFor(r.json, 40);
+    assert.match(String(forty.detail), /deferred/, "v1 defers NON-finally and is re-checked later");
+    assert.deepEqual(
+      h.pending.list("demo-backend", "production").map((e) => e.sourceFile),
+      [path(40)],
+      "v2 finished its start and left the ledger; v1 is what remains",
+    );
+  });
+
   it("orders the PENDING list too, and v1 never releases", async () => {
     // Two manifests already in the ledger, nothing served yet. They are seeded v1-FIRST, which
     // is Map insertion order — the order the ledger would otherwise hand back.

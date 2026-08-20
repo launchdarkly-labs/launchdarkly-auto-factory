@@ -1304,7 +1304,7 @@ export async function walkGraph(
     const loopBudgetFor = (ek: string, rawMax: number): { traversals: number; maxVisits: number } => ({
       traversals: edgeCounts.get(ek) ?? 0,
       maxVisits: Math.min(
-        Math.max(1, Math.floor(rawMax)) + grantedVisits(resume?.grants, ek, runsConsumed),
+        Math.floor(rawMax) + grantedVisits(resume?.grants, ek, runsConsumed),
         MAX_VISITS_HARD_CAP,
       ),
     });
@@ -1359,6 +1359,18 @@ export async function walkGraph(
         if (score === undefined || score >= below) continue;
       }
       const rawMax = handoffNumber(h, "max_visits");
+      // A SERVED `max_visits` OF 0 IS A BUDGET OF ZERO, and it used to be silently clamped UP to
+      // one: `loopBudgetFor` applied `Math.max(1, ...)`, so `max_visits: 0` — the natural way to
+      // spell "disable this loop" in the dashboard — kept the loop alive for one traversal, with no
+      // warning, because `warnIfMalformedNumericHandoff` only fires on non-NUMBERS. check-configs 6a
+      // rejects anything outside [1, 10] in the committed file; this is the served half of that rule.
+      //
+      // No special case in the control flow, which the first attempt at this got wrong by skipping
+      // the budget block and thereby making the edge takeable with NO budget at all. Dropping the
+      // lower clamp is enough: `traversals >= maxVisits` is 0 >= 0, so the edge is budget-blocked on
+      // its first look, recorded in `loopBudgetSpent` like any spent edge, and the walk falls through
+      // to whatever else the node offers. Unlike a malformed `"2"`, the intent here is unambiguous —
+      // zero traversals — so honouring the value is not coercion.
       if (rawMax !== undefined) {
         const ek = `${key}→${edge.key}`;
         const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);

@@ -722,14 +722,33 @@ export async function triggerRelease(
   } else {
     // Multivariate lineage: target = manifest targetVariation, else the tip.
     //
-    // ABSENT means "the tip", and the tip is derived from THIS FLAG's own variations — so a flag
-    // with no vN lineage at all defeats every manifest for it identically. That is a PER-FLAG
-    // error and it stays a throw. An EMPTY string is NOT absent (`??` catches only
-    // null/undefined): it is a target this one manifest names and the flag does not have, which
-    // is the held case just below.
+    // ABSENT means "the tip", and the tip is derived from THIS FLAG's own variations. An EMPTY
+    // string is NOT absent (`??` catches only null/undefined): it is a target this one manifest
+    // names and the flag does not have, which is the held case just below.
+    //
+    // HELD, NOT THROWN — and the argument for throwing was wrong. It read: "a flag with no vN
+    // lineage at all defeats every manifest for it identically, so this is a PER-FLAG error". That
+    // is false. This branch is reached only when the manifest names NO target; a sibling naming an
+    // EXPLICIT variation the flag does have resolves normally and would release (with `control`
+    // served, both backwards guards fall through). And `targetRank` ranks an absent target as the
+    // TIP — highest — so the tipless manifest is evaluated FIRST on every deploy, throws
+    // deterministically, and claims the flag's slot before the sibling that could act.
+    //
+    // Deterministic, pre-write and per-manifest is exactly the shape `PATCH_FAILURE_TAXONOMY` says
+    // must never claim the slot, and it is the permanent-starvation shape §6 forbids. So it gets
+    // the same answer as its structural twin eleven lines below: only a human can say what was
+    // meant, `held` is not final, and nothing was written.
     const targetValue = flag.targetVariation ?? latestVariationValue(variations.map((v) => v.value));
     if (targetValue === undefined) {
-      throw new Error(`multivariate flag '${flag.flagKey}' has no vN lineage variation to release`);
+      return {
+        flagKey: flag.flagKey,
+        method: "held",
+        note:
+          `this manifest names no targetVariation, and '${flag.flagKey}' has no vN lineage variation to ` +
+          `release (has: ${variations.map((v) => String(v.value)).join(", ")}) — HELD for a human: either ` +
+          `add the variation to the flag or name an existing one in the manifest. NOTHING WAS WRITTEN, so ` +
+          `a sibling manifest for this flag can still release in this same notification.`,
+      };
     }
     const t = variations.find((v) => v.value === targetValue);
     if (!t) {

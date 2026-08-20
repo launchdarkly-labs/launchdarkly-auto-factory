@@ -68,8 +68,22 @@ export class MemoryDeployStateStore implements DeployStateStore {
     if (current.last === sha) return;
     // Re-processing the PRIOR sha must not rewrite history either. Without this, a re-POST
     // of an older sha set {last: prior, prior: last} — swapping them — so the NEXT deploy
-    // diffed a range that had already been processed and re-evaluated finished flags. That
-    // is the path by which a manual recovery attempt could re-release a reverted flag.
+    // diffed a range that had already been processed and re-evaluated finished flags.
+    //
+    // THIS CLOSES THE WINDOW, NOT THE PATH, and an earlier version of this comment claimed the
+    // path — "the path by which a manual recovery attempt could re-release a reverted flag".
+    // The window is two deep. A notification for any sha FURTHER back still advances the
+    // window and inverts the history ({last: old, prior: current}), and the next ordinary
+    // deploy then re-diffs an already-processed range. Because that deploy's sha is genuinely
+    // new, `shaAlreadyProcessed` is false and `terminalHistoryRefusal` is never consulted, so a
+    // flag whose release LaunchDarkly REVERTED can be re-released unattended. Reproduced end to
+    // end: three deploys, a revert, a Railway "Redeploy" of the first sha, then one more deploy.
+    //
+    // Not fixed here because the fix is a shape change — a bounded list of processed shas per
+    // service/environment, with `resolvePreviousSha` generalising the `last → prior` rule — and it
+    // belongs in its own change with its own review rather than bolted onto a finished branch.
+    // Tracked in issue #21; the honest summary is that a re-POST inside the window is safe and one
+    // outside it is not.
     if (current.prior === sha) return;
     this.states.set(k, { last: sha, ...(current.last ? { prior: current.last } : {}) });
   }

@@ -232,6 +232,17 @@ start a second one (both the ledger and a repeat-SHA re-POST consult `findLatest
 and re-recording the prior SHA is a no-op so an intervening deploy no longer makes the next
 deploy re-diff a processed range.
 
+**Corrected, and this is a WINDOW rather than a closure.** The deploy-state store is two deep, so
+the paragraph above holds for a re-notification of the last or prior SHA and not for one further
+back. A notification for an older SHA — Railway's "Redeploy" button on an earlier deployment, a
+late out-of-order delivery, a manual re-POST — advances the window and inverts the history, and the
+next ordinary deploy re-diffs an already-processed range. That deploy's SHA is genuinely new, so
+the repeat-SHA guard above never runs, and a flag whose guarded release LaunchDarkly REVERTED can be
+re-released unattended: the one outcome this document calls unrecoverable. Reproduced end to end.
+The fix is a shape change to the store (a bounded list of processed SHAs, with `resolvePreviousSha`
+generalising the `last → prior` rule) and is tracked in issue #21 rather than bolted onto this branch.
+See `state.ts`'s own comment, which used to claim the path was closed.
+
 ### The axis address-keying exposed: several manifests, ONE flag
 
 Keying the ledger on the manifest's address was right, and it made a second problem visible

@@ -141,6 +141,44 @@ describe("Beacon server", async () => {
     return h;
   }
 
+  it("a store write failure answers 500 and the service SURVIVES", async () => {
+    // Express 4 does not forward async handler rejections, and Node kills the process on an
+    // unhandled one — so this used to take the whole service down mid-request, answering nothing
+    // and killing every detached release monitor with it. Both stores write on every notification
+    // and Beacon documents itself as running on an ephemeral filesystem, so ENOSPC / a read-only
+    // mount is an ordinary production failure, not a contrived one.
+    const failing = new MemoryDeployStateStore();
+    failing.record = () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+    const app = createApp(cfg, fakeLd({}, []), {
+      store: failing,
+      pending: new MemoryPendingStore(),
+      gh: fakeGh([]),
+      onReleaseStarted: () => {},
+    });
+    const server: Server = await new Promise((res) => {
+      const sv = app.listen(0, () => res(sv));
+    });
+    try {
+      const { port } = server.address() as { port: number };
+      const post = async () =>
+        fetch(`http://127.0.0.1:${port}/flag-releases`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-beacon-secret": SECRET },
+          body: JSON.stringify({ service: "demo-backend", sha: "sha2", environment: "production" }),
+        });
+      const first = await post();
+      assert.equal(first.status, 500, "answered, rather than dropping the connection");
+      assert.match(JSON.stringify(await first.json()), /ENOSPC/, "the cause is reported to the caller");
+      // THE DISCRIMINATOR: the process is still alive to serve the retry the 500 asks for.
+      const second = await post();
+      assert.equal(second.status, 500);
+    } finally {
+      server.close();
+    }
+  });
+
   it("rejects a missing or wrong secret on both endpoints", async () => {
     const h = await harness();
     assert.equal((await h.post("/flag-releases", {}, null)).status, 401);

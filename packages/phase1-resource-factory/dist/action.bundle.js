@@ -75104,7 +75104,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     const runsConsumed = runs.length;
     const loopBudgetFor = (ek, rawMax) => ({
       traversals: edgeCounts.get(ek) ?? 0,
-      maxVisits: Math.min(Math.max(1, Math.floor(rawMax)) + grantedVisits(resume?.grants, ek, runsConsumed), MAX_VISITS_HARD_CAP)
+      maxVisits: Math.min(Math.floor(rawMax) + grantedVisits(resume?.grants, ek, runsConsumed), MAX_VISITS_HARD_CAP)
     });
     const budgetBlocked = [];
     recordShadowedLoopEdges(key, node, loopEdgeShadowed, shadowWarned);

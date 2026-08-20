@@ -128,12 +128,26 @@ describe("triggerRelease — multivariate variation releases", () => {
     assert.deepEqual(patches, []);
   });
 
-  it("a flag with NO vN lineage still THROWS when the manifest named no target — that is per-flag", async () => {
-    // The throw that must NOT be converted. Nothing about this is manifest-specific: there is no
-    // lineage to release, so every manifest for this flag fails the same way on the same read and
-    // no sibling could have released anyway. Converting it would hide a real error as a hold.
-    const { ld } = fakeLd({ "enable-x": mvFlag(["control", "experiment-a"], { on: false, offVariation: 0 }) });
-    await assert.rejects(() => triggerRelease(ld, discovered(), "production"), /no vN lineage variation/);
+  it("a flag with NO vN lineage is HELD when the manifest named no target — it is NOT per-flag", async () => {
+    // This test asserted the opposite, reasoning that no sibling could have released anyway. FALSE,
+    // and the sibling assertion at the bottom is the evidence the old reasoning lacked: this branch
+    // is reached only when a manifest names NO target, so a sibling naming an EXISTING variation
+    // resolves normally. Throwing therefore claimed the flag's slot and starved that sibling on
+    // every deploy, since an absent target ranks as the TIP and is evaluated first. Why that shape
+    // must not claim the slot is stated once, in `PATCH_FAILURE_TAXONOMY`.
+    const { ld, patches } = fakeLd({
+      "enable-x": mvFlag(["control", "experiment-a"], { on: false, offVariation: 0 }),
+    });
+    const r = await triggerRelease(ld, discovered(), "production");
+    assert.equal(r.method, "held", "THE DISCRIMINATOR: a refusal of this one file, not a thrown flag-level error");
+    assert.match(r.note ?? "", /no vN lineage variation/);
+    assert.match(r.note ?? "", /a sibling manifest for this flag can still release/);
+    assert.deepEqual(patches, [], "nothing was written");
+
+    // THE SIBLING THE OLD ARGUMENT SAID COULD NOT EXIST: same flag, same read, explicit target.
+    const sibling = await triggerRelease(ld, discovered({ targetVariation: "experiment-a" }), "production");
+    assert.notEqual(sibling.method, "held", `a sibling naming an existing variation acts: ${sibling.method}`);
+    assert.ok(patches.length > 0, "so the slot the throw used to claim was a real release lost");
   });
 
   it("intent prerequisites on a MULTIVARIATE parent pin what its targeting points at", async () => {

@@ -549,3 +549,65 @@ whose loop work is otherwise twice-reviewed, was the worse trade.
 - **The `stopped` / `cancelled` reasoning** now lives in issue #20 rather than in a comment beside
   code that no longer exists.
 
+## 7e. WHOLE-BRANCH ADVERSARIAL REVIEW, 2026-08-20 — nine findings; four fixed here, three tracked
+
+Rounds one to three each audited a slice of recent work. This round audited the rest of the branch —
+Beacon's stores and passes, the §6 invariants against their code, the LaunchDarkly API assumptions
+(checked against the published docs), the check-configs rules themselves, the served-graph seam, the
+front ends, config payload sizes, and the input/secret surface. Nine findings, three of them executed
+end to end.
+
+**Fixed here, because the branch introduced them or the fix is a few lines:**
+
+- **The slot ordering had a seam between its two passes.** Each pass was correctly sorted within
+  itself, which is NOT the property the slot needs — the slot is global. A newly discovered v1
+  manifest could take it ahead of a pending v2 and roll a SUPERSEDED variation to production while v2
+  deferred, both reported as ordinary successes. Now one list, one sort, one evaluation loop. The
+  comment claiming "highest target variation first, in both passes" was the false-claim half of this.
+- **The tipless-lineage throw is now `held`.** Its comment argued the throw was safe because "every
+  manifest for this flag fails the same way, so no sibling could have released anyway". False: the
+  branch is reached only when a manifest names NO target, and a sibling naming an existing variation
+  resolves normally — so the throw claimed the flag's slot and starved it, every deploy, because an
+  absent target ranks as the TIP and is evaluated first. Its structural twin eleven lines below was
+  already `held`. The test that pinned the throw now pins the hold AND the sibling that proves the
+  loss was real.
+- **An async rejection in either route handler killed the whole process.** Express 4 does not forward
+  them and Node exits on an unhandled one, so a store write failure — ENOSPC or a read-only mount, on
+  a service documented as running on an ephemeral filesystem — answered NOTHING and took every
+  detached release monitor with it. Measured pre-fix: the request hung for five minutes. Now a 500,
+  which is honest (nothing was recorded, so the next notification re-diffs the same range).
+- **A served `max_visits: 0` was clamped UP to a budget of one.** The natural dashboard spelling of
+  "disable this loop" kept the loop alive, silently, because the malformed-value warning only fires on
+  non-numbers. The lower clamp is gone, so a zero budget is blocked on its first look and recorded in
+  `loopBudgetSpent`. The first attempt at this fix was wrong in a more interesting way — it skipped
+  the budget block, making the edge takeable with NO budget at all, which the test caught.
+
+**Tracked, not fixed here** — each is pre-existing on `main`, and the two serious ones are shape
+changes that deserve their own review rather than a late addition to this branch:
+
+- **Issue #21 (HIGH):** a Railway "Redeploy" of a sha outside the two-deep window inverts the
+  deploy-state history, and the next ordinary deploy re-diffs an already-processed range and can
+  **re-release a flag whose guarded release LaunchDarkly REVERTED**. Reproduced end to end. `state.ts`
+  and `docs/loop-seam.md` both claimed this path was closed; both now say it is a window, not a
+  closure, which is the part that mattered most to correct here.
+- **Issue #22 (HIGH, needs an owner decision):** nothing on the release write path checks that the
+  target flag belongs to the factory, while `repoint.ts` refuses to touch untagged flags on exactly
+  that principle. A merged manifest — or an agent writing the wrong `flagKey` — can roll out any flag
+  in the project. The fix is cheap; the migration question (untagged legacy flags would be held) is
+  what needs deciding.
+- **Issue #23 (MEDIUM):** `.release-flags/` discovery truncates silently at GitHub's 1,000-entry
+  Contents limit, and manifests are never deleted. A merge whose release simply never happens, with
+  nothing recorded to say so.
+
+**Left alone deliberately:** two check-configs rules that can fail legitimate config with advice that
+cannot fix it (build friction, no production risk); `create_metric`'s description sitting 4 bytes
+under LaunchDarkly's 1024-byte cap with no length guard; and `budgetSpent`'s trigger text being
+last-write-wins across iterations for one edge. Each is real and each is smaller than the cost of
+another diff for a human to re-review on a 101-commit branch.
+
+**Where the dark is.** The review did not open `config-bridge`'s `doctor/init/seed/sync`, `bootstrap/`,
+`examples/`, the Cursor extension beyond `runChain`, the Anthropic/Bedrock/Cursor runner internals,
+`scripts/smoke-served-loop.ts`, or `check-public.mjs`. It also flagged two LaunchDarkly beta-endpoint
+assumptions as unverifiable from the docs rather than checked: `findActiveRelease`'s `limit=20` and
+`findLatestRelease`'s reliance on newest-first ordering.
+
