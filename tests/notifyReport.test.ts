@@ -25,6 +25,22 @@ const BASE = { service: "demo-backend", sha: "abc123", beaconUrl: "https://beaco
 const body = (o: unknown): string => JSON.stringify({ discovered: Array.isArray(o) ? o.length : 0, outcomes: o });
 
 describe("describeNotifyResult", () => {
+  it("an unparseable 2xx body carries the ACTION REQUIRED marker", () => {
+    // `notify.ts` documents an alert on that exact string as the way to notice a strand, and a 2xx
+    // whose body is not JSON — a proxy answering instead of Beacon — is the case where NOTHING can
+    // be confirmed. It was the only attention path without the marker, so the documented alert
+    // missed precisely the outcome it most needed to catch.
+    const r = describeNotifyResult({
+      status: 200,
+      body: "<html>gateway</html>",
+      service: "demo-backend",
+      sha: "abc1234",
+      beaconUrl: "https://beacon.example",
+    });
+    assert.equal(r.attention, true);
+    assert.match(r.lines[0] ?? "", /ACTION REQUIRED/);
+  });
+
   it("a 200 carrying stranded flags demands attention — the case that read as success", () => {
     const r = describeNotifyResult({
       ...BASE,

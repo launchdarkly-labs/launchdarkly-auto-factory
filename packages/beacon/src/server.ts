@@ -674,16 +674,30 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         //
         // Stranding is the lesser failure: a human re-POST recovers it, and the log below
         // asks for one. Undoing a guardrail's rollback unattended does not recover.
+        // "NOT started" IS THE ONE THING THIS SITE CANNOT SAY, and it said it. The comment above
+        // exists because a throw here may land AFTER LaunchDarkly applied the patch (`startRelease`
+        // awaits `res.text()`), which is why the slot is claimed and the entry is non-final — the
+        // write state is UNKNOWN. Telling an operator "release NOT started" invites them to start
+        // one by hand in the LaunchDarkly UI, on a flag that may already be releasing: a second
+        // rollout of the same flag, which is exactly what the three write states in §6 exist to
+        // prevent. The idempotency sites above may say "NOT started" because their read failed
+        // BEFORE any write; this one may not. A re-POST is still safe (the idempotency read and
+        // `shaAlreadyProcessed` both guard it), so it is still what to ask for.
         console.warn(
-          `[beacon] release trigger ERROR for '${flag.flagKey}' — release NOT started. The ledger will re-check ` +
-            `it on a later deploy; re-POST /flag-releases to retry now: ${String(e)}`,
+          `[beacon] release trigger ERROR for '${flag.flagKey}' — whether LaunchDarkly applied the patch is ` +
+            `UNKNOWN, so the flag's slot is held rather than freed. Do NOT start a release by hand: re-POST ` +
+            `/flag-releases (safe — it re-reads what is running first), or wait for the next deploy, by which ` +
+            `time the releases listing says what actually happened: ${String(e)}`,
         );
         return {
           flag: flag.flagKey,
           sourceFile: flag.sourceFile,
           scope,
           action: "error",
-          detail: `release trigger failed — not started; ledger will re-check on a later deploy, or re-POST to retry now: ${String(e)}`,
+          detail:
+            `release trigger failed and whether the patch was applied is UNKNOWN — the ledger will re-check ` +
+            `on a later deploy, or re-POST to retry now (safe: it re-reads what is running first). Do not ` +
+            `start a release by hand: ${String(e)}`,
         };
       }
     };

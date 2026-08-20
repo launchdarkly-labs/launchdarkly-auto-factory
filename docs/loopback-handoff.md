@@ -338,6 +338,13 @@ the shadowing — so it never reaches the loop edge it is looking for. It must b
 `tests/loopEdgeOrder.test.ts` caught this, and pins the quiet-failure shape: a mis-ordered graph
 produces `["worker", "done"]` with `loopBudgetSpent`, `loopExhausted` and `stalledAt` all undefined.
 
+**The 2026-08-12 smoke green below is a record of THAT run, not a current property.** Merging
+`main` raised the graph's `manifest-steward → flag-implementer` backstop to 100 and the runner's
+default `max_turns` to 100 (`d230807`), which falsified this script's `[20, 20]` envelope assertion
+and the two premises its comment rested on. The script did not conflict in the merge, so nothing
+flagged it; it is corrected to `[100, 20]`, but it has NOT been re-run live since — provisioning is
+held (§2), so the next person to run it is the first to re-confirm the green.
+
 `npm run smoke:loop` also covers the served graph now. Its first version passed no `judgeHook`, so
 judge scores failed open and the `metrics-author` loop never fired — it exercised only the loop that
 ordering cannot break. It now scripts a 0.4 score, so both loops fire: 11 runs, two `loopBudgetSpent`
@@ -610,4 +617,61 @@ another diff for a human to re-review on a 101-commit branch.
 `scripts/smoke-served-loop.ts`, or `check-public.mjs`. It also flagged two LaunchDarkly beta-endpoint
 assumptions as unverifiable from the docs rather than checked: `findActiveRelease`'s `limit=20` and
 `findLatestRelease`'s reliance on newest-first ordering.
+
+## 7f. BRANCH-ONLY ADVERSARIAL REVIEW, 2026-08-20 — five findings, all fixed, all ours
+
+Round four's most serious findings turned out to be pre-existing Beacon bugs (issues #21–#23), so
+this round applied a hard scope rule: a finding counts only if THIS BRANCH introduced it, with the
+`git show origin/main:<path>` evidence to prove it. Everything below is branch-written, and one whole
+family exists because of the `main` merge.
+
+**THE CROSS-FILE STALENESS FAMILY — the merge's real cost.** Nine files conflicted and got scrutiny.
+`scripts/smoke-served-loop.ts` did not conflict, so nothing pointed at it, and main's `d230807`
+("Raise runaway backstops") silently falsified three things in it at once: its `[20, 20]` envelope
+assertion (the steward edge is now 100), the premise justifying that check as non-discriminating
+("both inbound edges declare max_turns: 20" — they now declare 100 and 20), and a claim that a
+dropped `max_turns` would read "12, the runner's default" (now also 100). Corrected to `[100, 20]`,
+which is a STRONGER check than before — the two edges differing means it now proves per-edge
+provenance. §7a's smoke-green paragraph is marked as a record of that run rather than a current
+property, because provisioning is held and nobody has re-run it since.
+
+**The lesson worth keeping:** a merge's blast radius is not its conflicts. Every assertion, fixture,
+comment and doc written against a value the other side changed is stale, and none of it conflicts.
+
+**The other four:**
+
+- **`server.ts`'s trigger-throw catch told the operator "release NOT started"** — the one thing that
+  site cannot say. Its own sixty-line comment exists because a throw there may land AFTER
+  LaunchDarkly applied the patch, which is why it claims the slot; the write state is UNKNOWN. An
+  operator who believes "not started" and acts in the LaunchDarkly UI starts a second rollout of a
+  flag that may already be releasing — the failure the three write states in §6 exist to prevent.
+  The idempotency sites twenty lines up may use that phrase, because their read failed pre-write.
+  Now states the unknown and says explicitly not to start one by hand.
+- **`grantIsAbsorbedByCap` kept a copy of the budget base the walker had dropped.** Round four's own
+  fix removed the `Math.max(1, …)` lower clamp from `loopBudgetFor` so a served `max_visits: 0` is
+  honoured as zero — and left the CLI's copy clamped. The two then disagreed by one for a sub-1
+  value: the CLI refused a resume as "already reached the hard cap" that the walker would have run.
+  `loopBudgetFor`'s comment names restating that formula as exactly how this happens, and the commit
+  that wrote the warning created the second copy. There is now ONE exported `loopBudgetBase`, and
+  nothing left to restate.
+- **`notifyReport.ts`'s unconfirmable path lacked the `ACTION REQUIRED` marker.** `notify.ts`
+  documents an alert on that exact string as the way to notice a strand; the 2xx-with-unparseable-body
+  case — a proxy answering instead of Beacon — was the only attention path without it, so the
+  documented alert missed the one outcome where nothing at all can be confirmed.
+- **`tests/releaseTrigger.test.ts` was a zero-byte file** committed by `63aea2e`, running as a
+  passing 0-test suite under a name that promises coverage. Deleted.
+
+**What the round DISCARDED as pre-existing, which is the point of the scope rule:** the handoff
+verifier's shim behaviour on a missing sandbox, oversized files and needles inside comments
+(byte-identical to `main`, and the branch's per-iteration runs make none of it worse);
+`judgeEvidence.ts` (unchanged); the Notifier's `arg()` parsing; and GitHub's contents API returning
+empty `content` for files over 1 MB. Each was checked with `git log origin/main..HEAD -- <path>`
+before being dropped.
+
+**Verified and unbroken this round:** resume replay under every grant position including the
+gate-halt-then-approve round trip, the loop rewind's budget accounting, `withFreshRouting` against
+the committed reviewer loop, run-cap arithmetic against the committed graph, the ledger's entry
+lifecycle (no resurrection path, no loss beyond #21/#23), all eight check-configs rules against the
+walker's actual semantics, cross-front-end consistency, and the Action bundle rebuilding
+byte-identically from source at tip.
 

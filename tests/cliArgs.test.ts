@@ -12,6 +12,7 @@ import {
   validateGrants,
   validateWalkState,
 } from "@auto-factory/phase1-cli";
+import { loopBudgetBase } from "@auto-factory/shared";
 
 describe("autofactory CLI args", () => {
   it("defaults: graph, base, cwd root, no approvals, not dry-run", () => {
@@ -350,6 +351,18 @@ describe("grant absorbed by the hard cap", () => {
     const prior = [{ edge: "a→b", visits: 8, effectiveAfterRuns: 3 }];
     assert.equal(grantIsAbsorbedByCap(2, prior, "a→b", 10), true);
     assert.equal(grantIsAbsorbedByCap(1, prior, "a→b", 10), false, "1 + 8 = 9, still room");
+  });
+
+  it("uses the WALKER's budget base, so a sub-1 declared value does not disagree by one", () => {
+    // The two used to be separate spellings of the same formula: the walker floors, and this
+    // carried a `Math.max(1, …)` lower clamp it had dropped. For a served `max_visits: 0` with nine
+    // prior grants the walker's rule gives a ceiling of 10 against ≤9 traversals — a grant DOES
+    // unlock a traversal — while the clamped copy said the cap was already reached and the CLI
+    // refused the resume with "already reached the hard cap".
+    const nine = [{ edge: "a→b", visits: 9, effectiveAfterRuns: 0 }];
+    assert.equal(grantIsAbsorbedByCap(0, nine, "a→b", 10), false, "0 + 9 = 9 < 10, so the grant is live");
+    assert.equal(loopBudgetBase(0), 0, "and the base both sides share is the floor, not a clamp");
+    assert.equal(loopBudgetBase(2.7), 2);
   });
 
   it("counts only grants for the edge in question", () => {

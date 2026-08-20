@@ -74691,6 +74691,9 @@ function startHandoffSpan(fromKey, toKey) {
 // ../shared/dist/graphWalker.js
 var JUDGE_REASONING_MAX = 1e3;
 var MAX_VISITS_HARD_CAP = 10;
+function loopBudgetBase(rawMax) {
+  return Math.floor(rawMax);
+}
 var ROUTING_TAGS = /* @__PURE__ */ new Set([
   "skip_flagging",
   "flag_worthy",
@@ -75104,7 +75107,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     const runsConsumed = runs.length;
     const loopBudgetFor = (ek, rawMax) => ({
       traversals: edgeCounts.get(ek) ?? 0,
-      maxVisits: Math.min(Math.floor(rawMax) + grantedVisits(resume?.grants, ek, runsConsumed), MAX_VISITS_HARD_CAP)
+      maxVisits: Math.min(loopBudgetBase(rawMax) + grantedVisits(resume?.grants, ek, runsConsumed), MAX_VISITS_HARD_CAP)
     });
     const budgetBlocked = [];
     recordShadowedLoopEdges(key, node, loopEdgeShadowed, shadowWarned);

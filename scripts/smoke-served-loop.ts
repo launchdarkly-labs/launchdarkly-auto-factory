@@ -194,16 +194,24 @@ async function main(): Promise<void> {
   );
   check("stalledAt", walk.stalledAt, undefined);
   check("replayDiverged", walk.replayDiverged, undefined);
-  // The re-entered node must inherit the loop edge's envelope, not the original
-  // forward edge's — a served handoff that dropped max_turns would show here.
-  // Both inbound edges to the implementer declare max_turns: 20, so this does NOT
-  // discriminate which edge supplied it — it proves only that the field survived the
-  // round trip and re-entry (a served handoff that dropped it would read 12, the
-  // runner's default). The capabilities check below is what proves per-edge provenance.
+  // The re-entered node must inherit the LOOP edge's envelope, not the forward edge it first
+  // arrived through. The committed graph now declares 100 on `manifest-steward → flag-implementer`
+  // and 20 on the `code-reviewer → flag-implementer` rework edge, so this check DOES discriminate
+  // per-edge provenance: [100, 20] can only be produced by taking each entry's own edge.
+  //
+  // IT USED TO ASSERT [20, 20], on the premise that "both inbound edges declare max_visits: 20"
+  // and a stale claim that a dropped `max_turns` would read 12, "the runner's default". Both were
+  // true of this branch and were falsified by merging `main`, which raised the steward edge to 100
+  // and the runner's default to 100 (`d230807`, "Raise runaway backstops"). The merge took main's
+  // values correctly and left this file behind: it did not conflict, so nothing pointed at it.
+  // Since the graph and the runner default are now both 100, a dropped `max_turns` on the FIRST
+  // entry is no longer detectable here (100 either way) — a dropped one on the loop edge still is,
+  // because inheritance would read 100 instead of 20. The capabilities check below remains the
+  // independent provenance proof.
   check(
-    "flag-implementer maxTurns per entry (survival, not provenance)",
+    "flag-implementer maxTurns per entry (per-edge provenance)",
     runner.seen.filter((s) => s.configKey === "autofactory-flag-implementer").map((s) => s.maxTurns),
-    [20, 20],
+    [100, 20],
   );
   // On rework the implementer comes in through the loop edge, whose capabilities omit
   // query_repos — the envelope is per-edge, so re-entry is not a repeat of first entry.

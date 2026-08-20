@@ -23,6 +23,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
+import { loopBudgetBase } from "@auto-factory/shared";
 import type { LoopGrant, NodeRun } from "@auto-factory/shared";
 
 /**
@@ -227,7 +228,7 @@ export function writeWalkState(
   root: string,
   state: Omit<WalkState, "version" | "at" | "treeHash" | "humanFeedback">,
   feedback: {
-    /** The feedback in force this round — `resume.humanFeedback`, or `--feedback` on a fresh run. */
+    /** The feedback in force this round — `resume.humanFeedback`, `--resume --feedback` (the only way in: `args.ts` refuses `--feedback` without `--resume`). */
     inForce: string | undefined;
     /** Total runs the walk produced, replayed + live. */
     totalRuns: number;
@@ -483,7 +484,14 @@ export function grantIsAbsorbedByCap(
   hardCap: number,
 ): boolean {
   const already = (prior ?? []).filter((g) => g.edge === edge).reduce((n, g) => n + Math.max(0, g.visits), 0);
-  return Math.max(1, Math.floor(declaredMaxVisits)) + already >= hardCap;
+  // `loopBudgetFor`'s base, NOT a second spelling of it. This carried `Math.max(1, …)` after the
+  // walker's rule dropped its lower clamp (so that a served `max_visits: 0` is honoured as a zero
+  // budget rather than silently clamped up to one) — which made the two disagree by one for a
+  // sub-1 declared value: the CLI refused a resume as "already reached the hard cap" while the
+  // walker's own arithmetic would have unlocked a traversal. `loopBudgetFor`'s comment names
+  // restating this formula as how a granted traversal becomes reachable in one place and blocked
+  // in another; this was that, introduced by the very commit that wrote the warning.
+  return loopBudgetBase(declaredMaxVisits) + already >= hardCap;
 }
 
 /**

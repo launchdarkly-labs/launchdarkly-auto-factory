@@ -49,6 +49,21 @@ const JUDGE_REASONING_MAX = 1000;
 export const MAX_VISITS_HARD_CAP = 10;
 
 /**
+ * A declared `max_visits`, floored, as the BASE that grants are added to and the hard cap bounds.
+ * ONE definition, exported because two callers need it: the walker's per-edge budget, and the
+ * CLI's "would this grant be absorbed by the cap?" check before it accepts a `--grant-visits`.
+ *
+ * Deliberately NOT clamped up to 1 — a served value below 1 is a budget of zero, which the budget
+ * check then blocks on its first look (see `loopBudgetFor`). It was clamped here once, and when
+ * that clamp was removed the CLI's copy kept it: the two then disagreed by one for a sub-1 value,
+ * and the CLI refused a resume as "already reached the hard cap" that the walker would have run.
+ * Restating this formula is the failure mode; this function is why there is nothing to restate.
+ */
+export function loopBudgetBase(rawMax: number): number {
+  return Math.floor(rawMax);
+}
+
+/**
  * The `max_visits` declared on the edge keyed `${source}→${target}`, or undefined if the
  * edge doesn't exist or isn't a loop edge. Lets a caller tell whether a grant could raise
  * that edge's ceiling at all, rather than issuing one the hard cap silently swallows.
@@ -1304,7 +1319,7 @@ export async function walkGraph(
     const loopBudgetFor = (ek: string, rawMax: number): { traversals: number; maxVisits: number } => ({
       traversals: edgeCounts.get(ek) ?? 0,
       maxVisits: Math.min(
-        Math.floor(rawMax) + grantedVisits(resume?.grants, ek, runsConsumed),
+        loopBudgetBase(rawMax) + grantedVisits(resume?.grants, ek, runsConsumed),
         MAX_VISITS_HARD_CAP,
       ),
     });

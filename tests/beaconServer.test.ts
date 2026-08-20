@@ -469,6 +469,13 @@ describe("beacon: release trigger failure", () => {
     assert.match(String(outcome.detail), /HTTP 502/, "the cause must survive into the outcome");
     assert.match(String(outcome.detail), /ledger will re-check/);
     assert.match(String(outcome.detail), /re-POST to retry now/, "the faster recovery must be stated");
+    // A THROW HERE MAY LAND AFTER THE PATCH APPLIED (`startRelease` awaits res.text()), which is
+    // why the slot is claimed. So this outcome must NOT tell an operator the release was not
+    // started: acting on that in the LaunchDarkly UI starts a second rollout of a flag that may
+    // already be releasing. The idempotency sites may say "NOT started" — their read failed before
+    // any write — and this one may not.
+    assert.doesNotMatch(String(outcome.detail), /not started/i, "the write state here is UNKNOWN, not known-not-written");
+    assert.match(String(outcome.detail), /UNKNOWN/, "and it says so");
     assert.deepEqual(h.monitored, [], "nothing handed to the monitor for a failed trigger");
   });
 

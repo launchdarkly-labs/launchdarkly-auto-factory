@@ -176,7 +176,13 @@ export function describeNotifyResult(input: {
     // A 2xx whose body we cannot read: probably a proxy in front of Beacon. Not a failure,
     // but we cannot claim the flags released either — say exactly that much.
     lines.push(
-      `notify: Beacon answered HTTP ${status} but the body was not JSON — cannot confirm what released.`,
+      // `ACTION REQUIRED` is the ALERTING CONTRACT, not decoration: `notify.ts` documents an alert
+      // on that exact string as the way to notice a strand, and this path — a 2xx whose body is not
+      // JSON, i.e. a proxy answering instead of Beacon — is the case where nothing at all can be
+      // confirmed. It was the one attention path without the marker, so the alert missed exactly
+      // the outcome it most needed to catch.
+      `notify: ACTION REQUIRED — Beacon answered HTTP ${status} but the body was not JSON — cannot ` +
+        `confirm what released.`,
     );
     lines.push(`  response: ${body.slice(0, 200) || "(empty)"}`);
     return { attention: true, lines };
