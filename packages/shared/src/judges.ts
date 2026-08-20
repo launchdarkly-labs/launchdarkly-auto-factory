@@ -131,6 +131,8 @@ class CompletionJudgeRunner implements Runner {
 export interface JudgeHookArgs {
   /** The evaluated node's config key (for logs). */
   configKey: string;
+  /** 1-based run count for this node in the walk (>1 = a loop re-run). */
+  iteration: number;
   /** The evaluated node's resolved agent config (carries judgeConfiguration). */
   cfg: LDAIAgentConfig;
   /** The prompt the node received. */

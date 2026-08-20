@@ -85,17 +85,91 @@ function normalizePrerequisites(v: unknown, issues: string[]): { value: IntentPr
   return { value: out, coerced };
 }
 
-/** Parse a notBefore value into ISO YYYY-MM-DD, or report it as an issue. */
+/**
+ * RFC 3339 `full-date`: `YYYY-MM-DD`, with month and day range-checked by the grammar
+ * itself (01-12, 01-31). Calendar validity — Feb 30, Apr 31 — is checked separately.
+ */
+const RFC3339_FULL_DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+
+/** Days in a month, with the full Gregorian leap rule. */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] ?? 0;
+}
+
+/**
+ * Parse a notBefore value. Accepts an RFC 3339 `full-date` (`YYYY-MM-DD`) and nothing
+ * else; anything unparseable holds the release with an issue.
+ *
+ * NOTE THE ABSENCE OF `new Date()`. That is the point, and it is enforceable by
+ * inspection. Five previous revisions all used `Date` — an INSTANT — to carry a CALENDAR
+ * DATE, and every bug was a symptom of converting between the two in a frame nobody chose:
+ *
+ *  - `toISOString()` on a locally-parsed value shifted the date east of UTC;
+ *  - local getters on a zone-anchored value shifted it west;
+ *  - reading zone-suffixed strings in UTC was wrong for every non-`Z` offset;
+ *  - validating a lenient parse against digit runs in the input was defeated by time
+ *    tokens, because V8 rolls an impossible day onto day 1-3;
+ *  - and `2026-08-01T24:00:00Z` — whose instant is Aug 2 — read as Aug 1 from its prefix.
+ *
+ * That last one is not an exotic input: hour 24 is the single best-known difference
+ * between ISO 8601 (which permits it) and RFC 3339 (which forbids it, restricting hours to
+ * 00-23 "in order to reduce confusion"). Validating against the specification instead of
+ * against `new Date()`'s tolerance rules it out by construction, along with the rest of
+ * V8's leniency: it accepts `T24:00` and rolls `2026-02-30` to March 2, while rejecting
+ * `2026-13-01`. Grammar plus an explicit day-in-month check needs no parser at all.
+ *
+ * The accepted set is deliberately ONE format — the one INTENT_INSTRUCTIONS documents.
+ * Datetimes are refused rather than truncated: a value carrying `T23:59:59Z` means an
+ * instant, and honouring only its date would open the gate ~12 hours early, which this
+ * module's contract forbids. `YYYY-MM` is refused too (a previous revision accepted it),
+ * because "which day" is a guess and one grammar with no exceptions is the whole idea.
+ */
 function normalizeNotBefore(v: unknown, issues: string[]): { value: string; coerced: boolean } {
   if (v === undefined || v === null || v === "") return { value: "", coerced: false };
   const raw = String(v).trim();
-  const parsed = new Date(raw);
-  if (!Number.isNaN(parsed.getTime())) {
-    const iso = parsed.toISOString().slice(0, 10);
-    return { value: iso, coerced: iso !== raw };
+  const m = RFC3339_FULL_DATE_RE.exec(raw);
+  if (m) {
+    const year = Number(m[1]);
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    if (day <= daysInMonth(year, month)) {
+      // Already canonical: nothing is transformed, so nothing is "healed".
+      return { value: raw, coerced: false };
+    }
   }
-  issues.push(`notBefore '${raw}' is not a parseable date (use YYYY-MM-DD) — treated as unintelligible`);
+  // The "notBefore" prefix is load-bearing: normalizeReleaseIntent flips action auto→hold
+  // on an issue starting with it. Reword this and the fail-closed hold disappears.
+  issues.push(
+    `notBefore '${raw}' is not a date in YYYY-MM-DD form (RFC 3339 full-date) — treated as unintelligible`,
+  );
   return { value: raw, coerced: false };
+}
+
+/**
+ * Does a `notBefore` still hold the release at `now`?
+ *
+ * ANYWHERE-ON-EARTH: the gate opens once the stated calendar date has begun in the LAST
+ * timezone on Earth (UTC−12), i.e. at `notBefore`T12:00Z. The author's timezone is
+ * unknown and unknowable from a bare date, and `notBefore` forbids EARLY while tolerating
+ * late — so the only safe reading is the latest interpretation.
+ *
+ * The previous comparison (`new Date(notBefore).getTime() > Date.now()`) opened at 00:00
+ * UTC, which is the *earliest* interpretation: an author in Los Angeles writing
+ * `2026-08-10` got a release at 17:00 on Aug 9 their time. That contradicts this module's
+ * contract — an intent must never CAUSE a release, only prevent one.
+ *
+ * Operational caveat worth knowing: Beacon has no scheduler. A held release is only
+ * re-evaluated on the next deploy notification, so `notBefore` means "held until someone
+ * deploys again on or after that date", not "released at midnight".
+ */
+export function notBeforeHolds(notBefore: string, now: number = Date.now()): boolean {
+  if (!notBefore) return false;
+  const AOE_OFFSET_MS = 12 * 60 * 60 * 1000;
+  return new Date(now - AOE_OFFSET_MS).toISOString().slice(0, 10) < notBefore;
 }
 
 /**

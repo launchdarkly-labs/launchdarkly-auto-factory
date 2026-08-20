@@ -160,6 +160,60 @@ describe("bridge upgrade", () => {
     assert.equal((patch.args[1] as { description: string }).description, stamp);
   });
 
+  it("round-trips a loop-back edge's max_visits handoff verbatim (Phase 3 / Workstream K)", async () => {
+    // If the bridge dropped unknown handoff fields, provisioned graphs would
+    // silently lose their loop budgets. A committed edge carrying max_visits must
+    // reach the target project unchanged.
+    const committedGraph = {
+      key: "g1", name: "G",
+      rootConfigKey: "research",
+      edges: [
+        { key: "e1", sourceConfig: "research", targetConfig: "review", handoff: { max_turns: 8 } },
+        { key: "loop", sourceConfig: "review", targetConfig: "research", handoff: { max_visits: 3, skip_if_tags: { review_approved: "approve" } } },
+      ],
+    };
+    const dirs = writeDirs("maxvisits", { graphs: { g1: committedGraph } });
+    const stamp = stampDescription(undefined, computeConfigHash(dirs)!);
+    // Live graph is missing the loop edge → a full-object PATCH carries the committed edges.
+    const { ld, calls } = fakeLd({
+      graphs: { g1: { rootConfigKey: "research", description: stamp, edges: [committedGraph.edges[0]] } },
+    });
+    const r = await upgrade(ld, dirs);
+    assert.deepEqual(r.graphsUpdated, ["g1"]);
+    const patch = calls.find((c) => c.op === "updateAgentGraph")!;
+    const patchedEdges = (patch.args[1] as { edges: Array<{ handoff: Record<string, unknown> }> }).edges;
+    // The loop edge's handoff — including max_visits — survives byte-for-byte.
+    assert.deepEqual(patchedEdges, committedGraph.edges);
+    assert.equal(patchedEdges[1]!.handoff.max_visits, 3);
+  });
+
+  it("round-trips a judge loop's loop_if_judge_below AND the edge ORDER (Phase 4 / Step 3)", async () => {
+    // Two ways this could silently break a quality loop: dropping the threshold
+    // field, or reordering the edges. Order is load-bearing — the walker takes the
+    // first passing edge, so a self-loop that lands after its node's forward edge
+    // never fires.
+    const committedGraph = {
+      key: "g1", name: "G",
+      rootConfigKey: "metrics",
+      edges: [
+        { key: "selfloop", sourceConfig: "metrics", targetConfig: "metrics", handoff: { max_visits: 1, loop_if_judge_below: 0.7 } },
+        { key: "forward", sourceConfig: "metrics", targetConfig: "testing", handoff: { require_tags: { needs_tests: "true" } } },
+      ],
+    };
+    const dirs = writeDirs("judgeloop", { graphs: { g1: committedGraph } });
+    const stamp = stampDescription(undefined, computeConfigHash(dirs)!);
+    const { ld, calls } = fakeLd({
+      graphs: { g1: { rootConfigKey: "metrics", description: stamp, edges: [committedGraph.edges[1]] } },
+    });
+    const r = await upgrade(ld, dirs);
+    assert.deepEqual(r.graphsUpdated, ["g1"]);
+    const patch = calls.find((c) => c.op === "updateAgentGraph")!;
+    const patchedEdges = (patch.args[1] as { edges: Array<{ key: string; handoff: Record<string, unknown> }> }).edges;
+    assert.deepEqual(patchedEdges, committedGraph.edges);
+    assert.equal(patchedEdges[0]!.handoff.loop_if_judge_below, 0.7);
+    assert.equal(patchedEdges[0]!.key, "selfloop", "the self-loop must still be served FIRST");
+  });
+
   it("re-stamps a graph whose shape is current but whose [cfg:…] stamp is stale or missing", async () => {
     const committedGraph = {
       key: "g1", name: "G", description: "Pipeline",

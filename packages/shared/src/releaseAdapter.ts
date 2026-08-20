@@ -11,7 +11,8 @@
  * Concrete request/response shapes: reference-private/internal-apis/.
  */
 
-import type { LdClient } from "./ldClient.js";
+import { LdApiError } from "./ldClient.js";
+import type { LdClient, LdResponse } from "./ldClient.js";
 import type { MetricRef, ReleaseKind, Stage } from "./types.js";
 
 /** Beta header required by the automated-release endpoints (subject to change). */
@@ -141,7 +142,38 @@ export interface AutomatedRelease {
   }>;
 }
 
-const TERMINAL: ReadonlySet<ReleaseStatus> = new Set(["completed", "reverted", "monitoring_stopped"]);
+const TERMINAL: ReadonlySet<string> = new Set(["completed", "reverted", "monitoring_stopped"]);
+
+/**
+ * Statuses we positively recognise as "still running". Deliberately an allowlist, and
+ * deliberately asymmetric with TERMINAL — an UNKNOWN status must be handled differently
+ * by the two callers, and both directions fail safe:
+ *
+ *  - monitoring KEEPS POLLING an unrecognised state rather than stopping on it. A release
+ *    PAUSED awaiting human intervention — reachable now that `rollbackOnRegression: false`
+ *    is honoured — must still be watched, because a human resuming it produces the
+ *    `completed` that repoints child flags. An earlier revision stopped on unknown, which
+ *    was a reporting fix that silently cost that observation.
+ *  - the idempotency check treats anything not known-TERMINAL as active, so a re-delivered
+ *    deploy webhook cannot start a SECOND release on a flag that already has one — PROVIDED
+ *    the listing read succeeds. The caller must fail closed when it throws (skip the flag
+ *    and answer retriably); answering "no active release" on a read error would perform the
+ *    very write the check exists to prevent. Not closed by this: the listing can also be
+ *    briefly, legitimately EMPTY just after a start (eventual consistency), so a redelivery
+ *    arriving seconds later can still double-start. That needs a start ledger or an LD-side
+ *    idempotency token.
+ */
+const KNOWN_RUNNING: ReadonlySet<string> = new Set(["in_progress"]);
+
+/** Is this release still running, as far as we can positively tell? */
+export function isReleaseRunning(status: string): boolean {
+  return KNOWN_RUNNING.has(status);
+}
+
+/** Is this release definitely finished? Unknown statuses are NOT finished. */
+export function isReleaseFinished(status: string): boolean {
+  return TERMINAL.has(status);
+}
 
 /** Read the current state of an automated release. */
 export async function getReleaseStatus(
@@ -167,15 +199,30 @@ export interface ReleasePolicy {
   stages?: Stage[];
   metricKeys?: string[];
   metricGroupKeys?: string[];
+  /**
+   * The policy's rollback choice: `true` = roll back automatically on a metric
+   * regression, `false` = pause the release and wait for a human. ONE value for the
+   * whole metric set — the release API is per-metric
+   * (`metricMonitoringPreferences`), so a caller fans this out across the metrics.
+   * Undefined when the policy doesn't state it.
+   */
+  rollbackOnRegression?: boolean;
+  /** Policy identity, for reporting ("guarded by policy 'Prod policy'"). */
+  policyKey?: string;
+  policyName?: string;
 }
 
 interface RawReleaseSettings {
   releaseMethod?: string;
+  releasePolicyKey?: string;
+  releasePolicyName?: string;
   guardedReleaseConfig?: {
     rolloutContextKindKey?: string;
     metricKeys?: string[];
     metricGroupKeys?: string[];
     stages?: Stage[];
+    /** Roll back automatically vs pause and wait for a human. */
+    rollbackOnRegression?: boolean;
   };
   progressiveReleaseConfig?: {
     rolloutContextKindKey?: string;
@@ -203,22 +250,214 @@ export function normalizeReleasePolicy(raw: RawReleaseSettings): ReleasePolicy {
   const g = raw.guardedReleaseConfig;
   if (g?.metricKeys?.length) out.metricKeys = g.metricKeys;
   if (g?.metricGroupKeys?.length) out.metricGroupKeys = g.metricGroupKeys;
+  if (typeof g?.rollbackOnRegression === "boolean") out.rollbackOnRegression = g.rollbackOnRegression;
+  // Empty strings are what a non-policy environment returns; treat them as absent.
+  if (raw.releasePolicyKey) out.policyKey = raw.releasePolicyKey;
+  if (raw.releasePolicyName) out.policyName = raw.releasePolicyName;
   return out;
 }
 
-/** Read a flag's configured release policy. Returns null if none is set (404). */
-export async function getReleasePolicy(
+/**
+ * The outcome of reading a flag's release policy. THREE states, not two, because
+ * "no policy is configured" and "we could not find out" must not be confused:
+ * both previously collapsed to `null`, and the caller then silently dropped the org's
+ * metric baseline AND flipped auto-rollback on — overriding a policy configured to pause
+ * and wait for a human, invisibly.
+ *
+ * Note which HTTP shape means what, from observing a live project: an environment with no
+ * policy returns **200 with empty strings**, not 404. So a 404 much more likely means the
+ * path or flag is wrong — including the rename this file's header predicts — and is
+ * reported as `unreadable`, not as "no policy".
+ */
+export type PolicyRead =
+  | {
+      status: "ok";
+      policy: ReleasePolicy;
+      note?: string;
+      /**
+       * The response drifted AND `rollbackOnRegression` is absent from what parsed — so a
+       * configured rollback choice may have been lost rather than never set. The caller
+       * still defaults to auto-rollback (reverting to a known-good variation is the safer
+       * direction for users, and Beacon has no pager to hand a paused release to), but it
+       * must SAY so: silently overriding a pause-and-wait policy is what this whole
+       * tri-state exists to prevent.
+       */
+      rollbackChoiceUncertain?: true;
+    }
+  | { status: "absent" }
+  | { status: "unreadable"; reason: string };
+
+/**
+ * Read a flag's configured release policy, distinguishing absent from unreadable.
+ *
+ * Never throws: a caller deciding how to release should get a state it can report, not
+ * an exception to swallow.
+ */
+export async function readReleasePolicy(
   ld: LdClient,
   flagKey: string,
   environmentKey: string,
-): Promise<ReleasePolicy | null> {
-  const res = await ld.request<RawReleaseSettings>({
-    path: releaseSettingsPath(ld.projectKey, flagKey, environmentKey),
-    headers: BETA_HEADER,
-    okStatuses: [404],
-  });
-  if (res.status === 404) return null;
-  return normalizeReleasePolicy(res.data);
+  /** `sleep` is injectable so tests can assert the backoff without wall-clock waits. */
+  opts: { sleep?: (ms: number) => Promise<void> } = {},
+): Promise<PolicyRead> {
+  // Retried because a missed policy read DISCARDS the org's configured policy for this
+  // release — but with a DIFFERENT shape from the monitor's poll loop, because this runs
+  // inside a webhook handler rather than a detached poller:
+  //
+  //  - short and SPACED. An earlier version reused the monitor's retry count with no sleep
+  //    at all, so six attempts completed in ~0ms and covered only sub-millisecond failures
+  //    while its comment claimed parity with polling (which does sleep).
+  //  - never on an exhausted rate limit. `LdClient.request` already retries 429s with
+  //    backoff, so an `LdApiError` with status 429 means that budget is spent; retrying here
+  //    multiplies a storm by this loop's attempt count for no new information, and the
+  //    handler is awaited per-flag — long stalls push the provider into timing out and
+  //    redelivering, which is the hazard the idempotency guard has to absorb.
+  const doSleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let res: LdResponse<RawReleaseSettings> | undefined;
+  let lastError = "";
+  for (let attempt = 0; attempt < POLICY_READ_MAX_ATTEMPTS; attempt++) {
+    try {
+      res = await ld.request<RawReleaseSettings>({
+        path: releaseSettingsPath(ld.projectKey, flagKey, environmentKey),
+        headers: BETA_HEADER,
+        okStatuses: [404],
+      });
+      break;
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+      // NOTE the coupling: this is only sound while LdClient retries 429s itself. If
+      // RATE_LIMIT_RETRIES ever drops to 0, a single transient 429 would surface here and
+      // this short-circuit would stop covering it.
+      if (e instanceof LdApiError && e.status === 429) return { status: "unreadable", reason: lastError };
+      if (attempt === POLICY_READ_MAX_ATTEMPTS - 1) return { status: "unreadable", reason: lastError };
+      await doSleep(POLICY_READ_BACKOFF_MS * 2 ** attempt);
+    }
+  }
+  if (!res) return { status: "unreadable", reason: lastError || "no response" };
+  if (res.status === 404) {
+    return {
+      status: "unreadable",
+      reason:
+        `release-settings returned 404 for '${flagKey}' in '${environmentKey}'. An environment with no ` +
+        `policy returns 200 with empty fields, so this is more likely a wrong path (the beta ` +
+        `/internal endpoint is mid-rename) or an unknown flag.`,
+    };
+  }
+  const policy = normalizeReleasePolicy(res.data);
+  // A POLICY WE PARSED IS NEVER DISCARDED. `unreadable` makes the caller fall back to
+  // manifest metrics with auto-rollback forced on, so treating an unfamiliar field as a
+  // reason to throw away a policy we successfully read would cause the exact failure this
+  // tri-state exists to prevent — and would do it org-wide the moment LaunchDarkly ships
+  // any additive field on an endpoint documented as mid-rename. Drift can only ever
+  // downgrade an otherwise-EMPTY result; against a parsed one it is a note.
+  const drift = describePolicyDrift(res.data, policy);
+  if (Object.keys(policy).length > 0) {
+    // Keyed on ANY drift, not just drift inside the guarded block: a whole-block rename
+    // shows up as an unknown TOP-LEVEL key while `releaseMethod` still parses, and loses
+    // the rollback choice just as completely.
+    const rollbackChoiceUncertain = drift !== undefined && policy.rollbackOnRegression === undefined;
+    return {
+      status: "ok",
+      policy,
+      ...(drift ? { note: drift } : {}),
+      ...(rollbackChoiceUncertain ? { rollbackChoiceUncertain: true as const } : {}),
+    };
+  }
+  if (drift) return { status: "unreadable", reason: drift };
+  return { status: "absent" };
+}
+
+/**
+ * Fields the no-policy response is known to carry, so their presence never reads as drift.
+ * Extend this as LaunchDarkly adds boilerplate — otherwise `absent` rots into noise.
+ */
+/**
+ * Recognized keys INSIDE each config block, mirroring `RawReleaseSettings`. The top-level
+ * allowlist below contains the block names themselves, which means their contents were
+ * never inspected — so a single renamed inner field parsed as "fine" while the value it
+ * carried silently vanished. Same maintenance contract as the top-level set: extend it when
+ * LaunchDarkly adds a field, or reads start carrying a note.
+ */
+const KNOWN_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
+  guardedReleaseConfig: new Set([
+    "rolloutContextKindKey",
+    "metricKeys",
+    "metricGroupKeys",
+    "stages",
+    "rollbackOnRegression",
+  ]),
+  progressiveReleaseConfig: new Set(["rolloutContextKindKey", "stages"]),
+};
+
+const KNOWN_SETTINGS_KEYS = new Set([
+  "releaseMethod",
+  "releasePolicyKey",
+  "releasePolicyName",
+  "guardedReleaseConfig",
+  "progressiveReleaseConfig",
+  "_links",
+]);
+
+/**
+ * Positive evidence that the response shape drifted, or undefined if it looks intact.
+ *
+ * This endpoint is documented as mid-rename, and total drift is not the dangerous case —
+ * PARTIAL drift is: a recognised `releaseMethod` alongside a renamed `guardedReleaseConfig`
+ * yields a non-empty policy with the metrics silently gone, which no emptiness check can
+ * see.
+ */
+function describePolicyDrift(raw: RawReleaseSettings, normalized: ReleasePolicy): string | undefined {
+  const asRecord = (raw ?? {}) as unknown as Record<string, unknown>;
+  // (1) A method we cannot map. Positive signal, no guessing: the field is populated and
+  // normalizeMethod returned nothing.
+  if (raw.releaseMethod && !normalized.releaseMethod) {
+    return `release-settings reported an unrecognized releaseMethod '${raw.releaseMethod}'`;
+  }
+  // (2) A config block with content from which nothing was recovered — an inner rename.
+  for (const key of ["guardedReleaseConfig", "progressiveReleaseConfig"] as const) {
+    const cfg = asRecord[key];
+    // Non-empty VALUES, not merely present keys: the no-policy body carries empty strings,
+    // and rule 3 below already exempts them. Requiring the same here keeps a policy-free
+    // environment silent even if LaunchDarkly starts sending an empty config block.
+    const hasContent =
+      cfg !== null &&
+      typeof cfg === "object" &&
+      Object.values(cfg as Record<string, unknown>).some(
+        (x) => x !== "" && x !== null && x !== undefined && !(Array.isArray(x) && x.length === 0),
+      );
+    if (hasContent) {
+      const recovered =
+        normalized.randomizationUnit !== undefined ||
+        normalized.stages !== undefined ||
+        normalized.metricKeys !== undefined ||
+        normalized.metricGroupKeys !== undefined ||
+        normalized.rollbackOnRegression !== undefined;
+      if (!recovered) return `release-settings ${key} had content but nothing in it was recognized`;
+      // Rule 2b: PARTIAL drift inside the block — the case rule 2 cannot see once any one
+      // field parses, and the one that actually matters, because losing
+      // `rollbackOnRegression` silently changes what happens when a metric regresses.
+      const known = KNOWN_CONFIG_KEYS[key];
+      const unknownInner = Object.entries(cfg as Record<string, unknown>)
+        .filter(([k, v]) => !known?.has(k) && v !== "" && v !== null && v !== undefined)
+        .map(([k]) => k);
+      if (unknownInner.length > 0) {
+        return `release-settings ${key} carried unrecognized field(s): ${unknownInner.join(", ")}`;
+      }
+      // Type drift on the destructive axis: normalizeReleasePolicy drops a non-boolean
+      // `rollbackOnRegression` silently, which reads identically to the field being absent.
+      const rollback = (cfg as Record<string, unknown>).rollbackOnRegression;
+      if (rollback !== undefined && typeof rollback !== "boolean") {
+        return `release-settings ${key}.rollbackOnRegression was ${typeof rollback}, not a boolean`;
+      }
+    }
+  }
+  // (3) Populated fields we have never seen. Only non-empty values count, so the
+  // empty-string no-policy body stays silent.
+  const unknown = Object.entries(asRecord)
+    .filter(([k, v]) => !KNOWN_SETTINGS_KEYS.has(k) && v !== "" && v !== null && v !== undefined)
+    .map(([k]) => k);
+  if (unknown.length > 0) return `release-settings carried unrecognized field(s): ${unknown.join(", ")}`;
+  return undefined;
 }
 
 /** Path for listing a flag's automated releases across environments (beta/internal). */
@@ -227,16 +466,49 @@ function flagAutomatedReleasesPath(projectKey: string, flagKey: string): string 
 }
 
 /**
- * Find the in-progress automated release for a flag in an environment, or null.
+ * Find the active automated release for a flag in an environment, or null.
  * `startRelease` doesn't return the release id (the semantic patch responds with
  * the flag), so this is how a caller obtains the id to monitor.
+ *
+ * "Active" is everything NOT known-terminal, not `status:in_progress`. The old
+ * server-side filter was an allowlist of one, so a release in any other non-terminal
+ * state — notably one PAUSED on a regression, which `rollbackOnRegression: false` makes
+ * reachable — read as "no active release". For the caller that uses this as a
+ * re-delivery guard, that means a retried deploy webhook would start a SECOND release on
+ * a flag that already has one. Filtering client-side against the terminal set fails safe
+ * for any status LaunchDarkly adds.
  */
 export async function findActiveRelease(
   ld: LdClient,
   flagKey: string,
   environmentKey: string,
 ): Promise<AutomatedRelease | null> {
-  const filter = encodeURIComponent(`environmentKey:${environmentKey},status:in_progress`);
+  const filter = encodeURIComponent(`environmentKey:${environmentKey}`);
+  const res = await ld.request<{ items?: AutomatedRelease[] }>({
+    // No limit=1: the newest release may be terminal while an older one is still active,
+    // and a server-side limit would hide it.
+    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=20`,
+    headers: BETA_HEADER,
+  });
+  return res.data.items?.find((r) => !isReleaseFinished(r.status)) ?? null;
+}
+
+/**
+ * The most recent automated release for a flag in an environment, terminal or not.
+ *
+ * Exists for the blind spot `findActiveRelease` has BY DESIGN: it filters to
+ * not-finished, so a release that completes inside the post-trigger retry envelope
+ * is invisible to it — and the caller would skip the completion path (child-flag
+ * repointing) for exactly the release it just started. One unfiltered look at the
+ * newest item (the listing is newest-first, which `findActiveRelease`'s no-limit-1
+ * comment already relies on) closes that.
+ */
+export async function findLatestRelease(
+  ld: LdClient,
+  flagKey: string,
+  environmentKey: string,
+): Promise<AutomatedRelease | null> {
+  const filter = encodeURIComponent(`environmentKey:${environmentKey}`);
   const res = await ld.request<{ items?: AutomatedRelease[] }>({
     path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=1`,
     headers: BETA_HEADER,
@@ -244,7 +516,24 @@ export async function findActiveRelease(
   return res.data.items?.[0] ?? null;
 }
 
-/** Poll an automated release until it reaches a terminal state or times out. */
+/** Consecutive poll failures tolerated before monitoring gives up. */
+const POLL_ERROR_RETRIES = 5;
+
+/**
+ * Policy-read attempts and backoff. Deliberately NOT the monitor's numbers: this read runs
+ * inside a webhook handler, so its budget is bounded by how long a provider will wait
+ * before timing out and redelivering.
+ */
+const POLICY_READ_MAX_ATTEMPTS = 3;
+const POLICY_READ_BACKOFF_MS = 250;
+
+/**
+ * Poll an automated release until it finishes or the deadline passes.
+ *
+ * Returns the last observation rather than throwing on timeout, and keeps polling states
+ * it does not recognise (a paused release resumed by a human must still be seen to
+ * complete — that is what repoints child flags).
+ */
 export async function monitorRelease(
   ld: LdClient,
   environmentKey: string,
@@ -253,12 +542,41 @@ export async function monitorRelease(
 ): Promise<AutomatedRelease> {
   const pollMillis = opts.pollMillis ?? 10_000;
   const deadline = Date.now() + (opts.timeoutMillis ?? 60 * 60 * 1000);
+  let consecutiveErrors = 0;
+  let lastSeen: AutomatedRelease | undefined;
+  let reportedUnknown: string | undefined;
   for (;;) {
-    const release = await getReleaseStatus(ld, environmentKey, releaseId);
-    if (TERMINAL.has(release.status)) return release;
-    if (Date.now() > deadline) {
-      throw new Error(`Timed out monitoring release ${releaseId} (last status: ${release.status})`);
+    let release: AutomatedRelease;
+    try {
+      release = await getReleaseStatus(ld, environmentKey, releaseId);
+      consecutiveErrors = 0;
+    } catch (e) {
+      // A single transient read must not end monitoring for good: dying here strands the
+      // completion, and with it the child-flag repointing that only runs on `completed`.
+      if (++consecutiveErrors > POLL_ERROR_RETRIES) throw e;
+      console.warn(
+        `[release] poll ${consecutiveErrors}/${POLL_ERROR_RETRIES} failed for ${releaseId} ` +
+          `(retrying): ${e instanceof Error ? e.message : e}`,
+      );
+      await new Promise((r) => setTimeout(r, pollMillis));
+      continue;
     }
+    lastSeen = release;
+    if (isReleaseFinished(release.status)) return release;
+    // Not finished and not recognised as running — most plausibly PAUSED on a regression,
+    // which `rollbackOnRegression: false` asks for. KEEP POLLING: a human resuming it in
+    // LaunchDarkly must be observed, because completion is what triggers child-flag
+    // repointing. Announce the transition once so the wait is explained rather than silent.
+    if (!isReleaseRunning(release.status) && reportedUnknown !== release.status) {
+      reportedUnknown = release.status;
+      console.warn(
+        `[release] ${releaseId} is '${release.status}' — neither running nor finished, most likely ` +
+          `PAUSED awaiting a human. Still watching for it to resume or end.`,
+      );
+    }
+    // Timeout returns the last observation instead of throwing: "still paused after N
+    // hours" is a state to report, not an error to swallow.
+    if (Date.now() > deadline) return lastSeen;
     await new Promise((r) => setTimeout(r, pollMillis));
   }
 }

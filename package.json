@@ -20,6 +20,7 @@
     "test": "node --import tsx --test tests/*.test.ts",
     "bootstrap": "node bootstrap/create.mjs",
     "bridge": "node --import tsx packages/config-bridge/src/cli.ts",
+    "smoke:loop": "node --import tsx scripts/smoke-served-loop.ts",
     "init": "node --import tsx packages/config-bridge/src/cli.ts init",
     "doctor": "node --import tsx packages/config-bridge/src/cli.ts doctor"
   },

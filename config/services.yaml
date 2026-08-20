@@ -29,9 +29,15 @@ services:
   # --- ToggleMart (launchdarkly-autofactory-application) ---
   # Railway service names verbatim (the Railway adapter matches on them).
   # catalog/orders/users are private-network-only: their statusUrls are
-  # unreachable from Beacon and exist for completeness — the fullstack
-  # cross-check skips unreachable counterparts and uses frontend/gateway,
-  # which have public domains.
+  # unreachable from Beacon and exist for documentation — the fullstack
+  # cross-check skips them and uses frontend/gateway, which have public domains.
+  #
+  # `privateNetwork: true` is what MAKES that skip happen; it is not a comment.
+  # The readiness check is tri-state (fullstack.ts): a counterpart it cannot read
+  # makes the answer "unverified" rather than "not deployed yet". Without this
+  # marker, these three unreachable services would turn every ordinary wait into a
+  # reported error on every delivery. Set it on any service whose statusUrl Beacon
+  # cannot reach; at least one counterpart per side must remain reachable.
   togglemart-frontend:
     side: frontend
     repo: ttotenberg-ld/launchdarkly-autofactory-application
@@ -49,15 +55,18 @@ services:
     repo: ttotenberg-ld/launchdarkly-autofactory-application
     statusUrl: http://togglemart-catalog.railway.internal:8081/api/status
     statusShaField: version
+    privateNetwork: true
 
   togglemart-orders:
     side: backend
     repo: ttotenberg-ld/launchdarkly-autofactory-application
     statusUrl: http://togglemart-orders.railway.internal:8082/api/status
     statusShaField: version
+    privateNetwork: true
 
   togglemart-users:
     side: backend
     repo: ttotenberg-ld/launchdarkly-autofactory-application
     statusUrl: http://togglemart-users.railway.internal:8083/api/status
     statusShaField: version
+    privateNetwork: true

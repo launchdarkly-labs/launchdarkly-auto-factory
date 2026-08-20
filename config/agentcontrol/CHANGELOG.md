@@ -84,6 +84,143 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-10
+
+### ✅ Guard: a `loop_if_judge_below` edge's source must have a judge attached
+- **Why:** judge scores fail **open** — no usable score means the edge is never
+  taken. Nothing checked that the source node of a judge-driven loop edge actually
+  attaches a judge in its committed AI config, so removing (or forgetting) the
+  judge turned the loop into dead config whose only signal was a per-run log line.
+- **Now:** `check:configs` (rule 6g) fails when a `loop_if_judge_below` edge's
+  source config has no variation with `judgeConfiguration.judges`, and the message
+  says what to do (attach a judge, or drop the condition). The committed graph's
+  `metrics-author` self-loop passes — its config carries
+  `autofactory-judge-metrics-quality` at `samplingRate: 1`. Still uncheckable here:
+  `samplingRate` lives in LaunchDarkly, so the runtime warning remains the backstop
+  for an unsampled judge.
+
+---
+
+## 2026-08-09 (the graph actually loops)
+
+### ✅ First loop edge: `code-reviewer → flag-implementer` on a rejected review
+- **Why:** `max_visits` shipped in July, but no committed edge used it — the graph
+  was still a DAG, so the loop machinery was untested in production. Separately,
+  `review_approved` was **routed on by nothing**: a rejection just reported RED to a
+  human, and the reviewer's findings were discarded. This edge makes the verdict
+  actionable, and it needs no new signal — the reviewer is an independent node
+  evaluating the implementer's work with the full diff in hand.
+- **The edge:** `max_visits: 1`, `require_tags: { review_approved: "false" }` — one
+  rework pass. (`max_visits: N` allows N traversals, i.e. N reworks. This first
+  shipped as 2 while being described as one; corrected to 1.) Capabilities mirror the steward → implementer envelope minus
+  `query_repos` (cross-repo research is a first-pass concern).
+- **Polarity is deliberate:** it fires only on the literal `"false"`. The approval
+  gate normalizes verdicts (`reject`/`rejected` also read as rejections), so a
+  drifted verdict still reports REJECTED but skips the rework. The alternative
+  (`skip_if_tags: { review_approved: "approve" }`) loops on anything that isn't the
+  exact approval string, which would rework work the reviewer *accepted* — the more
+  expensive mistake, since iteration 2 can attach new LD resources.
+- **Gate interaction — corrected.** The implementer is in `DEFAULT_GATED_STEPS` and the
+  walker does re-ask the gate on every re-entry, but every front end answers from a
+  per-run decision that does not change (a `--approve` set, a PR label, a cached
+  modal answer). So the loop does NOT pause again: **one human approval authorises up
+  to `max_visits` additional side-effecting reworks.** An earlier entry claimed it
+  halted at the gate on re-entry, which was wrong. Per-iteration approval would need
+  tokens scoped to an iteration, which the label/flag surface cannot express.
+- **Walker fix this surfaced (`graphWalker.ts`):** an unmet loop edge is now treated
+  as **convergence, not a stall**. Previously, giving a terminal node a loop-back
+  edge made every *approved* run report `stalledAt` → INCOMPLETE, because an unmet
+  `require_tags` was read as "the chain can't advance". Unmet forward edges still
+  stall; only `max_visits` edges are exempt. The dual of the capping rule.
+- **`tags.json`:** `review_approved` now declares the edge it gates, and its
+  description records the exact-equality-vs-normalization gap.
+
+### ⚠️ REVERTED: the metrics orphan guard (added below) was unsound
+- The guard reported INCOMPLETE when an earlier iteration's `metric_keys` were absent from
+  the final run's. It cannot work: `metric_keys` is set only by `create_metric`, stripped
+  from agent-supplied tags, and the tool executor is per node run — so a re-run's tag lists
+  only what THAT run created, never what stays attached. A compliant rework that keeps `m1`
+  and adds `m2` emits exactly `m2`, byte-identical to one that replaced `m1`. The guard
+  therefore fired on the path the rework instructions ask for, turning good runs red.
+- **Now:** `inventory.metric_keys` accumulates across iterations (a union), so every
+  created metric stays visible in the reported links — report, don't gate. An orphaned
+  FLAG is still gated: it is a config the application may evaluate, where a stray metric
+  is an unused row.
+- The durable answer is that the authoritative metric set belongs to the **release
+  policy**, not to creation tags — see `docs/release-policy-metrics.md`.
+
+### ✅ Orphan guard extended to metrics (superseded by the entry above)
+- **Why:** the guard that stops a rework from reporting success over an abandoned
+  resource only knew about flags — and `metrics-author` is the node the new
+  judge-driven quality loop re-runs. `inventory.metric_keys` is last-write-wins, so if
+  iteration 2 created a different metric, iteration 1's was left in LaunchDarkly,
+  unreported, on a run that still exited 0.
+- `interpretWalk` now returns `orphanedMetricKeys` (a set comparison, since the tag is
+  a comma-separated list — adding a metric on a rework is clean, dropping one is not),
+  `decideApproval` reports INCOMPLETE for it, and `runRecord.orphanedResources` carries
+  flags and metrics. An orphaned flag still takes precedence in the reason, being the
+  more serious of the two.
+
+### ✅ `loop_if_judge_below` — judge-driven quality retries
+- **Why:** judge scores were computed, recorded to LaunchDarkly, and then **discarded**
+  by the walker. They are the only evaluation signal in the pipeline grounded in
+  verified evidence (real commits/diff, not the agent's claims), so routing on them
+  turns monitoring into control.
+- **New handoff field `loop_if_judge_below: N`** (`N` in `[0, 1]`): take this edge only
+  when the just-completed node scored below `N`. A judge scores the node it is attached
+  to, so these are **self-loops**. Committed: `metrics-author → metrics-author`,
+  `max_visits: 1`, threshold `0.7`.
+- **Fail-open:** a score counts only when sampled + successful + numeric; otherwise the
+  edge is not taken. The **minimum** across a node's judges decides. `samplingRate`
+  lives in LaunchDarkly, so this can't be a build check — the walker logs loudly when a
+  judge-routing node yields no usable score.
+- **These loops are advisory.** The node also has a forward edge, so a spent budget
+  falls through and the walk finishes normally — no `loopExhausted`. New
+  `loopBudgetSpent` records the attempt and surfaces as a warning on all four front
+  ends, so "quality retries exhausted" can't pass as a clean first-pass run.
+- **Scores + reasoning ride on `NodeRun`**, which is also the resume journal, so a
+  routing input is persisted and replayed by construction. A tag would have been
+  deleted by the routing rewind.
+- **`check:configs`** now enforces the `[0, 1]` range, that a judge loop carries
+  `max_visits`, and that it is declared **before** any other edge from the same node
+  (the walker takes the first passing edge, so a late declaration silently never fires).
+
+### ✅ Rework prompts say who sent them back and why
+- **Why:** a re-entered node's preamble said only "The brief below explains what to
+  change" — nothing marked the brief as a *rejection*, named the node that produced
+  it, or stated which condition fired. The agent could read the reviewer's critique
+  as a fresh task rather than a change request.
+- The preamble now reads *"Sent back by 'autofactory-code-reviewer' because
+  `review_approved=false`. The brief below is that step's own report — treat it as the
+  change request, not a new task."* The reason is derived from the edge's own
+  conditions, so it works for any loop edge; a `skip_if_tags` edge is phrased as the
+  exit that never happened (`review_approved never became approve`).
+- **Not** carried as a tag, and the critique itself is **not** duplicated — the inbound
+  brief already carries the loop source's full report.
+- **Exhaustion messaging:** `describeLoopExhausted` now appends `— trigger: <condition>`,
+  so a non-converged loop reports why it kept firing instead of only that the budget
+  ran out. All four surfaces inherit it through the shared helper.
+
+### ⚠️ Known scope limit: `max_visits` bounds a walk, not a PR
+- The traversal counter is process-local (`edgeCounts` in `graphWalker.ts`) and is
+  persisted nowhere, so **every re-run starts with a full budget**. Because the
+  Action re-runs on `synchronize` and `labeled`, cumulative rework over a PR's life
+  is not capped by `max_visits: 2` — a PR pushed five times can take ten rework
+  passes. Each individual walk still terminates (per-edge cap + run-level backstop),
+  so this is not a runaway risk, but the July entry below and the README previously
+  implied a per-PR guarantee that does not exist. Both are corrected.
+- Compounding factor: approval labels persist across pushes by design (`labels.ts`),
+  so an approved gated node can be re-entered on every later push, each time after a
+  fresh re-plan. Fixing either properly needs cross-run walk state — see
+  `docs/phase4-judge-driven-loops.md` Step 2.
+- **Partially addressed** by the CLI's `--resume` (Step 2): a resumed walk re-derives
+  its traversal counts from the saved journal, so budgets are cumulative across a
+  resume chain. An ordinary re-run still starts fresh — it has no journal to replay —
+  so this is narrowed, not closed. Closing it needs re-runs to resume by default,
+  which on the Action depends on the deferred Action-side storage work.
+
+---
+
 ## 2026-08-07 (Bedrock provider)
 
 ### ✅ `auto-factory-ai-provider`: new `bedrock` variation
@@ -148,6 +285,33 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-07-28 (bounded loop-back edges)
+
+### ✅ `max_visits` handoff field + rework-aware agents
+- **Why:** the walker silently dropped loop-back edges (a cycle looked like a
+  clean success). Bounded loops let the graph iterate — re-plan on a rejection,
+  fix failing tests — without redoing irreversible work or running forever.
+- **New handoff field `max_visits`:** tag a loop-closing edge with `max_visits: N`
+  (integer, hard-capped at 10) to let it be traversed N times. Only tagged edges
+  are capped; untagged forward/rejoin edges never are. A non-converged loop
+  reports `loopExhausted` — a hard failure (red check / non-zero exit), never
+  "approved". See README → "Handoff fields the walker honors → `max_visits`".
+- **Agent instructions (all six agents):** added a "Rework iterations" section —
+  on a `REWORK ITERATION N` prompt, amend/reuse the listed resources
+  (`use_existing_flag`/`add_variation`, never `create_flag`; update the existing
+  manifest) instead of recreating. The research-planner additionally must not set
+  `skip_flagging` once a flag exists in a prior iteration (would orphan it).
+- **Behavior change for served cyclic graphs:** the walker runs the LD-served
+  graph, so adding a back-edge in LaunchDarkly is live. A served cycle that used
+  to terminate silently now iterates to its budget and, if unconverged, goes red.
+  `check:configs` enforces `max_visits ∈ [1,10]` and that every *committed* cycle
+  carries a budget; the run-level cap backstops runtime-only cycles.
+- **Runtime (tooling — this branch):** walker per-edge budget + routing/inventory
+  tag split + rewind; approval orphan/false-green guard; loop-exhausted reporting
+  across all front ends; pre-push gate hook inverted to a fail-closed allowlist.
+
+---
+
 ## 2026-07-24 (Sentry estate bridge — ADR 0015)
 
 ### ✅ Metrics author: `query_sentry` + dual-export guidance
@@ -189,7 +353,6 @@ Status legend: ✅ done · 🔜 planned/in progress
 - Runtime: `BEACON_SEER_AUTOFIX=true` → find Sentry issue → Autofix `open_pr`.
 
 ---
-
 
 ## 2026-07-20 (provider-aware model routing)
 
@@ -272,7 +435,6 @@ Status legend: ✅ done · 🔜 planned/in progress
   arms differ ONLY by model, which is what makes the A/B a model comparison.
 
 
-
 ### ✅ Metrics author: literal event keys (M12) — instruction hardening from live run
 - **Motivation (live CLI run, `show-free-shipping-nudge`):** the metrics author
   instrumented events with a template literal — `` track(`${FLAG_KEY}-error`) `` —
@@ -287,7 +449,6 @@ Status legend: ✅ done · 🔜 planned/in progress
   string" at the `track()` syntax. The shim stays strict (greppable literal = the
   verifiable contract); its failure detail now explains the dynamic-key case and
   the fix (runtime change, noted here because it pairs with M12).
-
 
 
 ### ✅ Deterministic handoff shims: agent claims re-derived from primary evidence

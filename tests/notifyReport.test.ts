@@ -1,0 +1,245 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+
+import { describeNotifyResult, FINAL_ACTIONS, NON_FINAL_ACTIONS } from "@auto-factory/beacon";
+
+// ---------------------------------------------------------------------------
+// The Notifier is the only thing an operator sees, and it used to say "HTTP 200"
+// for a deploy in which nothing released.
+//
+// Two separate blind spots:
+//  1. Non-blocking BY CONTRACT (it must never fail a deploy), so a 5xx became one
+//     console.warn beside a green deploy.
+//  2. The larger one, unrelated to failures: Beacon ACKS a notification and reports
+//     per-flag outcomes in the body, so `held`/`waiting`/`error` arrive inside a 200.
+//     Nothing REDELIVERS the notification (the Notifier exits 0; Railway documents no
+//     webhook retry). The ledger (pending.ts) re-checks unfinished flags on the next
+//     deploy, so they are no longer permanent — but nothing happens before then, and a
+//     flag whose newest release is terminal-without-completing is refused rather than
+//     retried, for as long as that stays true (server.ts, `terminalHistoryRefusal`).
+//
+// The exit code stays 0. What changes is that a human is told.
+// ---------------------------------------------------------------------------
+
+const BASE = { service: "demo-backend", sha: "abc123", beaconUrl: "https://beacon.example" };
+const body = (o: unknown): string => JSON.stringify({ discovered: Array.isArray(o) ? o.length : 0, outcomes: o });
+
+describe("describeNotifyResult", () => {
+  it("an unparseable 2xx body carries the ACTION REQUIRED marker", () => {
+    // `notify.ts` documents an alert on that exact string as the way to notice a strand, and a 2xx
+    // whose body is not JSON — a proxy answering instead of Beacon — is the case where NOTHING can
+    // be confirmed. It was the only attention path without the marker, so the documented alert
+    // missed precisely the outcome it most needed to catch.
+    const r = describeNotifyResult({
+      status: 200,
+      body: "<html>gateway</html>",
+      service: "demo-backend",
+      sha: "abc1234",
+      beaconUrl: "https://beacon.example",
+    });
+    assert.equal(r.attention, true);
+    assert.match(r.lines[0] ?? "", /ACTION REQUIRED/);
+  });
+
+  it("a 200 carrying stranded flags demands attention — the case that read as success", () => {
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "enable-one", action: "released" },
+        { flag: "enable-two", action: "held", detail: "notBefore 2026-12-01" },
+        { flag: "enable-three", action: "error", detail: "idempotency check failed" },
+      ]),
+    });
+    assert.equal(r.attention, true, "HTTP 200 is not the same as 'the flags released'");
+    const text = r.lines.join("\n");
+    assert.match(text, /ACTION REQUIRED/, "the marker an alert can grep for");
+    assert.match(text, /2 of 3 flag\(s\) did NOT release/);
+    assert.match(text, /enable-two: held/);
+    assert.match(text, /enable-three: error/);
+    assert.doesNotMatch(text, /enable-one/, "a released flag is not noise for the operator");
+    assert.match(text, /re-check them on the\s+next deploy/);
+    assert.match(text, /nothing happens before then/);
+  });
+
+  it("does not tell an operator that a needsHuman flag is never retried", () => {
+    // PREVENTS resurrecting a latch that no longer exists, in the one line an operator reads.
+    // `needsHuman` used to short-circuit `reEvaluate` off a stored field, and nothing in the code
+    // could clear it — hand-editing the ledger file was the only way out, which is what "never
+    // retried" described. It is now RE-DERIVED on every pass from the flag's newest release
+    // (`terminalHistoryRefusal`), so the refusal lasts exactly as long as its cause and then the
+    // entry takes the normal path. Telling an operator otherwise sends them looking for a file to
+    // edit, and invites them to distrust the re-check the same sentence promises.
+    //
+    // The outcome carries `needsHuman: true`, which is what server.ts actually emits for a reverted
+    // flag — and is now what makes the paragraph print at all (see the two tests below).
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "f", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "reverted", needsHuman: true },
+      ]),
+    });
+    const text = r.lines.join("\n");
+    assert.equal(r.attention, true);
+    assert.doesNotMatch(text, /never retried/, "THE DISCRIMINATOR: the deleted latch is not asserted");
+    assert.match(text, /re-decided on every deploy/, "the refusal is conditional, and the condition is named");
+  });
+
+  it("prints the needsHuman paragraph ONLY when an outcome actually carries needsHuman", () => {
+    // PREVENTS a paragraph about guardrail rollbacks on a deploy that had none. It used to print for
+    // ANY non-empty stranded list, so the commonest strands — a `waiting` fullstack counterpart, a
+    // future `notBefore` — were reported with an explanation of `reverted`/`monitoring_stopped` that
+    // applied to nothing in the list. An operator reading it looks for a reverted release that does
+    // not exist, and the per-flag lines gave them no way to tell which outcome it was about.
+    const quiet = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "a", sourceFile: ".release-flags/pr-1.json", action: "waiting", detail: "other service not deployed yet" },
+        { flag: "b", sourceFile: ".release-flags/pr-2.json", action: "held", detail: "notBefore 2099-01-01" },
+      ]),
+    });
+    const quietText = quiet.lines.join("\n");
+    assert.equal(quiet.attention, true, "they are still stranded, so a human is still told");
+    assert.match(quietText, /2 of 2 flag\(s\) did NOT release/);
+    assert.doesNotMatch(
+      quietText,
+      /needsHuman/,
+      "THE DISCRIMINATOR: no outcome refused to act, so nothing says one did",
+    );
+    assert.doesNotMatch(quietText, /reverted/, "and no guardrail rollback is described");
+
+    // Same list plus one refused outcome: now the paragraph belongs, and the LINE says which flag.
+    const loud = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "a", sourceFile: ".release-flags/pr-1.json", action: "waiting", detail: "other service not deployed yet" },
+        { flag: "b", sourceFile: ".release-flags/pr-2.json", action: "error", detail: "rel-3 is 'reverted'", needsHuman: true },
+      ]),
+    });
+    const loudText = loud.lines.join("\n");
+    assert.match(loudText, /1 of those is marked needsHuman/);
+    assert.match(loudText, /pr-2\.json b: error \[needsHuman\]/, "the mark is on the line it applies to");
+    assert.doesNotMatch(
+      loudText,
+      /pr-1\.json a: waiting \[needsHuman\]/,
+      "and not on the one it does not",
+    );
+  });
+
+  it("the needsHuman paragraph agrees with its own count when more than one is refused", () => {
+    // PREVENTS "3 of those IS marked needsHuman ... will NOT re-trigger IT". Not a pedantic point:
+    // N > 1 is the ORDINARY case. `config/services.yaml` registers four `side: backend` services on
+    // one repo, so one merge produces four notifications that discover the same manifest — one
+    // releases, three are kept — and a later revert marks every kept entry. The singular text then
+    // read as though a single flag were affected, understating the blast radius on the exact deploy
+    // where an operator is counting what broke.
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "a", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "rel-1 'reverted'", needsHuman: true },
+        { flag: "b", sourceFile: ".release-flags/pr-2.json", action: "error", detail: "rel-2 'reverted'", needsHuman: true },
+        { flag: "c", sourceFile: ".release-flags/pr-3.json", action: "error", detail: "rel-3 'reverted'", needsHuman: true },
+      ]),
+    });
+    const text = r.lines.join("\n");
+    assert.match(text, /3 of those are marked needsHuman/, "THE DISCRIMINATOR: plural subject");
+    assert.match(text, /re-trigger them/, "and a plural object, since three flags are refused");
+    assert.doesNotMatch(text, /of those is marked/, "no singular verb on a plural count");
+    assert.doesNotMatch(text, /re-trigger it while/, "and no singular pronoun either");
+  });
+
+  it("does not tell an operator to wait for a REVERTED release to complete", () => {
+    // PREVENTS advising a wait that can never end. The paragraph named three clearing paths —
+    // "completed, replaced, or the flag moves on" — and for the commonest cause the first is
+    // unreachable: `terminalHistoryRefusal` fires on a release LaunchDarkly REVERTED, and a reverted
+    // release never becomes `completed`. The way out is a NEW release, which is exactly what the
+    // refusal's own detail asks for ("deploy the fix as a new commit").
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([{ flag: "f", sourceFile: ".release-flags/pr-1.json", action: "error", detail: "x", needsHuman: true }]),
+    });
+    const text = r.lines.join("\n");
+    assert.match(text, /new commit/, "THE DISCRIMINATOR: the clearing path named is one that exists");
+    assert.match(
+      text,
+      /never becomes 'completed'/,
+      "and the unreachable one is called out, since the old line invited exactly that wait",
+    );
+  });
+
+  it("names the recovery, including why previousSha is needed", () => {
+    const r = describeNotifyResult({ ...BASE, status: 200, body: body([{ flag: "f", action: "waiting" }]) });
+    const text = r.lines.join("\n");
+    assert.match(text, /curl .*flag-releases/s, "a half-remembered curl is no recovery");
+    assert.match(text, /previousSha/);
+    // The trap: this notification already advanced Beacon's recorded SHA, so a re-POST
+    // without previousSha diffs the wrong range and discovers nothing.
+    assert.match(text, /already advanced/);
+  });
+
+  it("an all-final 200 is quiet", () => {
+    const r = describeNotifyResult({
+      ...BASE,
+      status: 200,
+      body: body([
+        { flag: "a", action: "released" },
+        { flag: "b", action: "skipped" },
+        { flag: "c", action: "already_running" },
+        { flag: "d", action: "noop" },
+      ]),
+    });
+    assert.equal(r.attention, false, "nothing here needs a human");
+    assert.match(r.lines.join("\n"), /a=released/);
+  });
+
+  it("a deploy with no new manifests is quiet, not empty", () => {
+    const r = describeNotifyResult({ ...BASE, status: 200, body: body([]) });
+    assert.equal(r.attention, false);
+    assert.match(r.lines.join("\n"), /no new release manifests/);
+    assert.ok(r.lines.length > 0, "silence is indistinguishable from a lost deploy");
+  });
+
+  it("a 5xx says the notification is not redelivered, but the ledger will re-check", () => {
+    const r = describeNotifyResult({ ...BASE, status: 503, body: body([{ flag: "f", action: "error" }]) });
+    assert.equal(r.attention, true);
+    const text = r.lines.join("\n");
+    assert.match(text, /NOT REDELIVERED/);
+    assert.match(text, /re-checks them on the NEXT deploy/);
+    assert.match(text, /curl/, "a 5xx is worth retrying, so state how");
+  });
+
+  it("a 4xx is classified as configuration, not transient", () => {
+    const r = describeNotifyResult({ ...BASE, status: 400, body: '{"error":"unknown service \'demo-back\'"}' });
+    assert.equal(r.attention, true);
+    const text = r.lines.join("\n");
+    assert.match(text, /REJECTED/);
+    assert.match(text, /configuration problem, not a transient one/);
+    assert.match(text, /services\.yaml/, "point at the file that is wrong");
+    assert.doesNotMatch(text, /curl -fsS/, "re-POSTing an unchanged config would just fail again");
+  });
+
+  it("a 2xx with an unreadable body does not claim success", () => {
+    // A proxy or CDN in front of Beacon returning HTML with a 200.
+    const r = describeNotifyResult({ ...BASE, status: 200, body: "<html>gateway</html>" });
+    assert.equal(r.attention, true);
+    assert.match(r.lines.join("\n"), /cannot confirm what released/);
+  });
+
+  it("the action sets are disjoint and cover what the server emits", () => {
+    // If server.ts gains an action that is in neither set it silently becomes "final",
+    // which is the fail-OPEN direction — so this is pinned deliberately.
+    for (const a of NON_FINAL_ACTIONS) assert.ok(!FINAL_ACTIONS.includes(a), `${a} in both sets`);
+    const emitted = ["released", "held", "noop", "already_running", "skipped", "waiting", "error"];
+    for (const a of emitted) {
+      assert.ok(
+        NON_FINAL_ACTIONS.includes(a) || FINAL_ACTIONS.includes(a),
+        `server.ts emits '${a}' but notifyReport classifies it as neither`,
+      );
+    }
+  });
+});

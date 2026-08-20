@@ -41,6 +41,9 @@ import {
   computeConfigHash,
   createPolicyGate,
   decideApproval,
+  describeLoopBudgetSpent,
+  describeLoopEdgeShadowed,
+  describeLoopExhausted,
   extractConfigStamp,
   getLdSdk,
   interpretWalk,
@@ -303,7 +306,25 @@ function describeStall(stall: StallInfo): string {
  * the exact label to add to proceed. This is the human-readable view; the label
  * chips are the at-a-glance approved state.
  */
-function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNode: string): string {
+/**
+ * The one "what's been created / what approval does" sentence, shared by the PR
+ * comment and the `action_required` check-run summary so they can't diverge.
+ * Only claims a "prior iteration" when a loop actually re-ran a node (`reworked`)
+ * — on a first pass the gate pauses before the gated step, so "nothing created
+ * for this or later steps" stays accurate even if earlier steps created things.
+ */
+function gateStatusLine(pendingNode: string, reworked: boolean, inventory: Record<string, string>): string {
+  const created = [
+    inventory.flag_key ? `flag \`${inventory.flag_key}\`` : "",
+    inventory.metric_keys ? `metric(s) \`${inventory.metric_keys}\`` : "",
+  ].filter(Boolean);
+  if (reworked && created.length) {
+    return `The chain paused before **${pendingNode}**. A prior iteration already created ${created.join(" and ")}; approving may re-run this step (up to its \`max_visits\` budget) against new input.`;
+  }
+  return `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`;
+}
+
+function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNode: string, statusLine: string): string {
   const lines = gatedSteps.map((step) => {
     if (approved.has(step)) return `- ✓ \`${step}\` — approved`;
     if (step === pendingNode) return `- ⏸ \`${step}\` — **awaiting approval**: add the label \`${approveLabel(step)}\``;
@@ -312,7 +333,7 @@ function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNo
   return [
     "### LaunchDarkly Auto-Factory — Phase 1 ⏸ awaiting approval",
     "",
-    `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`,
+    statusLine,
     "Approve by adding the labeled step below; the chain resumes on the next run.",
     "",
     ...lines,
@@ -524,7 +545,8 @@ async function main(): Promise<void> {
     ? async (args) => {
         const results = await baseJudgeHook(args);
         for (const r of results) {
-          if (r.sampled && typeof r.score === "number") judgeScores.set(args.configKey, r.score);
+          // Key by node#iteration so a looped node's re-runs don't overwrite.
+          if (r.sampled && typeof r.score === "number") judgeScores.set(`${args.configKey}#${args.iteration}`, r.score);
         }
         return results;
       }
@@ -536,7 +558,7 @@ async function main(): Promise<void> {
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...(verifierWriter ? { writer: verifierWriter } : {}) });
 
-  const walk = await walkGraph(graphDef, runner, context, graphTracker, undefined, gate, judgeHook, verifier);
+  const walk = await walkGraph(graphDef, runner, context, { graphTracker, gate, judgeHook, verifier });
 
   // Per-node visibility: dump each agent's terminal status, routing tags, and final output.
   for (const r of walk.runs) {
@@ -565,6 +587,24 @@ async function main(): Promise<void> {
     : "";
   if (verifyText) console.log(`::error::AutoFactory: ${verifyText}`);
 
+  // A loop did not converge within budget (or hit the run-cap). A hard failure —
+  // surface it as an error annotation and fail the run below, so it can never
+  // read as a clean success even if a stale routing tag looks approved.
+  const loopText = walk.loopExhausted ? describeLoopExhausted(walk.loopExhausted) : "";
+  // Advisory quality loops that spent their budget and let the chain proceed. Not a
+  // failure, so it never reaches loopText — but it must not vanish either.
+  const advisoryLoopText = walk.loopBudgetSpent ? describeLoopBudgetSpent(walk.loopBudgetSpent) : [];
+  if (loopText) console.log(`::error::AutoFactory: ${loopText}`);
+  // Warning, not error: the run is not failed by an advisory loop, but a reviewer
+  // should know quality retries were exhausted.
+  for (const l of advisoryLoopText) console.log(`::warning::AutoFactory: ${l}`);
+  // Served-graph edge order may have made a loop unreachable. Also a warning rather
+  // than an error — the walk is valid — but it is config drift a reviewer must see,
+  // and it leaves no other trace: the loop never fired, so there is no budget to spend.
+  if (walk.loopEdgeShadowed) {
+    for (const l of describeLoopEdgeShadowed(walk.loopEdgeShadowed)) console.log(`::warning::AutoFactory: ${l}`);
+  }
+
   // Halted at an approval gate: report what's pending + how to approve, then
   // stop. The flag/code for the gated step have NOT been created. A re-run once
   // the label is added proceeds past the gate.
@@ -573,7 +613,11 @@ async function main(): Promise<void> {
     const label = approveLabel(node);
     await ensureLabel(context.REPO, label, process.env.GITHUB_TOKEN);
     console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the PR label '${label}' to proceed.`);
-    const summary = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node);
+    // One status sentence, reused by the PR comment and the check-run summary so
+    // they can't diverge; "prior iteration" wording only when a loop re-ran a node.
+    const reworked = walk.runs.some((r) => r.iteration > 1);
+    const statusLine = gateStatusLine(node, reworked, walk.inventory);
+    const summary = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node, statusLine);
     await postPrComment(summary, { prNumber: context.PR_NUMBER, repo: context.REPO });
     // Carry the pause as a distinct `action_required` check run rather than a red
     // failure, so it doesn't read as a pipeline error or a reviewer rejection
@@ -583,7 +627,7 @@ async function main(): Promise<void> {
       headSha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Approval required before ${node}`,
-      summary: `The AutoFactory chain paused before \`${node}\`. Nothing was created for this or later steps. Add the PR label \`${label}\` to approve; the chain resumes on the next run.`,
+      summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`,
     });
     return;
   }
@@ -610,11 +654,13 @@ async function main(): Promise<void> {
   });
   if (intentReview.warning) console.log(`::warning::AutoFactory: ${intentReview.warning}`);
 
-  const verdict = interpretWalk(walk.tags);
+  const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);
 
   console.log(`Verdict → ${decision.reason}`);
-  if (decision.apply) {
+  if (walk.loopExhausted) {
+    console.log("⚠ Loop did not converge — see the error above. This run is not applied.");
+  } else if (decision.apply) {
     console.log("✓ Changes approved and applied by the agents.");
   } else if (decision.noop) {
     console.log("• No flag needed — nothing to apply.");
@@ -628,18 +674,20 @@ async function main(): Promise<void> {
   // LaunchDarkly judge evaluated the node). This is the at-a-glance record the
   // PR reader gets without opening the Actions log.
   const agentRows = walk.runs.map((r) => {
-    const judge = judgeScores.get(r.configKey);
+    const judge = judgeScores.get(`${r.configKey}#${r.iteration}`);
+    // Label re-runs so a looped node shows as distinct rows (iteration 2, 3, …).
+    const label = r.iteration > 1 ? `\`${r.configKey}\` (iter ${r.iteration})` : `\`${r.configKey}\``;
     const tags =
       Object.entries(r.tags)
         .map(([k, v]) => `${k}=${v}`)
         .join(", ")
         .slice(0, 140) || "—";
-    return `| \`${r.configKey}\` | ${r.status} | ${judge !== undefined ? judge.toFixed(2) : "—"} | ${tags} |`;
+    return `| ${label} | ${r.status} | ${judge !== undefined ? judge.toFixed(2) : "—"} | ${tags} |`;
   });
   const summary = [
     "### LaunchDarkly Auto-Factory — Phase 1",
     "",
-    `**Verdict:** ${decision.reason}` +
+    `**Verdict:** ${walk.loopExhausted ? "loop did not converge — not applied" : decision.reason}` +
       (policy.mode !== "yolo" ? ` _(approval mode: ${policy.mode}${policy.mode === "risk-threshold" ? ` @ ${policy.threshold}` : ""})_` : ""),
     intentReview.line ?? "",
     intentReview.warning ? `**⚠ Release intent:** ${intentReview.warning}` : "",
@@ -650,6 +698,8 @@ async function main(): Promise<void> {
         (kg.warnings.length ? `; ⚠ ${kg.warnings.map((w) => w.split(" — ")[0]).join("; ⚠ ")}` : "")
       : "",
     walk.skipped.length ? `**Skipped:** ${walk.skipped.join(", ")}` : "",
+    loopText ? `**⟳ Loop did not converge:** ${loopText}` : "",
+    ...advisoryLoopText.map((l) => `**⟳ Quality retries exhausted:** ${l}`),
     stallText ? `**⚠ Stalled:** ${stallText}` : "",
     verifyText ? `**⛔ Deterministic check failed:** ${verifyText}` : "",
     "",
@@ -668,8 +718,12 @@ async function main(): Promise<void> {
     name: "AutoFactory — Phase 1",
     repo: context.REPO,
     headSha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
-    conclusion: !walk.verificationFailed && (decision.apply || decision.noop) ? "success" : "failure",
-    title: walk.verificationFailed ? `Deterministic check failed after ${walk.verificationFailed.node}` : decision.reason,
+    conclusion: !walk.verificationFailed && !walk.loopExhausted && (decision.apply || decision.noop) ? "success" : "failure",
+    title: walk.verificationFailed
+      ? `Deterministic check failed after ${walk.verificationFailed.node}`
+      : walk.loopExhausted
+        ? `Loop did not converge at ${walk.loopExhausted.node}`
+        : decision.reason,
     summary,
   });
 
@@ -677,7 +731,7 @@ async function main(): Promise<void> {
   // no-op (no flag needed). Red: a genuine rejection, an incomplete run (the
   // chain stalled / never reviewed), or a failed deterministic check — each
   // carries its own distinct message above.
-  if (walk.verificationFailed || (!decision.apply && !decision.noop)) process.exitCode = 1;
+  if (walk.verificationFailed || walk.loopExhausted || (!decision.apply && !decision.noop)) process.exitCode = 1;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

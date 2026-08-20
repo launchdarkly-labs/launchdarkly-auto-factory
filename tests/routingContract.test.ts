@@ -37,13 +37,30 @@ const KEYS = {
   review: "autofactory-code-reviewer",
 };
 
+/**
+ * `scriptByKey[key]` is either one result reused on every call, or an array
+ * consumed one-per-call (clamped to the last entry) so a node can return e.g.
+ * "false" then "true" across rework iterations. Prompts are captured so loop
+ * tests can assert what iteration 2 was actually told.
+ */
 class FakeRunner implements AgentRunner {
-  constructor(private readonly scriptByKey: Record<string, Partial<AgentNodeResult>>) {}
+  readonly promptsByKey: Record<string, string[]> = {};
+  private readonly calls: Record<string, number> = {};
+  constructor(
+    private readonly scriptByKey: Record<
+      string,
+      Partial<AgentNodeResult> | Array<Partial<AgentNodeResult>>
+    >,
+  ) {}
   async runNode(req: AgentNodeRequest): Promise<AgentNodeResult> {
-    const s = this.scriptByKey[req.configKey] ?? {};
+    const n = this.calls[req.configKey] ?? 0;
+    this.calls[req.configKey] = n + 1;
+    (this.promptsByKey[req.configKey] ??= []).push(req.prompt);
+    const entry = this.scriptByKey[req.configKey];
+    const s: Partial<AgentNodeResult> = Array.isArray(entry) ? entry[Math.min(n, entry.length - 1)] ?? {} : entry ?? {};
     return {
       status: s.status ?? "completed",
-      messages: s.messages ?? [{ role: "assistant", content: `done: ${req.configKey}`, isFinal: true }],
+      messages: s.messages ?? [{ role: "assistant", content: `done: ${req.configKey} #${n + 1}`, isFinal: true }],
       tags: s.tags ?? {},
     };
   }
@@ -57,6 +74,9 @@ function buildChain(): AgentGraphDefinition {
       [KEYS.flag]: [{ key: KEYS.metrics, handoff: { require_tags: { flag_ready: "true" } } }],
       [KEYS.metrics]: [{ key: KEYS.test, handoff: { require_tags: { needs_tests: "true" } } }],
       [KEYS.test]: [{ key: KEYS.review }],
+      // Phase 4 Step 1a: bounded rework loop on the reviewer's verdict. Mirrors
+      // the committed graph edge — kept honest by the parity test below.
+      [KEYS.review]: [{ key: KEYS.flag, handoff: { max_visits: 1, require_tags: { review_approved: "false" } } }],
     },
   };
   const cfg = (key: string): LDAIAgentConfig =>
@@ -72,7 +92,9 @@ function buildChain(): AgentGraphDefinition {
   return new AgentGraphDefinition(flagValue, nodes, true, () => ({}) as unknown as LDGraphTracker);
 }
 
-async function runShape(script: Record<string, Partial<AgentNodeResult>>): Promise<WalkResult> {
+async function runShape(
+  script: Record<string, Partial<AgentNodeResult> | Array<Partial<AgentNodeResult>>>,
+): Promise<WalkResult> {
   return walkGraph(buildChain(), new FakeRunner(script), { PR_NUMBER: "1" });
 }
 const path = (w: WalkResult) => w.runs.map((r) => r.configKey);
@@ -144,6 +166,265 @@ describe("routing contract: PR-shape fixtures (walk → interpret → decide)", 
 });
 
 // ---------------------------------------------------------------------------
+// Phase 4 Step 1a — the verdict-driven rework loop, on the real config keys.
+// The reviewer's `review_approved` was previously routed on by nothing; the
+// loop edge review → implementer (max_visits: 1) makes a rejection actionable.
+// ---------------------------------------------------------------------------
+describe("routing contract: verdict-driven rework loop", () => {
+  /** A flag-worthy PR whose reviewer verdict is scripted per iteration. */
+  const reworkScript = (
+    verdicts: Array<Record<string, string>>,
+    flagTags: Array<Record<string, string>> = [{ flag_ready: "true", flag_created: "true", flag_key: "enable-x" }],
+  ): Record<string, Partial<AgentNodeResult> | Array<Partial<AgentNodeResult>>> => ({
+    [KEYS.research]: { tags: { flag_worthy: "true", risk_score: "0.4" } },
+    [KEYS.flag]: flagTags.map((tags) => ({ tags })),
+    [KEYS.metrics]: { tags: { metrics_created: "true", needs_tests: "true" } },
+    [KEYS.review]: verdicts.map((tags) => ({ tags })),
+  });
+
+  const countOf = (w: WalkResult, key: string) => w.runs.filter((r) => r.configKey === key).length;
+
+  it("1. a rejection re-runs the implementer; an approval on iteration 2 converges", async () => {
+    const w = await runShape(
+      reworkScript([
+        { review_approved: "false", risk_level: "medium" },
+        { review_approved: "true", risk_level: "low" },
+      ]),
+    );
+    assert.deepEqual(path(w), [
+      KEYS.research, KEYS.flag, KEYS.metrics, KEYS.test, KEYS.review,
+      KEYS.flag, KEYS.metrics, KEYS.test, KEYS.review,
+    ]);
+    assert.equal(countOf(w, KEYS.flag), 2, "the implementer re-ran exactly once");
+    assert.equal(w.loopExhausted, undefined);
+    assert.equal(w.stalledAt, undefined);
+    // Iterations are labelled, so reporting can distinguish the two passes.
+    assert.deepEqual(
+      w.runs.filter((r) => r.configKey === KEYS.flag).map((r) => r.iteration),
+      [1, 2],
+    );
+    const d = decide(w);
+    assert.equal(d.apply, true);
+    assert.equal(d.incomplete, false);
+  });
+
+  it("2. an approval on the first pass never enters the loop", async () => {
+    const w = await runShape(reworkScript([{ review_approved: "true", risk_level: "low" }]));
+    assert.deepEqual(path(w), [KEYS.research, KEYS.flag, KEYS.metrics, KEYS.test, KEYS.review]);
+    assert.equal(countOf(w, KEYS.flag), 1);
+    assert.equal(w.loopExhausted, undefined);
+    assert.equal(decide(w).apply, true);
+  });
+
+  it("3. KNOWN GAP: a drifted verdict ('rejected') does NOT loop, but still reports REJECTED", async () => {
+    // require_tags is exact equality; approval.ts normalizes. So a reviewer that
+    // says "rejected" instead of "false" skips the rework but is still read as a
+    // rejection — no wasted iteration, and nothing reports success. Fails safe.
+    const w = await runShape(reworkScript([{ review_approved: "rejected", risk_level: "high" }]));
+    assert.equal(countOf(w, KEYS.flag), 1, "no rework attempted");
+    assert.equal(w.loopExhausted, undefined);
+    const d = decide(w);
+    assert.equal(d.apply, false);
+    assert.equal(d.incomplete, false);
+    assert.match(d.reason, /reject/i);
+  });
+
+  it("4. a verdict that never converges exhausts the budget instead of looping forever", async () => {
+    const w = await runShape(reworkScript([{ review_approved: "false", risk_level: "high" }]));
+    assert.equal(countOf(w, KEYS.flag), 2, "1 initial + max_visits(1) rework");
+    assert.equal(w.stalledAt, undefined);
+    assert.equal(w.loopExhausted?.reason, "budget");
+    assert.deepEqual(w.loopExhausted?.exhausted, [
+      // `trigger` names the condition that kept firing, so the report says WHY the
+      // budget ran out rather than only that it did.
+      { source: KEYS.review, target: KEYS.flag, traversals: 1, maxVisits: 1, trigger: "review_approved=false" },
+    ]);
+  });
+
+  it("5. a reviewer that emits no verdict on iteration 2 does NOT re-fire the loop", async () => {
+    // A loop edge's routing conditions match the just-completed run's OWN tags, so
+    // the iteration-1 rejection that the rewind overlaid cannot re-trigger rework
+    // when the reviewer said nothing this pass.
+    //
+    // This used to burn a second full live iteration (four nodes, real LaunchDarkly
+    // writes) and then attribute it to a critique the reviewer never made — the
+    // rework preamble read "Sent back by 'code-reviewer' because
+    // review_approved=false" on a pass where it produced no verdict at all.
+    const w = await runShape(reworkScript([{ review_approved: "false" }, {}]));
+    assert.equal(countOf(w, KEYS.flag), 2, "one rework, then it stopped");
+    assert.equal(w.loopExhausted, undefined, "no budget burned chasing a stale verdict");
+    assert.equal(w.stalledAt, undefined, "an unmet loop edge is convergence, not a stall");
+    // Non-green either way. Known imprecision: the REASON is the stale rejection
+    // rather than "no verdict", because walk.tags still carries the overlaid value
+    // from iteration 1. Wrong label, right outcome — nothing reports success.
+    const d = decide(w);
+    assert.equal(d.apply, false);
+    assert.equal(d.noop, false);
+  });
+
+  it("5b. a loop edge may still gate on an upstream FACT tag across iterations", async () => {
+    // The freshness rule is scoped to ROUTING tags. Fact tags are never rewound and
+    // legitimately come from other nodes, so requiring the reviewer to re-emit
+    // `flag_ready` (which only the implementer sets) would break real configs.
+    const factLoop = (): AgentGraphDefinition => {
+      const flagValue: LDAgentGraphFlagValue = {
+        root: KEYS.research,
+        edges: {
+          [KEYS.research]: [{ key: KEYS.flag }],
+          [KEYS.flag]: [{ key: KEYS.review }],
+          // Loops while a FACT set by the implementer holds, exiting on the verdict.
+          [KEYS.review]: [
+            {
+              key: KEYS.flag,
+              handoff: { max_visits: 1, require_tags: { flag_ready: "true" }, skip_if_tags: { review_approved: "true" } },
+            },
+          ],
+        },
+      };
+      const cfg = (key: string): LDAIAgentConfig =>
+        ({
+          key,
+          enabled: true,
+          instructions: `instructions for ${key}`,
+          model: { name: "Anthropic.claude-sonnet-4-6" },
+          createTracker: () => ({}) as unknown as LDAIConfigTracker,
+        }) as LDAIAgentConfig;
+      const configs = Object.fromEntries(Object.values(KEYS).map((k) => [k, cfg(k)]));
+      return new AgentGraphDefinition(
+        flagValue,
+        AgentGraphDefinition.buildNodes(flagValue, configs),
+        true,
+        () => ({}) as unknown as LDGraphTracker,
+      );
+    };
+    const w = await walkGraph(
+      factLoop(),
+      new FakeRunner({
+        [KEYS.flag]: { tags: { flag_ready: "true" } },
+        [KEYS.review]: [{ tags: {} }, { tags: { review_approved: "true" } }],
+      }),
+      { PR_NUMBER: "1" },
+    );
+    // The reviewer never emits flag_ready, yet the loop fires on the implementer's.
+    assert.equal(countOf(w, KEYS.flag), 2, "the fact-gated loop still works");
+  });
+
+  it("6a. the walker DOES re-ask the gate on re-entry (a controller that changes its mind can halt)", async () => {
+    // This proves the walker's contract, not the product's behaviour — no real
+    // controller answers differently on the second call. See 6b.
+    let asked = 0;
+    const gate = {
+      steps: [KEYS.flag],
+      resolve: async () => {
+        asked++;
+        return asked === 1; // approved once, then withheld
+      },
+    };
+    const w = await walkGraph(
+      buildChain(),
+      new FakeRunner(reworkScript([{ review_approved: "false", risk_level: "medium" }])),
+      { PR_NUMBER: "1" },
+      { gate },
+    );
+    assert.equal(asked, 2, "the gate was consulted again on re-entry");
+    assert.equal(w.pendingApproval?.node, KEYS.flag);
+    assert.equal(countOf(w, KEYS.flag), 1, "iteration 2 never ran — no new side effects");
+    assert.equal(w.loopExhausted, undefined, "halted by the gate, not by the budget");
+  });
+
+  it("6b. REALITY: an idempotent controller lets one approval authorise the rework too", async () => {
+    // Every real controller answers from a per-run decision that doesn't change —
+    // the CLI's `--approve` set, the Action's PR label, the extension's cached
+    // answer. So the re-ask is a formality and a single human "yes" covers the
+    // rework's side effects as well. The README used to claim the opposite; this
+    // pins what actually happens so the claim can't drift back.
+    const approved = new Set([KEYS.flag]); // stands in for --approve / a PR label
+    let asked = 0;
+    const w = await walkGraph(
+      buildChain(),
+      new FakeRunner(
+        reworkScript([
+          { review_approved: "false", risk_level: "medium" },
+          { review_approved: "true", risk_level: "low" },
+        ]),
+      ),
+      { PR_NUMBER: "1" },
+      {
+        gate: {
+          steps: [KEYS.flag],
+          resolve: async (node: string) => {
+            asked++;
+            return approved.has(node);
+          },
+        },
+      },
+    );
+    assert.equal(asked, 2, "asked twice...");
+    assert.equal(w.pendingApproval, undefined, "...but never halted");
+    assert.equal(countOf(w, KEYS.flag), 2, "the rework ran on the strength of the first approval");
+    assert.equal(decide(w).apply, true);
+  });
+
+  it("7. the re-run is told WHO sent it back and WHY, and that the brief is a change request", async () => {
+    // Without this the reviewer's report arrives as an undifferentiated brief and
+    // reads like a fresh task. Note the critique itself is NOT duplicated into the
+    // preamble — ctx.PREVIOUS_STEP_OUTPUT already carries the reviewer's full text.
+    const runner = new FakeRunner(
+      reworkScript([
+        { review_approved: "false", risk_level: "medium" },
+        { review_approved: "true", risk_level: "low" },
+      ]),
+    );
+    await walkGraph(buildChain(), runner, { PR_NUMBER: "1" });
+    const prompts = runner.promptsByKey[KEYS.flag] ?? [];
+    assert.equal(prompts.length, 2);
+    assert.doesNotMatch(prompts[0] ?? "", /REWORK ITERATION/, "the first pass is not a rework");
+    const rework = prompts[1] ?? "";
+    assert.match(rework, /=== REWORK ITERATION 2 ===/);
+    assert.match(rework, /Sent back by 'autofactory-code-reviewer' because review_approved=false/);
+    assert.match(rework, /treat it as the change request, not a new task/);
+    // The inbound brief (the reviewer's own report) is still present alongside it.
+    assert.match(rework, /done: autofactory-code-reviewer #1/);
+    // And the inventory facts survive the rewind, so it amends rather than recreates.
+    assert.match(rework, /flag_key: enable-x/);
+  });
+
+  it("8. a loop trigger does not leak into the next node's preamble", async () => {
+    // The trigger is consumed once, by the node the loop edge re-entered. The
+    // metrics author also runs twice, but via a FORWARD edge — it must not be told
+    // the reviewer sent it back.
+    const runner = new FakeRunner(
+      reworkScript([{ review_approved: "false" }, { review_approved: "true", risk_level: "low" }]),
+    );
+    await walkGraph(buildChain(), runner, { PR_NUMBER: "1" });
+    const metricsRework = (runner.promptsByKey[KEYS.metrics] ?? [])[1] ?? "";
+    assert.match(metricsRework, /=== REWORK ITERATION 2 ===/, "it is still iteration 2");
+    assert.doesNotMatch(metricsRework, /Sent back by/, "but nothing sent it back");
+    assert.match(metricsRework, /The brief below explains what to change/, "generic wording instead");
+  });
+
+  it("9. a rework that creates a DIFFERENT flag is caught by the orphan guard", async () => {
+    // Phase 3 instructs the implementer to amend (use_existing_flag/add_variation)
+    // on a rework. If it creates a second flag instead, the never-rewound
+    // inventory exposes the orphan and the run reports INCOMPLETE, not success.
+    const w = await runShape(
+      reworkScript(
+        [{ review_approved: "false" }, { review_approved: "true", risk_level: "low" }],
+        [
+          { flag_ready: "true", flag_created: "true", flag_key: "enable-x" },
+          { flag_ready: "true", flag_created: "true", flag_key: "enable-y" },
+        ],
+      ),
+    );
+    assert.equal(countOf(w, KEYS.flag), 2);
+    assert.equal(w.inventory.flag_key, "enable-y", "inventory tracks the latest created resource");
+    const d = decideApproval(interpretWalk(w.tags, w.inventory, w.runs));
+    assert.equal(d.incomplete, true, "an orphaned earlier flag must not report success");
+    assert.equal(d.apply, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe("routing contract: deterministic handoff shims halt the walk", () => {
   it("a failed verification stops downstream nodes and reports the failure", async () => {
     const verifier = async (run: { configKey: string; tags: Record<string, string> }) =>
@@ -162,17 +443,49 @@ describe("routing contract: deterministic handoff shims halt the walk", () => {
         [KEYS.flag]: { tags: { flag_ready: "true", flag_key: "enable-x" } },
       }),
       { PR_NUMBER: "1" },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      verifier,
+      { verifier },
     );
     assert.deepEqual(path(w), [KEYS.research, KEYS.flag]); // halted at the implementer
     assert.equal(w.verificationFailed?.node, KEYS.flag);
     assert.match(w.verificationFailed?.failures[0]?.detail ?? "", /not referenced/);
     // Downstream never ran.
     assert.ok(w.skipped.includes(KEYS.metrics));
+  });
+
+  it("a FAILED run is not verified — the walk reports the error, not an unverified claim", async () => {
+    // Every shim trigger is a TOOL-set tag, so a run that errors late carries them: the real
+    // `tests_last_run: "fail"` shim fails unconditionally, which an agent whose suite went red and
+    // then timed out mid-fix hits every time. Verifying that run turns "the run errored" into
+    // "the agent claimed something it cannot prove" — the same dead end with the wrong diagnosis.
+    // Mirrors the real `tests_last_run === "fail"` shim: it only makes a claim when that tag is
+    // present, and no claim at all otherwise (the real verifier returns null when nothing matched).
+    const verifiedTagSets: Array<Record<string, string>> = [];
+    const verifier = async ({ configKey, tags }: { configKey: string; tags: Record<string, string> }) => {
+      verifiedTagSets.push(tags);
+      if (tags.tests_last_run !== "fail") return null;
+      return {
+        node: configKey,
+        ok: false,
+        passed: [],
+        failures: [{ name: "tests-green-at-handoff", detail: "the last real run_tests execution FAILED" }],
+      };
+    };
+    const w = await walkGraph(
+      buildChain(),
+      new FakeRunner({
+        [KEYS.research]: { tags: { flag_worthy: "true" } },
+        // Landed a red suite, then the run itself errored.
+        [KEYS.flag]: { status: "failed", tags: { tests_last_run: "fail" } },
+      }),
+      { PR_NUMBER: "1" },
+      { verifier },
+    );
+    assert.equal(verifiedTagSets.length, 1, "the healthy node was still verified; the failed one was not");
+    assert.equal(w.verificationFailed, undefined, "the failed run must not be reported as an unverified claim");
+    // The honest outcome instead: the walk stops at that node because nothing routes.
+    assert.deepEqual(path(w), [KEYS.research, KEYS.flag]);
+    assert.equal(w.runs[1]?.status, "failed");
+    assert.equal(w.stalledAt?.node, KEYS.flag);
   });
 
   it("a passing verification lets the chain continue; a shim crash never halts", async () => {
@@ -195,11 +508,7 @@ describe("routing contract: deterministic handoff shims halt the walk", () => {
         [KEYS.review]: { tags: { review_approved: "approve", risk_level: "low" } },
       }),
       { PR_NUMBER: "1" },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      verifier,
+      { verifier },
     );
     assert.deepEqual(path(w), [KEYS.research, KEYS.flag, KEYS.metrics, KEYS.test, KEYS.review]);
     assert.equal(w.verificationFailed, undefined);
@@ -230,6 +539,21 @@ describe("routing contract: registry ⟷ runtime + graph consistency", () => {
         }
       }
     }
+  });
+
+  it("the committed graph carries the rework loop edge this file's fixture mirrors", () => {
+    // buildChain() is a deliberate simplification of the real graph (it omits the
+    // manifest steward), so the loop edge is the one part that MUST stay in step
+    // with config — otherwise these loop tests would pass against a shape that no
+    // longer ships.
+    const graph = readJson("config/agentcontrol/graphs/auto-factory.json");
+    const loop = (graph.edges ?? []).find(
+      (e: { sourceConfig: string; targetConfig: string }) =>
+        e.sourceConfig === KEYS.review && e.targetConfig === KEYS.flag,
+    );
+    assert.ok(loop, "no code-reviewer → flag-implementer rework edge in the committed graph");
+    assert.equal(loop.handoff?.max_visits, 1);
+    assert.deepEqual(loop.handoff?.require_tags, { review_approved: "false" });
   });
 
   it("the verdict/routing tags interpretWalk reads are registry tags", () => {

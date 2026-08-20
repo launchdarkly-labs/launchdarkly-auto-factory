@@ -50,20 +50,39 @@ export interface ToolFile {
 }
 
 /**
+ * The tools library as provisioning found it. `versions` is what variation
+ * attachment needs (`tools: [{key, version}]`); `declared` is every key the repo
+ * asked for, whether or not it made it. Both, because a key missing from
+ * `versions` alone cannot say why it is missing.
+ */
+export interface ToolLibrary {
+  /** Tool key → live version. Populated only for tools that exist in LaunchDarkly. */
+  versions: Map<string, number>;
+  /** Every tool key found in the tools dir, including ones that failed to provision. */
+  declared: Set<string>;
+}
+
+/**
  * Ensure every committed tool definition exists in the project's tools
  * library. Create-only (existing definitions are never touched here — the LD
  * copy is the editable one; `upgrade` owns syncing drift). Returns key →
- * live version, which variation attachment needs (`tools: [{key, version}]`).
+ * live version, which variation attachment needs (`tools: [{key, version}]`),
+ * alongside the declared set — see {@link ToolLibrary}.
  */
 export async function provisionTools(
   ld: LdClient,
   toolsDir: string,
   result: ProvisionResult,
   dryRun: boolean,
-): Promise<Map<string, number>> {
+): Promise<ToolLibrary> {
   const versions = new Map<string, number>();
+  // Every key the repo DECLARES, recorded before any request. `versions` only
+  // gains a key on success, so without this the two reasons a key can be missing
+  // — absent from the repo, or present but unprovisionable — are indistinguishable.
+  const declared = new Set<string>();
   for (const file of listJson(toolsDir)) {
     const tool = JSON.parse(readFileSync(file, "utf8")) as ToolFile;
+    declared.add(tool.key);
     try {
       const existing = await ld.getAiTool<{ version?: number }>(tool.key);
       if (existing.status === 200) {
@@ -88,7 +107,7 @@ export async function provisionTools(
       result.failures.push({ resource: `ai-tool ${tool.key}`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
     }
   }
-  return versions;
+  return { versions, declared };
 }
 
 interface AiVariation {
@@ -136,7 +155,7 @@ function mapVariation(
   v: AiVariation,
   configKey: string,
   result: ProvisionResult,
-  toolVersions?: Map<string, number>,
+  tools?: ToolLibrary,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const f of VAR_FIELDS) if (v[f] !== undefined) out[f] = v[f];
@@ -145,14 +164,21 @@ function mapVariation(
   // refs pulled from a source project by seed) is stripped as before —
   // those reference a DIFFERENT project's tool library.
   const named = Array.isArray(v.tools) && v.tools.every((t) => typeof t === "string") ? (v.tools as string[]) : undefined;
-  if (named && toolVersions) {
+  if (named && tools) {
     const refs = named
       .filter((n) => {
-        if (toolVersions.has(n)) return true;
-        result.failures.push({ resource: `${configKey}/${v.key} tool '${n}'`, status: 0, message: "no such tool in config/agentcontrol/tools/ — attachment skipped" });
+        if (tools.versions.has(n)) return true;
+        // Say WHICH of the two it is. A single 403 on the tool library used to
+        // report every variation's tools as missing from the repo, which sent the
+        // reader to the wrong place: 50 such lines buried the 7 real failures,
+        // each naming a file that was sitting right there.
+        const message = tools.declared.has(n)
+          ? "declared in config/agentcontrol/tools/ but not provisioned — see the ai-tool failure above; attachment skipped"
+          : "no such tool in config/agentcontrol/tools/ — attachment skipped";
+        result.failures.push({ resource: `${configKey}/${v.key} tool '${n}'`, status: 0, message });
         return false;
       })
-      .map((n) => ({ key: n, version: toolVersions.get(n) as number }));
+      .map((n) => ({ key: n, version: tools.versions.get(n) as number }));
     if (refs.length > 0) out.tools = refs;
   } else if (v.tools !== undefined || v.toolKeys !== undefined) {
     result.toolsStripped.push({ config: configKey, variation: v.key });
@@ -207,7 +233,7 @@ async function provisionAiConfig(
   cfg: AiConfigFile,
   result: ProvisionResult,
   dryRun: boolean,
-  toolVersions?: Map<string, number>,
+  tools?: ToolLibrary,
 ): Promise<void> {
   const variations = cfg.variations ?? [];
   const existing = await ld.getAiConfig<{ variations?: { key: string }[] }>(cfg.key);
@@ -228,7 +254,7 @@ async function provisionAiConfig(
     };
     let defaultMapped: Record<string, unknown> | undefined;
     if (variations[0]) {
-      defaultMapped = mapVariation(variations[0], cfg.key, result, toolVersions);
+      defaultMapped = mapVariation(variations[0], cfg.key, result, tools);
       body.defaultVariation = defaultMapped;
     }
     try {
@@ -254,7 +280,7 @@ async function provisionAiConfig(
       continue;
     }
     try {
-      const mapped = mapVariation(v, cfg.key, result, toolVersions);
+      const mapped = mapVariation(v, cfg.key, result, tools);
       if (!dryRun) await ld.createAiConfigVariation(cfg.key, mapped);
       result.variationsCreated += 1;
       await attachJudges(ld, cfg.key, v, result, dryRun);
@@ -423,7 +449,7 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
 
   // Tools first: variations reference them as {key, version}, so the library
   // must exist before any variation create.
-  const toolVersions = await provisionTools(ld, toolsDir, result, dryRun);
+  const toolLibrary = await provisionTools(ld, toolsDir, result, dryRun);
 
   // Judge-mode configs next: agent variations may carry a `judgeConfiguration`
   // that references a judge by key, so the judges must exist before the agents.
@@ -431,7 +457,7 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
     .map((file) => JSON.parse(readFileSync(file, "utf8")) as AiConfigFile)
     .sort((a, b) => Number(b.mode === "judge") - Number(a.mode === "judge"));
   for (const cfg of aiConfigs) {
-    await provisionAiConfig(ld, cfg, result, dryRun, toolVersions);
+    await provisionAiConfig(ld, cfg, result, dryRun, toolLibrary);
   }
   // Graphs after configs — they reference config keys.
   const configHash = computeConfigHash({

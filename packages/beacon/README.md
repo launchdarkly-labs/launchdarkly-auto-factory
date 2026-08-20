@@ -24,6 +24,8 @@ Flat `src/`:
 | `src/notify.ts` | The `auto-factory-notify` bin — a post-deploy hook services run to POST the deployed SHA |
 | `src/discovery.ts` | Diff `.release-flags/` (current vs. previous SHA) to find newly-added flags |
 | `src/state.ts` | Deploy-state store: last-seen SHA per service/environment (file-backed default) |
+| `src/pending.ts` | Re-evaluation ledger: unfinished releases, re-checked on any later deploy |
+| `src/notifyReport.ts` | What the Notifier tells the operator (a 200 can still carry stranded flags) |
 | `src/railway.ts` | Railway webhook payload → generic deploy notification |
 | `src/scope.ts` | Route by scope — frontend / backend / fullstack |
 | `src/fullstack.ts` | Fullstack cross-service SHA check (stateless, re-derived per notification) |
@@ -71,6 +73,12 @@ runs server-side in LaunchDarkly regardless). Re-delivered notifications are
 idempotent: a flag whose release is already running reports `already_running`
 and re-attaches monitoring instead of double-triggering.
 
+`already_running` needs **nobody** (it is not in the Notifier's attention set — a
+redelivery mid-rollout is the normal shape of a deploy) but the manifest **stays in
+the ledger**. Those are different questions: only one variation of a flag can be
+releasing at a time, so a manifest asking for v2 hits `already_running` on v1's
+rollout, and treating that as "done" discarded the v2 release and called it a success.
+
 On `reverted`, when `BEACON_SEER_AUTOFIX=true` and Sentry credentials are set,
 Beacon searches for a related Sentry issue and starts Seer Autofix
 (`stopping_point: open_pr` by default) — see ADR 0014 / `src/seerAutofix.ts`.
@@ -80,6 +88,92 @@ Beacon searches for a related Sentry issue and starts Seer Autofix
 entitlement). A 403 on issue search is logged explicitly — it used to look like
 "no matching issue". Matching prefers `feature:<slug>` / `flag:<flagKey>` tags
 (e.g. flag `enable-broken-sign-in` → search `feature:broken-sign-in`).
+
+## Several manifests, one flag
+
+Manifests are one per PR (`.release-flags/pr-<N>.json`) and are **never deleted**, and
+an iteration PR targets a **new variation of an existing flag**. So one flag routinely
+has several manifests, each wanting a different `targetVariation`, while only one
+variation of a flag can be releasing at a time. Beacon's rules for that:
+
+- **The manifest is the unit of work** (`service`, `environment`, `sourceFile`); the
+  flag is the unit of *action* (`flagKey`, `environment`).
+- **Highest target variation acts first**, in both the discovered and the pending pass.
+  An absent `targetVariation` means the lineage tip, so it sorts highest. Filename order
+  and ledger insertion order both mean "oldest first", which for a lineage is backwards.
+- **A write claims the flag's action slot — plus a write we cannot rule out, plus one narrow
+  non-writing exception.** ("Only a write" was the rule until round 4 and is quoted below as what
+  changed.) A `held` or `noop` manifest wrote nothing and generally must not defer one
+  that can release; a second manifest that does reach the trigger is deferred **non-finally**, so
+  the ledger re-checks it. A trigger that **threw** claims the slot as well, because there are
+  three states and not two: `startRelease` awaits the response *after* LaunchDarkly applied the
+  patch, so a lost response is "we do not know". **And one non-writing outcome claims it too**, by
+  an explicit narrowing of the rule: where a refusal cannot be specific to one manifest, no sibling
+  may act either. That is a decision with a recorded cost, and both live in `trigger.ts`
+  (`PatchSite`, `TriggerResult.claimsSlotWithoutWriting`) rather than being restated here — this
+  file has already said "only a write claims the slot" while the code said otherwise.
+- **Whether that claim costs the sibling a delay or its release depends on the SHAPE of what
+  throws**, not on pre-write vs post-write — and the shapes are enumerated status by status in
+  `PATCH_FAILURE_TAXONOMY` (see below), which is the only place this repo states them. Two
+  consequences of that enumeration are worth having here: every refusal `trigger.ts` can answer
+  itself is answered there and returns `held` rather than throwing, and what is left for the catch
+  is a throw whose write is unknowable, refusals that recur for no single manifest — **and one that
+  does** recur for a single manifest, which is a knowingly open gap recorded in that table rather
+  than a solved case. Stating that residual is not optional: leaving it out is exactly how the
+  retired version of this bullet read.
+- **A manifest whose target is BEHIND what the environment serves is moot**, not held: a
+  newer variation superseded it, so it resolves as a final `noop` and stops being tracked.
+  Holding it would wait forever for a release that must never happen.
+- **A manifest whose target is not in the lineage at all** (`control`, a hand-named
+  variation) is **held for a human**. Releasing it would ramp production off the released
+  lineage — a deliberate rollback is LaunchDarkly's job, not a deploy notification's.
+- **A manifest naming a variation the flag does not have** is **held for a human** too, and
+  for the same reason: only a person can say whether the variation was never added or the
+  manifest's `targetVariation` is wrong. It must not *throw*: a throw claims the flag's action
+  slot, and this refusal recurs identically for this one manifest on every deploy, so the claim
+  would never lift and the sibling that could release never would — permanently, since "highest
+  target first" ranks the manifest naming the *missing* higher variation ahead of the releasable
+  one. `write_manifest` checks `targetVariation` against `/^v\d+$/` but never against the flag's
+  real variations.
+- **A patch LaunchDarkly REFUSES with an allowlisted status is held for a human**, named with
+  LaunchDarkly's own message. Nothing was written — but whether a sibling may therefore act depends
+  on which patch was refused, and at one of them it may not (see above). This bullet used to say the
+  sibling "can still release in this same notification", unconditionally, in the same breath as
+  admitting that one patch carries no manifest content; the runtime note for that patch now says the
+  opposite, which is how a document ends up contradicting the software it describes. Not "on content
+  grounds" either, which is false for the same reason plus one status's second cause. Which refusals
+  qualify, what each does and does not prove, and why, are in the taxonomy — not here.
+
+> **Known limitation: mutual exclusion is per-notification, not per-flag.** The slot
+> above is a set inside one request. `config/services.yaml` registers **four
+> `side: backend` services on one repo** (`togglemart-gateway`, `-catalog`, `-orders`,
+> `-users`), so one merge produces four concurrent notifications, each with its own set —
+> and they cannot see each other. Two of them can therefore reach `triggerRelease` for the
+> same flag at the same moment. The residual window is a **concurrent double-start during
+> a rollout**: `findActiveRelease` catches it as soon as the releases listing is
+> consistent (it is eventually consistent right after a start — see `monitor.ts`, which
+> retries five times for exactly that), so the exposure is that first moment only.
+> Closing it properly needs either a **persisted per-flag lease** or a decision that one
+> service **owns** a flag's releases; both are deferred pending that product decision
+> (`docs/loop-seam.md`).
+
+### Which statuses mean what: `PATCH_FAILURE_TAXONOMY`, and only there
+
+Every status Beacon classifies, what it does and does not prove, how wide it is, whether anything was
+written, what a `held` note may therefore say to an operator, and which residual gaps are knowingly
+open — all of it is one table: **`PATCH_FAILURE_TAXONOMY` in [`src/trigger.ts`](src/trigger.ts)**,
+next to the classifier, with the behaviour *derived* from it rather than described alongside it. It
+also inventories the patches **`triggerRelease`** sends — which is not all of Beacon's: `repoint.ts`
+sends one more, handled locally and reported per child flag, and that table does not cover it.
+
+This file, `docs/loop-seam.md` and the catch in `src/server.ts` each used to re-derive that argument
+in their own words. Eleven prose corrections on this branch each fixed **three of the four copies**,
+and the missed copy was reliably the one an auditor reads first. So the copies are gone rather than
+annotated: this section is a pointer and states no part of the argument, and
+`tests/taxonomyHome.test.ts` fails if any of the three sites starts stating one again — including in
+paraphrase, which is the hole the first version of that test left open.
+
+---
 
 ## Config surface
 
@@ -93,9 +187,18 @@ Read from the repo `config/` dir + env:
   - `GITHUB_TOKEN` (required) — reads `.release-flags/` via the Contents API.
   - LD connection: `LD_API_KEY`, `LD_PROJECT_KEY` (the **app** project),
     `LD_BASE_URL` (optional), `LD_ENVIRONMENT_KEY` (default `production`).
-  - `BEACON_STATE_FILE` (default `beacon-state.json`).
+  - `BEACON_STATE_FILE` (default `beacon-state.json`) — the deploy-state store.
+  - `BEACON_PENDING_FILE` (default `beacon-pending.json`) — the re-evaluation ledger.
+    Mount persistent storage for BOTH if the host filesystem is ephemeral: on ENOENT they
+    start empty, which reads as "nothing is pending" rather than as "state was lost".
   - `BEACON_MONITOR` (`false` disables), `BEACON_MONITOR_POLL_MS` (default
     10000), `BEACON_MONITOR_TIMEOUT_MS` (default 24h).
+  - Seer Autofix on a revert (ADR 0014, off by default): `BEACON_SEER_AUTOFIX=true`,
+    `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT`, `SENTRY_API_BASE` (default
+    `https://sentry.io`), `BEACON_SEER_STOPPING_POINT` (default `open_pr`). Incomplete
+    Sentry settings log and skip; they never fail a release.
+  - `config/services.yaml` may mark a service `privateNetwork: true` — its readiness
+    check is skipped rather than read as a failed read.
 
 ## Deploying
 
@@ -117,9 +220,15 @@ currently-deployed SHA already contains the same `.release-flags/` file. If yes,
 both services have the code and the release triggers; if no, it waits for the
 other service's deploy notification to re-evaluate.
 
-> **No retry queue (prototype).** A "waiting" flag is released only when the OTHER
-> service's deploy notification arrives and re-evaluates. Beacon logs each waiting
-> outcome (`[beacon] WAITING: …`) with the flag, file, and service so a lost
-> notification is visible. **Manual re-trigger:** once both services are deployed,
-> re-POST `/flag-releases` for the service (same `sha`/`service`) to re-run discovery
-> and release the now-ready flag — the state store re-resolves the same diff range.
+> **The ledger is the retry queue.** This paragraph used to say there wasn't one, and that
+> a `waiting` flag was released ONLY when the other service's own notification arrived. That
+> is no longer true: `waiting` is one of the ledger's re-checked outcomes (with `held`,
+> `error` and `already_running`), so ANY later deploy notification for the service re-evaluates
+> it — the other side's deploy is the common trigger, not the only one. Beacon still logs each
+> waiting outcome (`[beacon] WAITING: …`) with the flag, file and service, so a lost
+> notification is visible.
+>
+> What the ledger does NOT add is a timer: it is webhook-gated by decision, so with no deploys
+> arriving at all nothing re-checks. **Manual re-trigger** therefore still works and is still
+> the way out of that case: re-POST `/flag-releases` for the service (same `sha`/`service`) to
+> re-run discovery — the state store re-resolves the same diff range.

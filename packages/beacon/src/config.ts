@@ -16,6 +16,18 @@ export interface ServiceDef {
   repo: RepoRef;
   statusUrl: string;
   statusShaField: string;
+  /**
+   * True when `statusUrl` is NOT reachable from Beacon (a Railway private-network
+   * address, a VPC-internal host). Such a service is not a fullstack readiness
+   * WITNESS: it is skipped outright rather than counted as a failed read.
+   *
+   * Load-bearing since the readiness check became tri-state. Before that, an
+   * unreachable counterpart fell through a `continue` and was silently ignored —
+   * which is what `config/services.yaml` documents. Now an unread counterpart makes
+   * the whole answer `unknown`, so a permanently-unreachable one would turn every
+   * normal "the other side has not deployed yet" into a reported error, forever.
+   */
+  privateNetwork: boolean;
 }
 
 export interface BeaconConfig {
@@ -27,11 +39,16 @@ export interface BeaconConfig {
   releaseFlagsDir: string;
   /** Path of the JSON file the deploy-state store persists to. */
   stateFile: string;
+  /** Path of the JSON file the re-evaluation ledger persists to (pending.ts). */
+  pendingFile: string;
   services: Record<string, ServiceDef>;
 }
 
 interface RawServices {
-  services: Record<string, { side: Side; repo: string; statusUrl: string; statusShaField?: string }>;
+  services: Record<
+    string,
+    { side: Side; repo: string; statusUrl: string; statusShaField?: string; privateNetwork?: boolean }
+  >;
 }
 
 export function loadBeaconConfig(repoRoot: string = process.cwd()): BeaconConfig {
@@ -43,6 +60,7 @@ export function loadBeaconConfig(repoRoot: string = process.cwd()): BeaconConfig
       repo: parseRepo(def.repo),
       statusUrl: def.statusUrl,
       statusShaField: def.statusShaField ?? "version",
+      privateNetwork: def.privateNetwork === true,
     };
   }
 
@@ -54,6 +72,7 @@ export function loadBeaconConfig(repoRoot: string = process.cwd()): BeaconConfig
     ldEnvironmentKey: process.env.LD_ENVIRONMENT_KEY || "production",
     releaseFlagsDir: releaseFlagsDir(releaseSource),
     stateFile: process.env.BEACON_STATE_FILE || "beacon-state.json",
+    pendingFile: process.env.BEACON_PENDING_FILE || "beacon-pending.json",
     services,
   };
 }

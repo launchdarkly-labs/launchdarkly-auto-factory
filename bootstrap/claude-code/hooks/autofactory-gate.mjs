@@ -14,10 +14,12 @@
  *     Action (AUTOFACTORY_REQUIRE_LABEL repo variable).
  *   - no record, or record from another branch → DENY, with the fix
  *     ("run /autofactory") fed back to Claude.
- *   - record says the review REJECTED the change (or a deterministic check
- *     failed) → ASK the human — a red verdict is a review opinion, not a
- *     pipeline failure, so the human may knowingly push anyway.
- *   - otherwise → allow.
+ *   - record shows a known-good outcome (approved / noop) → allow.
+ *   - any other outcome (rejected, incomplete, verification-failed, a
+ *     non-converged loop, or an unrecognized future value) → ASK the human.
+ *     Fail CLOSED on unknowns: a red/ambiguous result is a human decision, not
+ *     a silent push. (A red verdict is still just a review opinion, so it's
+ *     "ask", not "deny" — the human may knowingly push anyway.)
  *
  * Deliberately branch-granular, not content-granular: committing the agents'
  * edits (or small follow-ups) after a run must not re-trip the gate. "Re-run
@@ -169,13 +171,17 @@ try {
       `AutoFactory last ran on branch '${record?.branch ?? "(unknown)"}', not '${branch}'. Run /autofactory on this branch first, then push.`,
     );
   }
-  if (record.outcome === "rejected" || record.outcome === "verification-failed" || record.outcome === "incomplete") {
-    decide(
-      "ask",
-      `AutoFactory's last run on '${branch}' ended '${record.outcome}' (${record.at}). A red verdict is a review opinion — push anyway, or fix and re-run /autofactory?`,
-    );
+  // Allowlist: only a clean success passes silently. Everything else fails
+  // closed to an "ask" — including new outcome values older copies of this hook
+  // never knew about.
+  if (record.outcome === "approved" || record.outcome === "noop") {
+    decide("allow", `AutoFactory ran on '${branch}': ${record.outcome}${record.flagKey ? ` (flag ${record.flagKey})` : ""}`);
   }
-  decide("allow", `AutoFactory ran on '${branch}': ${record.outcome}${record.flagKey ? ` (flag ${record.flagKey})` : ""}`);
+  const detail = record.loopExhausted ? `${record.outcome} (loop did not converge)` : record.outcome;
+  decide(
+    "ask",
+    `AutoFactory's last run on '${branch}' ended '${detail}' (${record.at}). A non-success result — push anyway, or fix and re-run /autofactory?`,
+  );
 } catch (e) {
   decide("allow", `AutoFactory gate error (failing open): ${e instanceof Error ? e.message : e}`);
 }

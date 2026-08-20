@@ -72175,16 +72175,22 @@ var LdApiError = class extends Error {
 
 // ../shared/dist/releaseAdapter.js
 var BETA_HEADER = { "LD-API-Version": "beta" };
+var TERMINAL = /* @__PURE__ */ new Set(["completed", "reverted", "monitoring_stopped"]);
+function isReleaseFinished(status) {
+  return TERMINAL.has(status);
+}
 function flagAutomatedReleasesPath(projectKey, flagKey) {
   return `/internal/projects/${projectKey}/flags/${flagKey}/automated-releases`;
 }
 async function findActiveRelease(ld, flagKey, environmentKey) {
-  const filter = encodeURIComponent(`environmentKey:${environmentKey},status:in_progress`);
+  const filter = encodeURIComponent(`environmentKey:${environmentKey}`);
   const res = await ld.request({
-    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=1`,
+    // No limit=1: the newest release may be terminal while an older one is still active,
+    // and a server-side limit would hide it.
+    path: `${flagAutomatedReleasesPath(ld.projectKey, flagKey)}?filter=${filter}&limit=20`,
     headers: BETA_HEADER
   });
-  return res.data.items?.[0] ?? null;
+  return res.data.items?.find((r6) => !isReleaseFinished(r6.status)) ?? null;
 }
 
 // ../shared/dist/releaseIntent.js
@@ -72254,16 +72260,28 @@ function normalizePrerequisites(v, issues) {
   }
   return { value: out, coerced };
 }
+var RFC3339_FULL_DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+function daysInMonth(year2, month) {
+  if (month === 2) {
+    const leap = year2 % 4 === 0 && year2 % 100 !== 0 || year2 % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] ?? 0;
+}
 function normalizeNotBefore(v, issues) {
   if (v === void 0 || v === null || v === "")
     return { value: "", coerced: false };
   const raw = String(v).trim();
-  const parsed = new Date(raw);
-  if (!Number.isNaN(parsed.getTime())) {
-    const iso = parsed.toISOString().slice(0, 10);
-    return { value: iso, coerced: iso !== raw };
+  const m4 = RFC3339_FULL_DATE_RE.exec(raw);
+  if (m4) {
+    const year2 = Number(m4[1]);
+    const month = Number(m4[2]);
+    const day = Number(m4[3]);
+    if (day <= daysInMonth(year2, month)) {
+      return { value: raw, coerced: false };
+    }
   }
-  issues.push(`notBefore '${raw}' is not a parseable date (use YYYY-MM-DD) \u2014 treated as unintelligible`);
+  issues.push(`notBefore '${raw}' is not a date in YYYY-MM-DD form (RFC 3339 full-date) \u2014 treated as unintelligible`);
   return { value: raw, coerced: false };
 }
 function normalizeReleaseIntent(raw) {
@@ -74671,8 +74689,141 @@ function startHandoffSpan(fromKey, toKey) {
 }
 
 // ../shared/dist/graphWalker.js
+var JUDGE_REASONING_MAX = 1e3;
+var MAX_VISITS_HARD_CAP = 10;
+function loopBudgetBase(rawMax) {
+  return Math.floor(rawMax);
+}
+var ROUTING_TAGS = /* @__PURE__ */ new Set([
+  "skip_flagging",
+  "flag_worthy",
+  "flag_action",
+  "needs_tests",
+  "review_approved",
+  "risk_level",
+  "risk_score",
+  // See the note above this Set for why (ADR 0014).
+  "sentry_guardrail"
+]);
+var FACT_TAGS = /* @__PURE__ */ new Set([
+  "flag_ready",
+  "flag_created",
+  "flag_key",
+  "flag_variation",
+  "metrics_created",
+  "metric_keys",
+  "metric_event_keys",
+  "tests_last_run"
+]);
+var LOOP_EDGE_SHADOWED_RULE = "a loop edge (max_visits) must be declared BEFORE every non-loop edge from the same source, because edge selection takes the first passing edge and breaks";
+function recordShadowedLoopEdges(nodeKey, node, into, warned2) {
+  let precededBy;
+  for (const edge of node.getEdges()) {
+    const isLoop = handoffNumber(edge.handoff, "max_visits") !== void 0;
+    if (!isLoop) {
+      precededBy ??= edge.key;
+      continue;
+    }
+    if (precededBy === void 0)
+      continue;
+    const seenKey = `${nodeKey}\u2192${edge.key}`;
+    if (warned2.has(seenKey))
+      continue;
+    warned2.add(seenKey);
+    const entry = { source: nodeKey, target: edge.key, precededBy };
+    into.push(entry);
+    console.warn(`[loop] ${describeLoopEdgeShadowed([entry])[0]}`);
+  }
+}
+function describeLoopEdgeShadowed(shadowed) {
+  return shadowed.map((s2) => `loop edge ${s2.source} \u2192 ${s2.target} is declared AFTER the forward edge to ${s2.precededBy} in the graph LaunchDarkly SERVES, so it may never fire (${LOOP_EDGE_SHADOWED_RULE}). The committed graph is checked by check-configs 6e, so this is served-vs-committed drift: fix the edge order in LaunchDarkly. 'bridge upgrade' will NOT repair it \u2014 its graph comparison sorts edges by key, so it reports no changes for an order-only difference (docs/loopback-handoff.md 7a).`);
+}
+function describeLoopBudgetSpent(spent) {
+  return spent.map((e6) => `quality loop ${e6.source} \u2192 ${e6.target} used all ${e6.maxVisits} attempt(s) without converging` + (e6.trigger ? ` (${e6.trigger})` : "") + " \u2014 the chain continued anyway.");
+}
+function describeLoopExhausted(info) {
+  if (info.reason === "run-cap") {
+    return `loop did not converge at '${info.node}': the run hit the total-node-run cap \u2014 likely an untagged cycle in the graph.`;
+  }
+  const edges = info.exhausted.map((e6) => {
+    const why = e6.trigger ? ` \u2014 trigger: ${e6.trigger}` : "";
+    return `edge \u2192 ${e6.target} spent its budget (${e6.traversals}/${e6.maxVisits} traversals)${why}`;
+  }).join("; ");
+  return `loop did not converge at '${info.node}'; ${edges}. The chain could not advance within budget.`;
+}
+function withFreshRouting(accumulated, own) {
+  const out = {};
+  for (const [k6, v] of Object.entries(accumulated))
+    if (!ROUTING_TAGS.has(k6))
+      out[k6] = v;
+  for (const [k6, v] of Object.entries(own))
+    out[k6] = v;
+  return out;
+}
+function warnIfOnlyStaleWouldMatch(isLoop, source, target, kind, cond, accumulated, fresh) {
+  if (!isLoop || !tagsMatch(accumulated, cond))
+    return;
+  const foreign = Object.keys(cond).filter((k6) => ROUTING_TAGS.has(k6) && fresh[k6] === void 0);
+  if (foreign.length === 0)
+    return;
+  console.warn(`[loop] edge ${source} \u2192 ${target} can never fire: its ${kind} names routing tag(s) ${foreign.join(", ")} that '${source}' did not emit. A loop edge's routing conditions are matched against the source run's own tags, so this condition is unsatisfiable \u2014 check the SERVED graph.`);
+}
+var NUMERIC_HANDOFF_FIELDS = [
+  {
+    field: "max_visits",
+    lost: "this edge is NOT budget-capped \u2014 it is treated as an ordinary forward edge, so the loop is bounded only by the run-level cap and no loop-budget report is produced"
+  },
+  {
+    field: "loop_if_judge_below",
+    lost: "this edge no longer gates on the judge score \u2014 it fires whenever its tag conditions pass, so rework is triggered without any quality signal"
+  }
+];
+function describeRejectedValue(raw) {
+  try {
+    return JSON.stringify(raw) ?? String(raw);
+  } catch {
+    return String(raw);
+  }
+}
+function warnIfMalformedNumericHandoff(source, target, handoff, warned2) {
+  for (const { field, lost } of NUMERIC_HANDOFF_FIELDS) {
+    const raw = handoff?.[field];
+    if (raw === void 0 || typeof raw === "number")
+      continue;
+    const wk = `${source}\u2192${target}#${field}`;
+    if (warned2.has(wk))
+      continue;
+    warned2.add(wk);
+    console.warn(`[loop] edge ${source} \u2192 ${target} has ${field}=${describeRejectedValue(raw)}, which is ${Array.isArray(raw) ? "an array" : typeof raw} and not a number, so the walker IGNORES it: ${lost}. The committed-config check rejects this, so it came from the SERVED graph \u2014 run 'npm run bridge -- upgrade' to restore the committed value.`);
+  }
+}
+function grantedVisits(grants, edge, runsConsumed) {
+  let total = 0;
+  for (const g6 of grants ?? []) {
+    if (g6.edge === edge && runsConsumed >= g6.effectiveAfterRuns) {
+      total += Math.max(0, Math.floor(g6.visits));
+    }
+  }
+  return total;
+}
+function unionCsv(existing, incoming) {
+  const split2 = (s2) => (s2 ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  return [.../* @__PURE__ */ new Set([...split2(existing), ...split2(incoming)])].join(",");
+}
+function unemittedExitTags(skip, fresh) {
+  if (!skip)
+    return [];
+  return Object.keys(skip).filter((k6) => ROUTING_TAGS.has(k6) && fresh[k6] === void 0);
+}
 function tagsMatch(tags, cond) {
   return Object.entries(cond).every(([k6, v]) => tags[k6] === v);
+}
+function pickRouting(tags) {
+  const out = {};
+  for (const [k6, v] of Object.entries(tags))
+    if (ROUTING_TAGS.has(k6))
+      out[k6] = v;
+  return out;
 }
 function handoffTags(handoff, field) {
   const v = handoff?.[field];
@@ -74690,21 +74841,77 @@ function handoffStringArray(handoff, field) {
   const v = handoff?.[field];
   return Array.isArray(v) ? v.filter((x) => typeof x === "string") : void 0;
 }
-function buildPrompt(hasInbound, ctx) {
+function usableJudgeScores(results) {
+  const out = {};
+  for (const r6 of results) {
+    if (r6.sampled && r6.success && typeof r6.score === "number" && Number.isFinite(r6.score)) {
+      out[r6.judgeConfigKey ?? "judge"] = r6.score;
+    }
+  }
+  return out;
+}
+function routingJudgeScore(scores) {
+  if (!scores)
+    return void 0;
+  const values = Object.values(scores);
+  return values.length > 0 ? Math.min(...values) : void 0;
+}
+function describeJudgeCondition(handoff, scores) {
+  const below = handoffNumber(handoff, "loop_if_judge_below");
+  if (below === void 0)
+    return void 0;
+  const entries = Object.entries(scores ?? {});
+  if (entries.length === 0)
+    return `no usable judge score (threshold ${below})`;
+  const [lowestKey, lowestScore] = entries.reduce((lo, e6) => e6[1] < lo[1] ? e6 : lo);
+  return `${lowestKey} scored ${lowestScore.toFixed(2)}, below ${below}`;
+}
+function describeLoopCondition(handoff) {
+  const require2 = handoffTags(handoff, "require_tags");
+  if (require2 && Object.keys(require2).length > 0) {
+    return Object.entries(require2).map(([k6, v]) => `${k6}=${v}`).join(", ");
+  }
+  const skip = handoffTags(handoff, "skip_if_tags");
+  if (skip && Object.keys(skip).length > 0) {
+    return Object.entries(skip).map(([k6, v]) => `${k6} never became ${v}`).join(", ");
+  }
+  return void 0;
+}
+function reworkPreamble(iteration, inventory, trigger) {
+  const facts = Object.entries(inventory).filter(([, v]) => v).map(([k6, v]) => `- ${k6}: ${v}`);
+  const factBlock = facts.length ? `
+Resources already created in a prior iteration (amend or reuse \u2014 do NOT recreate):
+${facts.join("\n")}` : "";
+  const why = trigger ? `Sent back by '${trigger.source}' because ${trigger.reason}. The brief below is that step's own report \u2014 treat it as the change request, not a new task.` : `The brief below explains what to change.`;
+  const detailBlock = trigger?.detail ? `
+Additional guidance for this iteration:
+${trigger.detail}` : "";
+  return `=== REWORK ITERATION ${iteration} ===
+This is a re-run of an earlier step; a previous iteration already executed. ${why}${detailBlock}${factBlock}
+=== END REWORK CONTEXT ===`;
+}
+function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx, trigger, humanFeedback) {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
     ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
   ].filter(Boolean).join("\n");
-  if (!hasInbound) {
-    return `${header}${ctx.PR_BODY ? `
-
-${ctx.PR_BODY}` : ""}`.trim();
+  const parts = [header];
+  if (iteration > 1)
+    parts.push(reworkPreamble(iteration, inventory, trigger));
+  if (humanFeedback) {
+    parts.push(`=== HUMAN GUIDANCE (authoritative \u2014 overrides the brief below) ===
+${humanFeedback}
+=== END HUMAN GUIDANCE ===`);
   }
-  const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
-  return `${header}
-
-${brief}`.trim();
+  if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY)
+    parts.push(ctx.PR_BODY);
+  if (hasInbound) {
+    const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
+    if (brief)
+      parts.push(brief);
+  }
+  return parts.filter(Boolean).join("\n\n").trim();
 }
 function lastAssistantText(result) {
   const finals = result.messages.filter((m4) => m4.role === "assistant");
@@ -74723,41 +74930,105 @@ function allNodeKeys(graphDef) {
   }
   return [...keys];
 }
-async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate, judgeHook, verifier) {
+async function walkGraph(graphDef, runner, context, inputs = {}) {
+  const { graphTracker, onEvent, gate, judgeHook, verifier, resume } = inputs;
+  const journal = resume?.journal ?? [];
   const runs = [];
   const accumulatedTags = {};
+  const inventory = {};
   const ctx = { ...context };
   const gatedSteps = new Set(gate?.steps ?? []);
-  const visited = /* @__PURE__ */ new Set();
+  const edgeCounts = /* @__PURE__ */ new Map();
+  const budgetSpent = /* @__PURE__ */ new Map();
+  const exitWarned = /* @__PURE__ */ new Set();
+  const malformedHandoffWarned = /* @__PURE__ */ new Set();
+  const exitNeverPossible = /* @__PURE__ */ new Map();
+  const routingSnapshots = [];
+  const entryEdgeFields = /* @__PURE__ */ new Map();
+  const runCountByKey = /* @__PURE__ */ new Map();
+  const loopEdgeShadowed = [];
+  const shadowWarned = /* @__PURE__ */ new Set();
+  const rootKey = graphDef.getConfig().root;
+  const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
+  let totalRuns = 0;
   const startMs = Date.now();
+  let anyReplayed = false;
   const totalTokens = { total: 0, input: 0, output: 0 };
   let node = graphDef.rootNode();
   let inboundHandoff;
   let stalledAt;
   let pendingApproval;
   let verificationFailed;
-  while (node && !visited.has(node.getKey())) {
+  let loopExhausted;
+  let replayDiverged;
+  let pendingLoopTrigger;
+  let pendingHumanFeedback = resume?.humanFeedback;
+  while (node) {
     const key = node.getKey();
-    if (gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
+    const replayEntry = runs.length < journal.length ? journal[runs.length] : void 0;
+    const replaying = replayEntry !== void 0;
+    if (replaying)
+      anyReplayed = true;
+    if (!replaying && gate && gatedSteps.has(key) && !await gate.resolve(key, accumulatedTags)) {
       pendingApproval = { node: key };
       onEvent?.({ type: "awaiting-approval", node: key });
       break;
     }
-    visited.add(key);
+    if (totalRuns >= maxTotalNodeRuns) {
+      loopExhausted = { node: key, reason: "run-cap", exhausted: [], tags: { ...accumulatedTags } };
+      onEvent?.({ type: "loop-exhausted", info: loopExhausted });
+      break;
+    }
+    totalRuns++;
+    const iteration = (runCountByKey.get(key) ?? 0) + 1;
+    runCountByKey.set(key, iteration);
+    routingSnapshots.push(pickRouting(accumulatedTags));
     const cfg = node.getConfig();
-    const maxTurns = handoffNumber(inboundHandoff, "max_turns");
-    const requestType = handoffString(inboundHandoff, "request_type");
-    const capabilities = handoffStringArray(inboundHandoff, "capabilities");
+    const inboundMaxTurns = handoffNumber(inboundHandoff, "max_turns");
+    const inboundRequestType = handoffString(inboundHandoff, "request_type");
+    const inboundCapabilities = handoffStringArray(inboundHandoff, "capabilities");
+    if (!entryEdgeFields.has(key)) {
+      entryEdgeFields.set(key, {
+        maxTurns: inboundMaxTurns,
+        requestType: inboundRequestType,
+        capabilities: inboundCapabilities
+      });
+    }
+    const entry = entryEdgeFields.get(key) ?? {};
+    const maxTurns = inboundMaxTurns ?? entry.maxTurns;
+    const requestType = inboundRequestType ?? entry.requestType;
+    const capabilities = inboundCapabilities ?? entry.capabilities;
+    if (replayEntry && (replayEntry.configKey !== key || replayEntry.iteration !== iteration)) {
+      replayDiverged = {
+        atIndex: runs.length,
+        expected: `${replayEntry.configKey}#${replayEntry.iteration}`,
+        actual: `${key}#${iteration}`,
+        detail: "the journal does not describe the node this walk re-derived \u2014 the served graph, the agent configs, or the walker's routing changed under it. A fresh run is required."
+      };
+      onEvent?.({ type: "replay-diverged", info: replayDiverged });
+      break;
+    }
     onEvent?.({ type: "node-start", configKey: key, index: runs.length });
-    const tracker = cfg.createTracker();
-    const prompt = buildPrompt(inboundHandoff !== void 0, ctx);
-    const result = await runner.runNode({
+    const tracker = replaying ? void 0 : cfg.createTracker();
+    const trigger = pendingLoopTrigger;
+    pendingLoopTrigger = void 0;
+    const humanFeedback = replaying ? void 0 : pendingHumanFeedback;
+    if (!replaying)
+      pendingHumanFeedback = void 0;
+    const prompt = buildPrompt(key === rootKey, inboundHandoff !== void 0, iteration, inventory, ctx, trigger, humanFeedback);
+    const result = replayEntry ? {
+      status: replayEntry.status,
+      // The recorded final text, re-wrapped so the rest of the loop (which reads
+      // it via lastAssistantText) is identical on a replayed and a live run.
+      messages: [{ role: "assistant", content: replayEntry.output, isFinal: true }],
+      tags: replayEntry.tags
+    } : await runner.runNode({
       configKey: key,
       prompt,
       ...cfg.instructions ? { instructions: cfg.instructions } : {},
       ...cfg.model?.name ? { model: cfg.model.name } : {},
       ...cfg.model?.parameters ? { modelParameters: cfg.model.parameters } : {},
-      tracker,
+      ...tracker ? { tracker } : {},
       ...maxTurns !== void 0 ? { maxTurns } : {},
       ...requestType ? { requestType } : {},
       ...capabilities ? { capabilities } : {},
@@ -74765,7 +75036,7 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
       ...cfg.tools && Object.keys(cfg.tools).length > 0 ? { ldTools: cfg.tools } : {}
     });
     try {
-      const nodeTokens = tracker.getSummary?.().tokens;
+      const nodeTokens = tracker?.getSummary?.().tokens;
       if (nodeTokens) {
         totalTokens.total += nodeTokens.total;
         totalTokens.input += nodeTokens.input;
@@ -74774,21 +75045,44 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     } catch {
     }
     Object.assign(accumulatedTags, result.tags);
+    for (const [k6, v] of Object.entries(result.tags)) {
+      if (!FACT_TAGS.has(k6))
+        continue;
+      inventory[k6] = k6 === "metric_keys" ? unionCsv(inventory[k6], v) : v;
+    }
     const output = lastAssistantText(result);
     ctx.PREVIOUS_STEP_OUTPUT = output;
-    const run = { configKey: key, status: result.status, output, tags: result.tags };
+    const run = { configKey: key, status: result.status, output, tags: result.tags, iteration };
+    if (replayEntry?.judgeScores && Object.keys(replayEntry.judgeScores).length > 0) {
+      run.judgeScores = { ...replayEntry.judgeScores };
+      if (replayEntry.judgeReasoning)
+        run.judgeReasoning = replayEntry.judgeReasoning;
+    }
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
     if (judgeHook && result.status === "failed") {
       console.log(`[judge] ${key}: node failed (infra/API error) \u2014 judges skipped, no score recorded`);
-    } else if (judgeHook) {
+    } else if (judgeHook && tracker) {
+      let judgeResults = [];
       try {
-        await judgeHook({ configKey: key, cfg, input: prompt, output, tracker });
+        judgeResults = await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
       } catch (e6) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
       }
+      const scores = usableJudgeScores(judgeResults);
+      if (Object.keys(scores).length > 0) {
+        run.judgeScores = scores;
+        const lowestKey = Object.entries(scores).reduce((lo, e6) => e6[1] < lo[1] ? e6 : lo)[0];
+        const reasoning = judgeResults.find((r6) => (r6.judgeConfigKey ?? "judge") === lowestKey)?.reasoning;
+        if (reasoning)
+          run.judgeReasoning = reasoning.slice(0, JUDGE_REASONING_MAX);
+      }
+      const routesOnJudge = node.getEdges().some((e6) => handoffNumber(e6.handoff, "loop_if_judge_below") !== void 0);
+      if (routesOnJudge && Object.keys(scores).length === 0) {
+        console.warn(`[judge] '${key}' has a judge-driven loop edge but produced NO usable score (unsampled, failed, or no judge attached) \u2014 the quality loop cannot fire and this run is unverified.`);
+      }
     }
-    if (verifier) {
+    if (verifier && !replaying && result.status !== "failed") {
       try {
         const verification = await verifier({ configKey: key, tags: result.tags });
         if (verification) {
@@ -74808,16 +75102,60 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     }
     let next = null;
     let nextHandoff;
+    let nextIsLoopEdge = false;
+    let nextJudgeThreshold;
+    const runsConsumed = runs.length;
+    const loopBudgetFor = (ek, rawMax) => ({
+      traversals: edgeCounts.get(ek) ?? 0,
+      maxVisits: Math.min(loopBudgetBase(rawMax) + grantedVisits(resume?.grants, ek, runsConsumed), MAX_VISITS_HARD_CAP)
+    });
+    const budgetBlocked = [];
+    recordShadowedLoopEdges(key, node, loopEdgeShadowed, shadowWarned);
     for (const edge of node.getEdges()) {
       const h6 = edge.handoff;
+      const isLoop = handoffNumber(h6, "max_visits") !== void 0;
+      warnIfMalformedNumericHandoff(key, edge.key, h6, malformedHandoffWarned);
+      const matchAgainst = isLoop ? withFreshRouting(accumulatedTags, result.tags) : accumulatedTags;
       const require2 = handoffTags(h6, "require_tags");
-      if (require2 && !tagsMatch(accumulatedTags, require2))
+      if (require2 && !tagsMatch(matchAgainst, require2)) {
+        warnIfOnlyStaleWouldMatch(isLoop, key, edge.key, "require_tags", require2, accumulatedTags, matchAgainst);
         continue;
+      }
       const skip = handoffTags(h6, "skip_if_tags");
-      if (skip && tagsMatch(accumulatedTags, skip))
+      if (skip && tagsMatch(matchAgainst, skip))
         continue;
+      const below = handoffNumber(h6, "loop_if_judge_below");
+      if (below !== void 0) {
+        const score = routingJudgeScore(run.judgeScores);
+        if (score === void 0 || score >= below)
+          continue;
+      }
+      const rawMax = handoffNumber(h6, "max_visits");
+      if (rawMax !== void 0) {
+        const ek = `${key}\u2192${edge.key}`;
+        const { traversals, maxVisits } = loopBudgetFor(ek, rawMax);
+        if (traversals >= maxVisits) {
+          const trig = describeJudgeCondition(h6, run.judgeScores) ?? describeLoopCondition(h6);
+          const spent = {
+            source: key,
+            target: edge.key,
+            traversals,
+            maxVisits,
+            ...trig ? { trigger: trig } : {}
+          };
+          budgetBlocked.push(spent);
+          if (exitNeverPossible.get(ek) === true) {
+            const named = Object.keys(handoffTags(h6, "skip_if_tags") ?? {}).join(", ");
+            console.warn(`[loop] ${key} \u2192 ${edge.key} exhausted ${traversals} iteration(s) and its exit (${named}) was never satisfiable \u2014 '${key}' did not emit at least one of those tags on any pass. This edge can only ever end by budget; check the SERVED graph.`);
+          }
+          budgetSpent.set(`${key}\u2192${edge.key}`, spent);
+          continue;
+        }
+      }
       next = edge.key;
       nextHandoff = h6;
+      nextIsLoopEdge = rawMax !== void 0;
+      nextJudgeThreshold = handoffNumber(h6, "loop_if_judge_below");
       break;
     }
     if (!next) {
@@ -74827,6 +75165,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
         const h6 = edge.handoff;
         const skip = handoffTags(h6, "skip_if_tags");
         if (skip && tagsMatch(accumulatedTags, skip))
+          continue;
+        if (handoffNumber(h6, "max_visits") !== void 0)
           continue;
         const require2 = handoffTags(h6, "require_tags");
         if (require2 && !tagsMatch(accumulatedTags, require2)) {
@@ -74838,14 +75178,57 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
           unmet.push({ target: edge.key, requireMissing });
         }
       }
-      if (unmet.length > 0) {
+      if (budgetBlocked.length > 0) {
+        loopExhausted = {
+          node: key,
+          reason: "budget",
+          exhausted: budgetBlocked,
+          ...unmet.length > 0 ? { alsoUnmet: unmet } : {},
+          tags: { ...accumulatedTags }
+        };
+        onEvent?.({ type: "loop-exhausted", info: loopExhausted });
+      } else if (unmet.length > 0) {
         stalledAt = { node: key, tags: { ...accumulatedTags }, unmet };
-        for (const u of unmet)
-          graphTracker?.trackHandoffFailure(key, u.target);
+        if (!replaying)
+          for (const u of unmet)
+            graphTracker?.trackHandoffFailure(key, u.target);
         onEvent?.({ type: "stalled", stall: stalledAt });
       }
     }
-    if (next) {
+    if (next && nextIsLoopEdge) {
+      let k6 = -1;
+      for (let j6 = runs.length - 1; j6 >= 0; j6--) {
+        if (runs[j6]?.configKey === next) {
+          k6 = j6;
+          break;
+        }
+      }
+      if (k6 >= 0) {
+        const snap = routingSnapshots[k6] ?? {};
+        const sourceRouting = pickRouting(runs[runs.length - 1]?.tags ?? {});
+        for (const rk of ROUTING_TAGS)
+          delete accumulatedTags[rk];
+        for (const [rk, rv] of Object.entries(snap))
+          accumulatedTags[rk] = rv;
+        for (const [rk, rv] of Object.entries(sourceRouting))
+          accumulatedTags[rk] = rv;
+      }
+      const ek = `${key}\u2192${next}`;
+      edgeCounts.set(ek, (edgeCounts.get(ek) ?? 0) + 1);
+      const unemitted = unemittedExitTags(handoffTags(nextHandoff, "skip_if_tags"), result.tags);
+      exitNeverPossible.set(ek, (exitNeverPossible.get(ek) ?? true) && unemitted.length > 0);
+      if (unemitted.length > 0 && !exitWarned.has(ek)) {
+        exitWarned.add(ek);
+        console.warn(`[loop] ${key} \u2192 ${next}: iteration taken while its exit named routing tag(s) ${unemitted.join(", ")}, which '${key}' did not emit this pass. If it never emits them, this loop can only end by exhausting its budget.`);
+      }
+      const judgeReason = describeJudgeCondition(nextHandoff, run.judgeScores);
+      pendingLoopTrigger = {
+        source: key,
+        reason: judgeReason ?? describeLoopCondition(nextHandoff) ?? "the loop edge fired (budget-bounded)",
+        ...nextJudgeThreshold !== void 0 && run.judgeReasoning ? { detail: run.judgeReasoning } : {}
+      };
+    }
+    if (next && !replaying) {
       graphTracker?.trackHandoffSuccess(key, next);
       const handoff = startHandoffSpan(key, next);
       handoff.setGenAi({
@@ -74859,13 +75242,26 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
   }
-  if (graphTracker && !pendingApproval && runs.length > 0) {
+  if (!replayDiverged && runs.length < journal.length) {
+    const nextEntry = journal[runs.length];
+    replayDiverged = {
+      atIndex: runs.length,
+      expected: nextEntry ? `${nextEntry.configKey}#${nextEntry.iteration}` : "(entry)",
+      actual: "(walk ended)",
+      detail: "the walk terminated before consuming the whole journal \u2014 an edge condition or the graph changed. A fresh run is required."
+    };
+    onEvent?.({ type: "replay-diverged", info: replayDiverged });
+  }
+  if (graphTracker && !pendingApproval && !anyReplayed && runs.length > 0) {
     try {
       graphTracker.trackPath(runs.map((r6) => r6.configKey));
       graphTracker.trackDuration(Date.now() - startMs);
       if (totalTokens.total > 0)
         graphTracker.trackTotalTokens(totalTokens);
-      const clean = !stalledAt && !verificationFailed && runs.every((r6) => r6.status === "completed");
+      const lastRunByNode = /* @__PURE__ */ new Map();
+      for (const r6 of runs)
+        lastRunByNode.set(r6.configKey, r6);
+      const clean = !stalledAt && !verificationFailed && !replayDiverged && !loopExhausted && [...lastRunByNode.values()].every((r6) => r6.status === "completed");
       if (clean)
         graphTracker.trackInvocationSuccess();
       else
@@ -74879,10 +75275,15 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
   return {
     runs,
     tags: accumulatedTags,
+    inventory,
     skipped,
     ...stalledAt ? { stalledAt } : {},
     ...pendingApproval ? { pendingApproval } : {},
-    ...verificationFailed ? { verificationFailed } : {}
+    ...verificationFailed ? { verificationFailed } : {},
+    ...loopExhausted ? { loopExhausted } : {},
+    ...replayDiverged ? { replayDiverged } : {},
+    ...budgetSpent.size > 0 ? { loopBudgetSpent: [...budgetSpent.values()] } : {},
+    ...loopEdgeShadowed.length > 0 ? { loopEdgeShadowed } : {}
   };
 }
 
@@ -75015,6 +75416,20 @@ function buildHandoffVerifier(opts) {
 // ../shared/dist/approval.js
 function decideApproval(verdict) {
   const base = { apply: false, noop: false, incomplete: false };
+  if (verdict.inconsistentSkip) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: "INCOMPLETE \u2014 a flag was created in an earlier iteration but the run now reports no flag needed (orphaned resource \u2014 clean up in LaunchDarkly)"
+    };
+  }
+  if (verdict.orphanedFlagKeys.length > 0) {
+    return {
+      ...base,
+      incomplete: true,
+      reason: `INCOMPLETE \u2014 an earlier iteration created a different flag (${verdict.orphanedFlagKeys.join(", ")}) than the final one (orphaned \u2014 clean up in LaunchDarkly)`
+    };
+  }
   if (verdict.skipFlagging) {
     return { ...base, noop: true, reason: "no flag needed \u2014 nothing to review" };
   }
@@ -75026,7 +75441,7 @@ function decideApproval(verdict) {
   }
   return { ...base, apply: true, reason: "code review APPROVED" };
 }
-function interpretWalk(tags) {
+function interpretWalk(tags, inventory = {}, runs = []) {
   const rawDecision = (tags.review_approved ?? // canonical
   tags.review_decision ?? // legacy
   tags.decision ?? // legacy
@@ -75039,7 +75454,13 @@ function interpretWalk(tags) {
   "").toLowerCase();
   const risk = rawRisk === "low" || rawRisk === "medium" || rawRisk === "high" ? rawRisk : void 0;
   const skipFlagging = (tags.skip_flagging ?? "").toLowerCase() === "true";
-  return { reviewApproved, hasVerdict, risk, skipFlagging };
+  const flagWasCreated = inventory.flag_created?.toLowerCase() === "true" || inventory.flag_ready?.toLowerCase() === "true" || Boolean(inventory.flag_key);
+  const inconsistentSkip = skipFlagging && flagWasCreated;
+  const finalFlagKey = inventory.flag_key;
+  const orphanedFlagKeys = [
+    ...new Set(runs.map((r6) => r6.tags.flag_key).filter((k6) => Boolean(k6) && k6 !== finalFlagKey))
+  ];
+  return { reviewApproved, hasVerdict, risk, skipFlagging, inconsistentSkip, orphanedFlagKeys };
 }
 
 // ../shared/dist/approvalGates.js
@@ -75143,7 +75564,7 @@ function createPolicyGate(policy, approve) {
 }
 
 // ../shared/dist/vegaClient.js
-var TERMINAL = /* @__PURE__ */ new Set(["completed", "failed", "stopped", "cancelled"]);
+var TERMINAL2 = /* @__PURE__ */ new Set(["completed", "failed", "stopped", "cancelled"]);
 var StubVegaTransport = class {
   async dispatch(_req) {
     throw new Error("Vega transport not configured \u2014 set VEGA_ENDPOINT + VEGA_TOKEN, or use the default 'anthropic' provider.");
@@ -75167,7 +75588,7 @@ var VegaClient = class {
     const deadline = Date.now() + this.timeoutMillis;
     for (; ; ) {
       const result = await this.transport.getStatus(conversationId);
-      if (TERMINAL.has(result.status))
+      if (TERMINAL2.has(result.status))
         return result;
       if (Date.now() > deadline) {
         throw new Error(`Vega node ${req.configKey} timed out (status: ${result.status})`);
@@ -76464,6 +76885,38 @@ var WRITE_MANIFEST_TOOL = {
     required: ["path", "manifest"]
   }
 };
+var GUARDED_MAX_ALLOCATION = 5e4;
+var FULL_ALLOCATION = 1e5;
+function stageSetProblem(stages, guarded) {
+  if (!Array.isArray(stages))
+    return "must be an array of {allocation, durationMillis}";
+  if (stages.length === 0)
+    return "must not be empty (omit the field instead)";
+  let previous = 0;
+  for (let i6 = 0; i6 < stages.length; i6++) {
+    const s2 = stages[i6];
+    if (!s2 || typeof s2 !== "object" || Array.isArray(s2))
+      return `stage ${i6} must be an object`;
+    const { allocation, durationMillis } = s2;
+    if (typeof allocation !== "number" || !Number.isFinite(allocation)) {
+      return `stage ${i6} has no numeric allocation`;
+    }
+    if (allocation <= 0 || allocation > FULL_ALLOCATION) {
+      return `stage ${i6} allocation ${allocation} is outside 1\u2013${FULL_ALLOCATION}`;
+    }
+    if (typeof durationMillis !== "number" || !Number.isFinite(durationMillis) || durationMillis <= 0) {
+      return `stage ${i6} has no positive durationMillis`;
+    }
+    if (allocation <= previous) {
+      return `stage ${i6} allocation ${allocation} does not exceed the previous stage's ${previous}`;
+    }
+    if (guarded && allocation > GUARDED_MAX_ALLOCATION) {
+      return `stage ${i6} allocation ${allocation} exceeds the guarded cap of ${GUARDED_MAX_ALLOCATION} (50%)`;
+    }
+    previous = allocation;
+  }
+  return void 0;
+}
 var SANDBOX_TOOL_DEFS = new Map([
   ...READONLY_TOOLS,
   READ_LD_DOCS_TOOL,
@@ -77096,6 +77549,32 @@ ${verdicts.join("\n")}` : "")
         content: `write_manifest: targetVariation must be a vN lineage value (v1, v2, \u2026), got '${String(inc.targetVariation)}'. Omit it for fresh flags and boolean legacy flags (whole-flag release).`,
         isError: true
       };
+    }
+    if (mergedPlan.stages !== void 0) {
+      const hasMetrics = Array.isArray(mergedPlan.metricKeys) && mergedPlan.metricKeys.length > 0 || Array.isArray(mergedPlan.metricGroupKeys) && mergedPlan.metricGroupKeys.length > 0;
+      const guardedByInference = mergedPlan.releaseMethod === void 0 && hasMetrics;
+      const guarded = mergedPlan.releaseMethod === "guarded" || guardedByInference;
+      const problem = stageSetProblem(mergedPlan.stages, guarded);
+      if (problem) {
+        return {
+          content: `write_manifest: releasePlan.stages ${problem}. allocation is BASIS POINTS (20000 = 20%, ${FULL_ALLOCATION} = 100%), durationMillis is that stage's monitoring window in milliseconds, and allocations must ASCEND. ` + (guarded ? `This is a GUARDED release (${guardedByInference ? `metricKeys with no explicit releaseMethod` : `releaseMethod: "guarded"`}), and LaunchDarkly caps a guarded stage at ${GUARDED_MAX_ALLOCATION} (50%) \u2014 it needs a control group at least as large as the treatment, and the release completes to 100% by itself after the final monitored stage passes, so a 100% stage asks for something the release already does. ` + (guardedByInference ? `NOTE this may be a FALSE rejection: at deploy time the flag's LaunchDarkly release policy beats the metrics inference, so if that policy is a progressive release these stages would have been accepted. IF THAT IS THE CASE, OMIT stages (see below) rather than capping them \u2014 capping caps the ROLLOUT, and a progressive release is expected to reach 100%. ` : "") + `Setting releaseMethod "progressive" is the escape if a 100% stage is genuinely wanted, BUT KNOW WHAT IT COSTS: an explicit releaseMethod outranks the flag's release policy permanently for this manifest, and metrics are only sent when the method is guarded \u2014 so this manifest's metricKeys/metricGroupKeys become DEAD, and the rollout is guarded by nothing. When the release really is guarded, prefer capping the final stage at ${GUARDED_MAX_ALLOCATION} and keeping the metrics. ` : "") + // WHAT OMITTING STAGES ACTUALLY BUYS, and it is a different answer in three cases.
+          // `trigger.ts` resolves the two from different chains: `stages = ov.stages ?? policy.stages
+          // ?? defaults` but `method = ov.releaseMethod ?? policy.releaseMethod ?? inferred`. So
+          // when this manifest PINS a method, dropping `stages` inherits the policy's stages and
+          // NOT its method — the pin still outranks it. Saying "omit stages to use the flag's
+          // configured release policy" there promised the policy would take over, which it will
+          // not, and for a pinned `guarded` that means the cap the author just hit still applies.
+          //
+          // AND `immediate` IS A THIRD CASE, not a variant of the second: `trigger.ts` returns from
+          // its immediate branch BEFORE `stages` is resolved at all, so these stages are not capped,
+          // not defaulted and not inherited — they are ignored. Telling that author about inheritance
+          // would describe a mechanism their manifest never reaches. Note `releaseMethod` itself is
+          // unvalidated here (see the `write_manifest` caveat in the release-method line below), so
+          // it is only quoted back when it is a method this repo recognises.
+          (mergedPlan.releaseMethod === void 0 ? `Omit stages entirely to fall back to the flag's configured release policy: its stages if it sets any, else the demo defaults. With no explicit releaseMethod here the policy's method applies too \u2014 but ONLY if the policy sets one; if it does not, or if it cannot be read at deploy time, the method is INFERRED from whether this manifest carries metrics (metrics \u21D2 guarded, none \u21D2 progressive), and the cap comes back with it.` : mergedPlan.releaseMethod === "immediate" ? `NOTE releaseMethod is "immediate", which IGNORES stages entirely \u2014 an immediate release moves the fallthrough in one step and never reads a stage set, so these stages are dead either way. Fix them only if you also meant to ask for a staged rollout, in which case the method is what is wrong; otherwise remove them.` : `Omitting stages inherits the policy's stages (else the demo defaults) but NOT its method: ` + (mergedPlan.releaseMethod === "guarded" || mergedPlan.releaseMethod === "progressive" ? `this manifest's explicit releaseMethod "${mergedPlan.releaseMethod}" ` : `this manifest's explicit releaseMethod (which is not one of "guarded", "progressive" or "immediate", and nothing here validates it) `) + `outranks the policy permanently, so ` + (guarded ? `the guarded cap still governs whatever stages are inherited.` : `the method the policy configured is not used.`)),
+          isError: true
+        };
+      }
     }
     const existingIntent = existing.releaseIntent;
     let intent;
@@ -79967,7 +80446,17 @@ function describeStall(stall) {
   const edges = stall.unmet.map((u) => `edge \u2192 ${u.target} requires ${Object.entries(u.requireMissing).map(([k6, v]) => `${k6}=${v}`).join(", ")} (never produced)`).join("; ");
   return `chain stalled at '${stall.node}'; ${edges}. Downstream agents did not run.`;
 }
-function buildGateComment(gatedSteps, approved, pendingNode) {
+function gateStatusLine(pendingNode, reworked, inventory) {
+  const created = [
+    inventory.flag_key ? `flag \`${inventory.flag_key}\`` : "",
+    inventory.metric_keys ? `metric(s) \`${inventory.metric_keys}\`` : ""
+  ].filter(Boolean);
+  if (reworked && created.length) {
+    return `The chain paused before **${pendingNode}**. A prior iteration already created ${created.join(" and ")}; approving may re-run this step (up to its \`max_visits\` budget) against new input.`;
+  }
+  return `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`;
+}
+function buildGateComment(gatedSteps, approved, pendingNode, statusLine) {
   const lines = gatedSteps.map((step) => {
     if (approved.has(step)) return `- \u2713 \`${step}\` \u2014 approved`;
     if (step === pendingNode) return `- \u23F8 \`${step}\` \u2014 **awaiting approval**: add the label \`${approveLabel(step)}\``;
@@ -79976,7 +80465,7 @@ function buildGateComment(gatedSteps, approved, pendingNode) {
   return [
     "### LaunchDarkly Auto-Factory \u2014 Phase 1 \u23F8 awaiting approval",
     "",
-    `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`,
+    statusLine,
     "Approve by adding the labeled step below; the chain resumes on the next run.",
     "",
     ...lines
@@ -80121,13 +80610,13 @@ async function main() {
   const judgeHook = baseJudgeHook ? async (args) => {
     const results = await baseJudgeHook(args);
     for (const r6 of results) {
-      if (r6.sampled && typeof r6.score === "number") judgeScores.set(args.configKey, r6.score);
+      if (r6.sampled && typeof r6.score === "number") judgeScores.set(`${args.configKey}#${args.iteration}`, r6.score);
     }
     return results;
   } : void 0;
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...verifierWriter ? { writer: verifierWriter } : {} });
-  const walk2 = await walkGraph(graphDef, runner, context, graphTracker, void 0, gate, judgeHook, verifier);
+  const walk2 = await walkGraph(graphDef, runner, context, { graphTracker, gate, judgeHook, verifier });
   for (const r6 of walk2.runs) {
     console.log(`
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 ${r6.configKey} [${r6.status}] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550`);
@@ -80141,19 +80630,28 @@ async function main() {
   if (stallText) console.log(`::warning::AutoFactory: ${stallText}`);
   const verifyText = walk2.verificationFailed ? `deterministic check failed after '${walk2.verificationFailed.node}': ` + walk2.verificationFailed.failures.map((f6) => `[${f6.name}] ${f6.detail}`).join("; ") : "";
   if (verifyText) console.log(`::error::AutoFactory: ${verifyText}`);
+  const loopText = walk2.loopExhausted ? describeLoopExhausted(walk2.loopExhausted) : "";
+  const advisoryLoopText = walk2.loopBudgetSpent ? describeLoopBudgetSpent(walk2.loopBudgetSpent) : [];
+  if (loopText) console.log(`::error::AutoFactory: ${loopText}`);
+  for (const l4 of advisoryLoopText) console.log(`::warning::AutoFactory: ${l4}`);
+  if (walk2.loopEdgeShadowed) {
+    for (const l4 of describeLoopEdgeShadowed(walk2.loopEdgeShadowed)) console.log(`::warning::AutoFactory: ${l4}`);
+  }
   if (walk2.pendingApproval) {
     const node = walk2.pendingApproval.node;
     const label = approveLabel(node);
     await ensureLabel(context.REPO, label, process.env.GITHUB_TOKEN);
     console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the PR label '${label}' to proceed.`);
-    const summary2 = buildGateComment(policy.steps.map((s2) => s2.step), approvedSteps, node);
+    const reworked = walk2.runs.some((r6) => r6.iteration > 1);
+    const statusLine = gateStatusLine(node, reworked, walk2.inventory);
+    const summary2 = buildGateComment(policy.steps.map((s2) => s2.step), approvedSteps, node, statusLine);
     await postPrComment(summary2, { prNumber: context.PR_NUMBER, repo: context.REPO });
     await postCheckRun({
       repo: context.REPO,
       headSha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Approval required before ${node}`,
-      summary: `The AutoFactory chain paused before \`${node}\`. Nothing was created for this or later steps. Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
+      summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
     });
     return;
   }
@@ -80174,10 +80672,12 @@ async function main() {
     ...process.env.PR_BRANCH ? { prBranch: process.env.PR_BRANCH } : {}
   });
   if (intentReview.warning) console.log(`::warning::AutoFactory: ${intentReview.warning}`);
-  const verdict = interpretWalk(walk2.tags);
+  const verdict = interpretWalk(walk2.tags, walk2.inventory, walk2.runs);
   const decision = decideApproval(verdict);
   console.log(`Verdict \u2192 ${decision.reason}`);
-  if (decision.apply) {
+  if (walk2.loopExhausted) {
+    console.log("\u26A0 Loop did not converge \u2014 see the error above. This run is not applied.");
+  } else if (decision.apply) {
     console.log("\u2713 Changes approved and applied by the agents.");
   } else if (decision.noop) {
     console.log("\u2022 No flag needed \u2014 nothing to apply.");
@@ -80187,19 +80687,22 @@ async function main() {
     console.log("\u2717 Not applied \u2014 code review REJECTED.");
   }
   const agentRows = walk2.runs.map((r6) => {
-    const judge = judgeScores.get(r6.configKey);
+    const judge = judgeScores.get(`${r6.configKey}#${r6.iteration}`);
+    const label = r6.iteration > 1 ? `\`${r6.configKey}\` (iter ${r6.iteration})` : `\`${r6.configKey}\``;
     const tags = Object.entries(r6.tags).map(([k6, v]) => `${k6}=${v}`).join(", ").slice(0, 140) || "\u2014";
-    return `| \`${r6.configKey}\` | ${r6.status} | ${judge !== void 0 ? judge.toFixed(2) : "\u2014"} | ${tags} |`;
+    return `| ${label} | ${r6.status} | ${judge !== void 0 ? judge.toFixed(2) : "\u2014"} | ${tags} |`;
   });
   const summary = [
     "### LaunchDarkly Auto-Factory \u2014 Phase 1",
     "",
-    `**Verdict:** ${decision.reason}` + (policy.mode !== "yolo" ? ` _(approval mode: ${policy.mode}${policy.mode === "risk-threshold" ? ` @ ${policy.threshold}` : ""})_` : ""),
+    `**Verdict:** ${walk2.loopExhausted ? "loop did not converge \u2014 not applied" : decision.reason}` + (policy.mode !== "yolo" ? ` _(approval mode: ${policy.mode}${policy.mode === "risk-threshold" ? ` @ ${policy.threshold}` : ""})_` : ""),
     intentReview.line ?? "",
     intentReview.warning ? `**\u26A0 Release intent:** ${intentReview.warning}` : "",
     configDrift ? `**\u26A0 Config drift:** ${configDrift}` : "",
     kg ? `**Knowledge graph:** on \u2014 ${kg.graph.edges.filter((e6) => e6.kind === "service_calls").length} service edges (traces), ${kg.graph.edges.filter((e6) => e6.kind === "flag_wraps").length} wrap points (code refs)` + (kg.warnings.length ? `; \u26A0 ${kg.warnings.map((w) => w.split(" \u2014 ")[0]).join("; \u26A0 ")}` : "") : "",
     walk2.skipped.length ? `**Skipped:** ${walk2.skipped.join(", ")}` : "",
+    loopText ? `**\u27F3 Loop did not converge:** ${loopText}` : "",
+    ...advisoryLoopText.map((l4) => `**\u27F3 Quality retries exhausted:** ${l4}`),
     stallText ? `**\u26A0 Stalled:** ${stallText}` : "",
     verifyText ? `**\u26D4 Deterministic check failed:** ${verifyText}` : "",
     "",
@@ -80212,11 +80715,11 @@ async function main() {
     name: "AutoFactory \u2014 Phase 1",
     repo: context.REPO,
     headSha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
-    conclusion: !walk2.verificationFailed && (decision.apply || decision.noop) ? "success" : "failure",
-    title: walk2.verificationFailed ? `Deterministic check failed after ${walk2.verificationFailed.node}` : decision.reason,
+    conclusion: !walk2.verificationFailed && !walk2.loopExhausted && (decision.apply || decision.noop) ? "success" : "failure",
+    title: walk2.verificationFailed ? `Deterministic check failed after ${walk2.verificationFailed.node}` : walk2.loopExhausted ? `Loop did not converge at ${walk2.loopExhausted.node}` : decision.reason,
     summary
   });
-  if (walk2.verificationFailed || !decision.apply && !decision.noop) process.exitCode = 1;
+  if (walk2.verificationFailed || walk2.loopExhausted || !decision.apply && !decision.noop) process.exitCode = 1;
 }
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((e6) => {

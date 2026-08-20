@@ -23,7 +23,25 @@ export async function discoverNewReleaseFlags(
   const cleanDir = dir.replace(/^\/+|\/+$/g, "");
   for (const name of newJsonFiles) {
     const filePath = `${cleanDir}/${name}`;
-    const parsed = await gh.getFileJson<ReleaseFlagFile>(repo, filePath, currentSha);
+    let parsed: ReleaseFlagFile | null;
+    try {
+      parsed = await gh.getFileJson<ReleaseFlagFile>(repo, filePath, currentSha);
+    } catch (e) {
+      // A syntactically invalid manifest is a PERMANENT property of this SHA: letting
+      // it throw made the handler 502 without recording the SHA, so every later
+      // notification re-diffed the same range, hit the same file, and 502'd again —
+      // blocking every OTHER manifest in the range forever, with a log that never
+      // named the culprit. A manifest that never parsed cannot have a release to
+      // protect, so skipping it (by name) is the safe branch. Anything that is NOT a
+      // parse failure (network, GitHub 5xx) is transient and still aborts discovery —
+      // the 502 path exists precisely so those retry.
+      if (!(e instanceof SyntaxError)) throw e;
+      console.warn(
+        `[beacon] skipping malformed release manifest ${filePath}@${currentSha} (not valid JSON — ` +
+          `no release can be triggered for it until the file is fixed in a later commit): ${e.message}`,
+      );
+      continue;
+    }
     if (!parsed?.flagKey) continue; // not a valid release-flag file
     discovered.push({ ...parsed, sourceFile: filePath });
   }

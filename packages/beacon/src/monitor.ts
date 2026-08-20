@@ -12,7 +12,10 @@
  */
 
 import {
+  isReleaseFinished,
+  isReleaseRunning,
   findActiveRelease,
+  findLatestRelease,
   monitorRelease,
   type AutomatedRelease,
   type LdClient,
@@ -41,6 +44,38 @@ export function monitorSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): Mo
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Wrap a per-(flag, environment) async task so at most ONE runs at a time per key.
+ *
+ * Exists for redelivered `already_running` notifications: monitoring is re-attached
+ * on each one (deliberately — that is how a restarted Beacon picks a release back
+ * up), but every redelivery used to attach ANOTHER detached 24h poll loop for the
+ * same release — duplicate polling and duplicate (idempotent) repoints. Keyed
+ * in-process: once the running task settles, the key frees, so a genuine re-attach
+ * after a completed/abandoned watch still works.
+ */
+/**
+ * The revert-time context a release-started hook carries: repo, sha, target variation. ONE
+ * declaration, because `monitorTriggeredRelease`, `dedupeMonitors` and `BeaconDeps.onReleaseStarted`
+ * must agree on it — and it is derived from `RevertAutofixContext` rather than restated, so adding a
+ * field Seer needs cannot leave the hook signatures behind.
+ */
+export type ReleaseMonitorContext = Partial<Omit<RevertAutofixContext, "flagKey" | "environmentKey">>;
+
+export function dedupeMonitors(
+  run: (flagKey: string, environmentKey: string, ctx?: ReleaseMonitorContext) => Promise<unknown>,
+): (flagKey: string, environmentKey: string, ctx?: ReleaseMonitorContext) => void {
+  const inFlight = new Set<string>();
+  // The key is flag/environment ONLY: the context describes the same release, so a redelivery
+  // carrying it must still be deduped against the watch already in flight.
+  return (flagKey, environmentKey, ctx) => {
+    const key = `${flagKey}/${environmentKey}`;
+    if (inFlight.has(key)) return;
+    inFlight.add(key);
+    void run(flagKey, environmentKey, ctx).finally(() => inFlight.delete(key));
+  };
+}
+
+/**
  * Resolve the active release's id for a flag (retrying briefly — the listing
  * is eventually consistent right after the start), then poll to completion.
  *
@@ -52,16 +87,29 @@ export async function monitorTriggeredRelease(
   flagKey: string,
   environmentKey: string,
   settings: MonitorSettings,
-  revertCtx?: Partial<Omit<RevertAutofixContext, "flagKey" | "environmentKey">>,
+  revertCtx?: ReleaseMonitorContext,
 ): Promise<AutomatedRelease | null> {
   const tag = `[beacon] release ${flagKey}/${environmentKey}`;
   try {
     let active: AutomatedRelease | null = null;
     for (let attempt = 0; attempt < 5 && !active; attempt++) {
-      if (attempt > 0) await sleep(2_000);
+      // Never longer than the poll interval, so tests (and short stages) aren't
+      // pinned to a hardcoded 2s; production settings keep the original 2s.
+      if (attempt > 0) await sleep(Math.min(2_000, settings.pollMillis));
       active = await findActiveRelease(ld, flagKey, environmentKey);
     }
     if (!active) {
+      // findActiveRelease filters to NOT-finished, so a release that completed
+      // inside this retry envelope is invisible to it. One unfiltered look: if the
+      // newest release is already `completed`, run the completion path — otherwise
+      // "it may have completed instantly" was exactly the case that skipped the
+      // child-flag repointing it names.
+      const latest = await findLatestRelease(ld, flagKey, environmentKey);
+      if (latest?.status === "completed") {
+        console.log(`${tag}: COMPLETED before monitoring could attach (release ${latest.id}) — rolled out to 100%`);
+        await repointDependentPrerequisites(ld, flagKey, environmentKey);
+        return latest;
+      }
       console.warn(`${tag}: started but no in-progress release found to monitor (it may have completed instantly)`);
       return null;
     }
@@ -78,7 +126,7 @@ export async function monitorTriggeredRelease(
       // the PREVIOUS variation — re-point auto-factory children to what the
       // environment serves now. Never throws (logs its own outcomes).
       await repointDependentPrerequisites(ld, flagKey, environmentKey);
-    } else {
+    } else if (isReleaseFinished(final.status)) {
       // reverted = a guardrail metric regressed and LD rolled the flag back;
       // monitoring_stopped = a human intervened. Both are end states for us.
       console.warn(`${tag}: ended ${final.status.toUpperCase()} (stage ${final.latestStageIndex})`);
@@ -94,6 +142,36 @@ export async function monitorTriggeredRelease(
           seerSettingsFromEnv(),
         );
       }
+    } else if (isReleaseRunning(final.status)) {
+      // Still legitimately running when the window closed. A guarded rollout's stages can
+      // outlast the monitoring timeout, so this is a slow release, NOT a paused one —
+      // diagnosing it as paused sent the operator looking for a human decision that nobody
+      // was asked to make.
+      console.warn(
+        `${tag}: stopped watching release ${final.id} — still ${final.status} (stage ` +
+          `${final.latestStageIndex}) after the monitoring window. The release continues in ` +
+          `LaunchDarkly; nothing here is waiting on a human.`,
+      );
+    } else {
+      // Neither running nor finished: most plausibly PAUSED on a regression, which
+      // `rollbackOnRegression: false` asks for. The poll loop keeps watching such a release
+      // (a human may resume it), so reaching here means it was still unresolved at the
+      // deadline. Per-metric detail is printed VERBATIM — we do not know LaunchDarkly's
+      // vocabulary for this state, and quoting beats guessing.
+      console.warn(
+        `${tag}: stopped watching release ${final.id} — still '${final.status}' (stage ` +
+          `${final.latestStageIndex}) after the monitoring window. Most likely PAUSED awaiting a human.`,
+      );
+      for (const m of final.metricConfigurations ?? []) {
+        console.warn(`${tag}:   metric ${m.metricKey} status='${m.status}' autoRollback=${m.autoRollback}`);
+      }
+      // Deliberately NOT promising that a later deploy repoints child flags: discovery is a
+      // manifest DIFF, so a flag whose manifest exists at both SHAs is never rediscovered
+      // and `triggerRelease` never runs for it again. See docs/release-policy-metrics.md.
+      console.warn(
+        `${tag}:   note: if this release later completes outside this window, child flags pinned to the ` +
+          `previous variation are NOT repointed automatically — see the deferred watch-ledger item.`,
+      );
     }
     return final;
   } catch (e) {

@@ -35,6 +35,19 @@ export function nextVariationValue(values: unknown[]): string {
 }
 
 /** Highest vN value present (the current treatment lineage tip), if any. */
+/**
+ * Position of a value in the vN lineage, or undefined if it is not a lineage variation
+ * (`control`, a boolean, a hand-named variation).
+ *
+ * Exists so callers can tell FORWARD from BACKWARD along the lineage. Beacon needs that to
+ * refuse a release that would move an environment to an OLDER variation than it already
+ * serves — see the regression guard in `trigger.ts`.
+ */
+export function variationLineageIndex(value: unknown): number | undefined {
+  const m = typeof value === "string" ? VN_RE.exec(value) : null;
+  return m ? Number(m[1]) : undefined;
+}
+
 export function latestVariationValue(values: unknown[]): string | undefined {
   let max = 0;
   for (const v of values) {

@@ -33,6 +33,13 @@ export interface RepoState {
   dirtyFiles: number;
   /** The base ref that was resolvable, if any. */
   resolvedBase?: string;
+  /**
+   * The commit `resolvedBase` points at. The ref NAME is not an identity:
+   * `origin/main` moves on any `git fetch` with no change to HEAD or the working
+   * tree, and an unresolvable `origin/<base>` silently falls through to the local
+   * branch. Anything that records "what this walk diffed against" needs the SHA.
+   */
+  resolvedBaseSha?: string;
   /** owner/name parsed from the origin remote, if any. */
   repoSlug?: string;
 }
@@ -76,6 +83,11 @@ export async function readRepoState(cwd: string, base: string): Promise<RepoStat
   }
   state.resolvedBase = await resolveBase(cwd, base);
   if (state.resolvedBase) {
+    try {
+      state.resolvedBaseSha = await git(cwd, ["rev-parse", state.resolvedBase]);
+    } catch {
+      /* left undefined — consumers must treat that as "unknown", never "unchanged" */
+    }
     try {
       const n = await git(cwd, ["rev-list", "--count", `${state.resolvedBase}..HEAD`]);
       state.aheadOfBase = Number(n) || 0;

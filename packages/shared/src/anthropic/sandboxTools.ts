@@ -443,6 +443,75 @@ const WRITE_MANIFEST_TOOL: AnthropicToolDef = {
   },
 };
 
+/** LaunchDarkly's cap on a GUARDED release's stage allocation, in basis points (50%). */
+const GUARDED_MAX_ALLOCATION = 50_000;
+/** Full traffic, in basis points. */
+const FULL_ALLOCATION = 100_000;
+
+/**
+ * What is wrong with a `releasePlan.stages` value, or undefined when nothing is.
+ *
+ * WHY THIS IS CHECKED AT AUTHORING TIME. `stages` is a MACHINE field that reaches LaunchDarkly
+ * unvalidated: `trigger.ts` passes it straight into the `startAutomatedRelease` instruction, and LD
+ * answers a bad stage set with a 400. Beacon now RECOVERS from that (it reports `held` and leaves
+ * the flag's action slot free for a sibling instead of treating the rejection as a lost write —
+ * true of THIS refusal because a `stages` 400 can only reach the release-start patch, whose body
+ * carries manifest content; `PATCH_SITES` in `trigger.ts` has the one patch where a `held` refusal
+ * claims the slot instead), but
+ * a refused manifest is still a release that did not happen and a human who has to work out why —
+ * so the agent path must not write one silently. Defence in depth, not a substitute: the file is
+ * hand-editable in git, which is why both ends exist.
+ *
+ * The guarded cap is a LIVE constraint, quoted in `trigger.ts`: "stage allocation must not exceed
+ * 50%", because the metric comparison needs a control group at least as large as the treatment. The
+ * release completes to 100% after the final monitored stage passes, so a 100% guarded stage is not
+ * merely rejected — it is asking for something the release does by itself.
+ *
+ * `guarded` is decided from the MANIFEST alone, mirroring `trigger.ts`'s precedence as far as a
+ * manifest can see it: an explicit `releaseMethod`, else metrics imply `guarded`.
+ *
+ * SO THIS CAN REJECT A MANIFEST THAT WOULD HAVE RELEASED LEGALLY, and the message has to be honest
+ * about it. At release time the method is
+ * `ov.releaseMethod ?? policy?.releaseMethod ?? (hasMetrics ? "guarded" : "progressive")`, so the
+ * flag's LaunchDarkly release policy BEATS the metrics inference (only an explicit manifest
+ * `releaseMethod` beats the policy). `metricKeys` plus a 100% stage on a flag whose policy is
+ * `progressive-release` therefore releases fine, and is refused here anyway.
+ *
+ * That trade is acceptable — a loud error naming an escape beats a silent permanent 400 — but the
+ * escape has a COST, and the message must state it, because otherwise the nudge trades a false
+ * rejection for a silently ignored metric set: `releaseMethod: "progressive"` pins the method over
+ * the flag's policy FOREVER for that manifest, and `trigger.ts` sends `metrics` only when the method
+ * is guarded, so the manifest's `metricKeys`/`metricGroupKeys` become dead weight. The rollout stops
+ * being guarded by anything.
+ */
+function stageSetProblem(stages: unknown, guarded: boolean): string | undefined {
+  if (!Array.isArray(stages)) return "must be an array of {allocation, durationMillis}";
+  if (stages.length === 0) return "must not be empty (omit the field instead)";
+  let previous = 0;
+  for (let i = 0; i < stages.length; i++) {
+    const s = stages[i];
+    if (!s || typeof s !== "object" || Array.isArray(s)) return `stage ${i} must be an object`;
+    const { allocation, durationMillis } = s as { allocation?: unknown; durationMillis?: unknown };
+    if (typeof allocation !== "number" || !Number.isFinite(allocation)) {
+      return `stage ${i} has no numeric allocation`;
+    }
+    if (allocation <= 0 || allocation > FULL_ALLOCATION) {
+      return `stage ${i} allocation ${allocation} is outside 1–${FULL_ALLOCATION}`;
+    }
+    if (typeof durationMillis !== "number" || !Number.isFinite(durationMillis) || durationMillis <= 0) {
+      return `stage ${i} has no positive durationMillis`;
+    }
+    if (allocation <= previous) {
+      return `stage ${i} allocation ${allocation} does not exceed the previous stage's ${previous}`;
+    }
+    if (guarded && allocation > GUARDED_MAX_ALLOCATION) {
+      return `stage ${i} allocation ${allocation} exceeds the guarded cap of ${GUARDED_MAX_ALLOCATION} (50%)`;
+    }
+    previous = allocation;
+  }
+  return undefined;
+}
+
 /**
  * Every sandbox tool definition, keyed by name — the built-in DEFAULTS for the
  * model-facing interface (description + schema), and the registry the
@@ -1200,6 +1269,85 @@ export class SandboxToolExecutor {
           "Omit it for fresh flags and boolean legacy flags (whole-flag release).",
         isError: true,
       };
+    }
+
+    // releasePlan.stages: see stageSetProblem. The rollout shape LaunchDarkly will be asked for,
+    // checked here so the agent path cannot commit a manifest that is a permanent 400.
+    if (mergedPlan.stages !== undefined) {
+      const hasMetrics =
+        (Array.isArray(mergedPlan.metricKeys) && mergedPlan.metricKeys.length > 0) ||
+        (Array.isArray(mergedPlan.metricGroupKeys) && mergedPlan.metricGroupKeys.length > 0);
+      // Guarded because the manifest SAID so, versus guarded only because metrics IMPLY it. The
+      // second is the one the flag's release policy can overturn at deploy time, so it is the one
+      // where this check can refuse a release that would have been legal — see `stageSetProblem`.
+      const guardedByInference = mergedPlan.releaseMethod === undefined && hasMetrics;
+      const guarded = mergedPlan.releaseMethod === "guarded" || guardedByInference;
+      const problem = stageSetProblem(mergedPlan.stages, guarded);
+      if (problem) {
+        return {
+          content:
+            `write_manifest: releasePlan.stages ${problem}. allocation is BASIS POINTS ` +
+            `(20000 = 20%, ${FULL_ALLOCATION} = 100%), durationMillis is that stage's monitoring window ` +
+            `in milliseconds, and allocations must ASCEND. ` +
+            (guarded
+              ? `This is a GUARDED release (${guardedByInference ? `metricKeys with no explicit releaseMethod` : `releaseMethod: "guarded"`}), ` +
+                `and LaunchDarkly caps a guarded stage at ${GUARDED_MAX_ALLOCATION} (50%) — it needs a ` +
+                `control group at least as large as the treatment, and the release completes to 100% by ` +
+                `itself after the final monitored stage passes, so a 100% stage asks for something the ` +
+                `release already does. ` +
+                (guardedByInference
+                  ? `NOTE this may be a FALSE rejection: at deploy time the flag's LaunchDarkly release ` +
+                    `policy beats the metrics inference, so if that policy is a progressive release these ` +
+                    `stages would have been accepted. IF THAT IS THE CASE, OMIT stages (see below) rather ` +
+                    `than capping them — capping caps the ROLLOUT, and a progressive release is expected ` +
+                    `to reach 100%. `
+                  : "") +
+                `Setting releaseMethod "progressive" is the escape if a 100% stage is genuinely wanted, ` +
+                `BUT KNOW WHAT IT COSTS: an explicit releaseMethod outranks the flag's release policy ` +
+                `permanently for this manifest, and metrics are only sent when the method is guarded — so ` +
+                `this manifest's metricKeys/metricGroupKeys become DEAD, and the rollout is guarded by ` +
+                `nothing. When the release really is guarded, prefer capping the final stage at ` +
+                `${GUARDED_MAX_ALLOCATION} and keeping the metrics. `
+              : "") +
+            // WHAT OMITTING STAGES ACTUALLY BUYS, and it is a different answer in three cases.
+            // `trigger.ts` resolves the two from different chains: `stages = ov.stages ?? policy.stages
+            // ?? defaults` but `method = ov.releaseMethod ?? policy.releaseMethod ?? inferred`. So
+            // when this manifest PINS a method, dropping `stages` inherits the policy's stages and
+            // NOT its method — the pin still outranks it. Saying "omit stages to use the flag's
+            // configured release policy" there promised the policy would take over, which it will
+            // not, and for a pinned `guarded` that means the cap the author just hit still applies.
+            //
+            // AND `immediate` IS A THIRD CASE, not a variant of the second: `trigger.ts` returns from
+            // its immediate branch BEFORE `stages` is resolved at all, so these stages are not capped,
+            // not defaulted and not inherited — they are ignored. Telling that author about inheritance
+            // would describe a mechanism their manifest never reaches. Note `releaseMethod` itself is
+            // unvalidated here (see the `write_manifest` caveat in the release-method line below), so
+            // it is only quoted back when it is a method this repo recognises.
+            (mergedPlan.releaseMethod === undefined
+              ? `Omit stages entirely to fall back to the flag's configured release policy: its stages ` +
+                `if it sets any, else the demo defaults. With no explicit releaseMethod here the ` +
+                `policy's method applies too — but ONLY if the policy sets one; if it does not, or if ` +
+                `it cannot be read at deploy time, the method is INFERRED from whether this manifest ` +
+                `carries metrics (metrics ⇒ guarded, none ⇒ progressive), and the cap comes back with ` +
+                `it.`
+              : mergedPlan.releaseMethod === "immediate"
+                ? `NOTE releaseMethod is "immediate", which IGNORES stages entirely — an immediate ` +
+                  `release moves the fallthrough in one step and never reads a stage set, so these ` +
+                  `stages are dead either way. Fix them only if you also meant to ask for a staged ` +
+                  `rollout, in which case the method is what is wrong; otherwise remove them.`
+                : `Omitting stages inherits the policy's stages (else the demo defaults) but NOT its ` +
+                  `method: ` +
+                  (mergedPlan.releaseMethod === "guarded" || mergedPlan.releaseMethod === "progressive"
+                    ? `this manifest's explicit releaseMethod "${mergedPlan.releaseMethod}" `
+                    : `this manifest's explicit releaseMethod (which is not one of "guarded", ` +
+                      `"progressive" or "immediate", and nothing here validates it) `) +
+                  `outranks the policy permanently, so ` +
+                  (guarded
+                    ? `the guarded cap still governs whatever stages are inherited.`
+                    : `the method the policy configured is not used.`)),
+          isError: true,
+        };
+      }
     }
 
     // releaseIntent: create-if-absent for agents; steward grade may update it.

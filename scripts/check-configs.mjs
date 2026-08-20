@@ -54,6 +54,16 @@ const instructionsOf = (p) =>
   (JSON.parse(readFileSync(p, "utf8")).variations ?? []).map((v) => v?.instructions ?? "").join("\n");
 const edgeId = (from, to, kind) => `${from} -${kind}-> ${to}`;
 
+/** Whether the committed AI config for `configKey` attaches at least one judge. */
+function nodeHasJudge(configKey) {
+  try {
+    const cfg = JSON.parse(readFileSync(join(AI_CONFIG_DIR, `${configKey}.json`), "utf8"));
+    return (cfg.variations ?? []).some((v) => (v.judgeConfiguration?.judges ?? []).length > 0);
+  } catch {
+    return false; // no config file / unreadable → certainly no judge to route on
+  }
+}
+
 const violations = [];
 const fail = (m) => violations.push(m);
 
@@ -128,6 +138,193 @@ for (const [tag, def] of Object.entries(registry)) {
   } else {
     fail(`registry: tag '${tag}' has invalid production '${def.production}' (expected "llm" or "tool").`);
   }
+}
+
+// --- Check 6: loop-back budgets + walker tag-class sync -------------------
+// 6a: `max_visits` on any edge must be an integer in [1, 10]. 6b: removing every
+// max_visits-tagged edge must leave an ACYCLIC graph — i.e. every cycle carries a
+// budget on at least one edge, so the walker can't run it to the node-run cap.
+const MAX_VISITS_HARD_CAP = 10;
+for (const file of listJson(GRAPH_DIR)) {
+  const graph = JSON.parse(readFileSync(file, "utf8"));
+  const adjUntagged = new Map(); // source -> [target] for edges WITHOUT max_visits
+  // 6d: `loop_if_judge_below` must be a number in [0, 1] and only on a budgeted edge
+  // (an unbudgeted judge loop would run to the node-run cap). 6e: ANY loop edge must
+  // be declared BEFORE the other edges from the same source — the walker takes the
+  // first passing edge, so a loop declared after a forward edge that can pass is dead
+  // config with no runtime signal. This applies to every max_visits edge, not just
+  // judge-driven ones: a plain verdict loop is equally killable by a forward edge
+  // added above it.
+  const seenSourceEdge = new Set();      // any edge seen from this source
+  const seenNonLoopSource = new Set();   // a NON-loop edge seen from this source
+  for (const edge of graph.edges ?? []) {
+    const mv = edge.handoff?.max_visits;
+    const below = edge.handoff?.loop_if_judge_below;
+    if (below !== undefined) {
+      if (typeof below !== "number" || !Number.isFinite(below) || below < 0 || below > 1) {
+        fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has loop_if_judge_below=${JSON.stringify(below)} (must be a number in [0, 1]).`);
+      }
+      if (mv === undefined) {
+        fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has loop_if_judge_below but no max_visits — an unbudgeted quality loop runs to the node-run cap.`);
+      }
+      // 6g: the source node must actually have a judge attached in its committed AI
+      // config. The score fails OPEN (no usable score → the edge is never taken), so
+      // a judge-less source makes the edge dead config that fails silently — the
+      // walker's runtime warning only fires per run, and only for whoever reads logs.
+      // (samplingRate lives in LaunchDarkly and cannot be checked here; this covers
+      // the committed half.)
+      if (!nodeHasJudge(edge.sourceConfig)) {
+        fail(
+          `graph: edge ${edge.sourceConfig} → ${edge.targetConfig} routes on loop_if_judge_below, but ` +
+            `'${edge.sourceConfig}' has no judge attached in its committed AI config ` +
+            `(${AI_CONFIG_DIR}/${edge.sourceConfig}.json has no variation with judgeConfiguration.judges). ` +
+            `Judge scores fail open, so this loop can never fire. Attach a judge to '${edge.sourceConfig}' ` +
+            `(see autofactory-metrics-author.json for the shape) or remove loop_if_judge_below from the edge.`,
+        );
+      }
+    }
+    // 6f: a LOOP edge's conditions on ROUTING tags must name tags its SOURCE node can
+    // produce. The walker matches loop-edge routing conditions against the source
+    // run's own tags (so a stale verdict can't re-fire the loop), which means a
+    // condition on another node's llm tag can never be satisfied — the loop would be
+    // dead config with no runtime signal. Fact tags are exempt: they're never rewound
+    // and legitimately come from upstream.
+    if (mv !== undefined) {
+      for (const kind of ["require_tags", "skip_if_tags"]) {
+        for (const tag of Object.keys(edge.handoff?.[kind] ?? {})) {
+          const def = registry[tag];
+          if (!def || def.production !== "llm") continue;
+          if (def.producedBy !== edge.sourceConfig) {
+            // The consequence is opposite per kind, so say the right one: an unsatisfiable
+            // require_tags means the loop never fires; an unreachable skip_if exit means it
+            // fires every pass until budget. Printing "never fires" for both would send a
+            // reader looking for the wrong symptom.
+            const consequence =
+              kind === "require_tags"
+                ? "this condition can never be satisfied, so the loop would never fire"
+                : "this exit can never match, so the loop would run to its full budget every time";
+            fail(
+              `graph: loop edge ${edge.sourceConfig} → ${edge.targetConfig} gates on '${tag}' (${kind}), ` +
+                `which is produced by '${def.producedBy}', not by the edge's source. The walker matches a loop edge's ` +
+                `routing conditions against the source run's OWN tags, so ${consequence}.`,
+            );
+          }
+        }
+      }
+    }
+    // Multiple loop edges from one source are legitimate (each has its own condition
+    // and budget), so only a preceding NON-loop edge is a problem.
+    if (mv !== undefined && seenNonLoopSource.has(edge.sourceConfig)) {
+      fail(
+        `graph: the loop edge ${edge.sourceConfig} → ${edge.targetConfig} (max_visits: ${mv}) is declared AFTER a non-loop edge from '${edge.sourceConfig}'. ` +
+          `The walker takes the first passing edge, so this loop may never fire. Move it above the forward edges — a loop edge's own ` +
+          `conditions decide whether it fires, so ordering it first is always safe.`,
+      );
+    }
+    seenSourceEdge.add(edge.sourceConfig);
+    if (mv === undefined) seenNonLoopSource.add(edge.sourceConfig);
+    if (mv !== undefined) {
+      if (!Number.isInteger(mv) || mv < 1 || mv > MAX_VISITS_HARD_CAP) {
+        fail(`graph: edge ${edge.sourceConfig} → ${edge.targetConfig} has max_visits=${JSON.stringify(mv)} (must be an integer in [1, ${MAX_VISITS_HARD_CAP}]).`);
+      }
+    } else {
+      if (!adjUntagged.has(edge.sourceConfig)) adjUntagged.set(edge.sourceConfig, []);
+      adjUntagged.get(edge.sourceConfig).push(edge.targetConfig);
+    }
+  }
+  // DFS cycle detection over the untagged subgraph (white/gray/black).
+  const color = new Map();
+  let cycleNode = null;
+  const visit = (n) => {
+    color.set(n, "gray");
+    for (const m of adjUntagged.get(n) ?? []) {
+      const c = color.get(m);
+      if (c === "gray") { cycleNode = m; return true; }
+      if (c === undefined && visit(m)) return true;
+    }
+    color.set(n, "black");
+    return false;
+  };
+  for (const n of adjUntagged.keys()) {
+    if (color.get(n) === undefined && visit(n)) break;
+  }
+  if (cycleNode) {
+    fail(`graph ${basename(file)}: a cycle through '${cycleNode}' has no max_visits on any of its edges — the walker would run it to the node-run cap. Tag the loop-back edge with max_visits.`);
+  }
+}
+// 6c: the walker's hard-coded ROUTING_TAGS/FACT_TAGS (graphWalker.ts) must match
+// tags.json `production` (llm → routing/rewound, tool → fact/inventory), or a
+// loop rewind would drop/keep the wrong tags.
+try {
+  const walkerSrc = readFileSync("packages/shared/src/graphWalker.ts", "utf8");
+  const parseSet = (name) => {
+    const m = walkerSrc.match(new RegExp(`const ${name} = new Set<string>\\(\\[([\\s\\S]*?)\\]\\)`));
+    return m ? new Set([...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1])) : null;
+  };
+  const routing = parseSet("ROUTING_TAGS");
+  const fact = parseSet("FACT_TAGS");
+  if (!routing || !fact) {
+    fail("graphWalker.ts: could not parse ROUTING_TAGS/FACT_TAGS for the tag-class sync check.");
+  } else {
+    for (const [tag, def] of Object.entries(registry)) {
+      if (def.production === "llm" && !routing.has(tag)) fail(`graphWalker ROUTING_TAGS is missing '${tag}' (tags.json production:"llm").`);
+      if (def.production === "tool" && !fact.has(tag)) fail(`graphWalker FACT_TAGS is missing '${tag}' (tags.json production:"tool").`);
+    }
+    for (const t of routing) if (registry[t]?.production !== "llm") fail(`graphWalker ROUTING_TAGS has '${t}', not production:"llm" in tags.json.`);
+    for (const t of fact) if (registry[t]?.production !== "tool") fail(`graphWalker FACT_TAGS has '${t}', not production:"tool" in tags.json.`);
+  }
+} catch (e) {
+  fail(`graphWalker.ts: could not run tag-class sync check: ${e.message}`);
+}
+
+// 6h: 6e above enforces the loop-edge ordering rule on the COMMITTED graph; the
+// walker enforces the same rule on the graph LaunchDarkly SERVES (a dashboard edit
+// or a seed from another project can diverge, and REST GET's edge order is not
+// faithful enough for `bridge upgrade` to notice — docs/loopback-handoff.md 7a).
+// Two enforcement points, one rule: assert the walker's half is still there, or a
+// future refactor silently leaves 6e guarding only half the surface. Eleven prose
+// corrections in this repo's history each fixed three of four sites; this is the
+// same class, so it gets a check rather than a comment.
+try {
+  const walkerSrc = readFileSync("packages/shared/src/graphWalker.ts", "utf8");
+  if (!walkerSrc.includes("LOOP_EDGE_SHADOWED_RULE")) {
+    fail(
+      "graphWalker.ts no longer defines LOOP_EDGE_SHADOWED_RULE — the served-graph counterpart of check 6e is gone, " +
+        "so a loop edge reordered in LaunchDarkly (not in the committed file) would fire nothing and report nothing.",
+    );
+  }
+  // Defined AND called AND surfaced. Each is separately droppable: a helper nobody
+  // calls, or a record that never reaches WalkResult, leaves the rule documented in
+  // the walker but unenforced there — worse than absent, because 6e reads as covering
+  // both graphs. (This check earned itself immediately: it caught the marker moving
+  // into a helper on the first run.)
+  //
+  // Patterns are deliberately loose about ARGUMENTS and FORMATTING. The first version
+  // matched `recordShadowedLoopEdges(key, node,` exactly, so renaming a local or a
+  // formatter wrapping the call would have failed the build with the mechanism fully
+  // intact — the same lint-misfire class 7a.1 records for taxonomyHome, where the
+  // documented remedy is to loosen the term rather than delete the check.
+  //
+  // What this canNOT do, stated so nobody reads more into a green build: it is a
+  // source-text lint, so it matches commented-out code and cannot tell a live mechanism
+  // from a broken one. tests/loopEdgeOrder.test.ts is the behavioural proof; 6h only
+  // stops the wiring vanishing silently.
+  const callSites = walkerSrc.split("recordShadowedLoopEdges").length - 1;
+  for (const [ok, missing] of [
+    [/function recordShadowedLoopEdges\s*\(/.test(walkerSrc), "does not define recordShadowedLoopEdges"],
+    // Definition + at least one call: the name appears twice or more.
+    [callSites >= 2, "never calls recordShadowedLoopEdges during the walk"],
+    [/loopEdgeShadowed\.length/.test(walkerSrc), "never puts loopEdgeShadowed on the WalkResult"],
+  ]) {
+    if (!ok) {
+      fail(
+        `graphWalker.ts defines LOOP_EDGE_SHADOWED_RULE but ${missing} — a loop edge reordered in LaunchDarkly ` +
+          "would then fire nothing and report nothing, while check 6e still passes on the committed file.",
+      );
+    }
+  }
+} catch (e) {
+  fail(`graphWalker.ts: could not run the loop-edge-order sync check (6h): ${e.message}`);
 }
 
 // --- Check 4: README ⟷ registry -------------------------------------------

@@ -49,6 +49,25 @@
       }
     },
     {
+      "$comment": "Judge-driven quality retry. MUST stay declared BEFORE the metrics-author → flag-testing edge: the walker takes the first passing edge, and that forward edge's require_tags are satisfied whenever this one's are, so a later declaration would never fire. Advisory by design — when the budget is spent the walk falls through to testing and records the attempt in loopBudgetSpent.",
+      "key": "edge-autofactory-metrics-author-autofactory-metrics-author",
+      "sourceConfig": "autofactory-metrics-author",
+      "targetConfig": "autofactory-metrics-author",
+      "handoff": {
+        "max_visits": 1,
+        "loop_if_judge_below": 0.7,
+        "max_turns": 20,
+        "request_type": "Fix",
+        "capabilities": [
+          "create_metric",
+          "edit_files",
+          "write_manifest",
+          "read_docs",
+          "query_graph"
+        ]
+      }
+    },
+    {
       "key": "edge-autofactory-metrics-author-autofactory-flag-testing",
       "sourceConfig": "autofactory-metrics-author",
       "targetConfig": "autofactory-flag-testing",
@@ -81,6 +100,26 @@
         "require_tags": {
           "flag_ready": "true"
         }
+      }
+    },
+    {
+      "key": "edge-autofactory-code-reviewer-autofactory-flag-implementer",
+      "sourceConfig": "autofactory-code-reviewer",
+      "targetConfig": "autofactory-flag-implementer",
+      "handoff": {
+        "max_turns": 20,
+        "request_type": "Fix",
+        "capabilities": [
+          "create_flag",
+          "flag_state",
+          "edit_files",
+          "write_manifest",
+          "read_docs"
+        ],
+        "require_tags": {
+          "review_approved": "false"
+        },
+        "max_visits": 1
       }
     }
   ]
