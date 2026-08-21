@@ -92,6 +92,8 @@ the registry, the graph, and the instructions all agree.
 | `metrics_created` | metrics-author | `"true"` if any metric was created/reused (set automatically by `create_metric`) |
 | `metric_keys` | metrics-author | comma-separated metric keys attached (set automatically by `create_metric`) |
 | `metric_event_keys` | metrics-author | comma-separated event keys of event-backed metrics (set automatically by `create_metric`; the deterministic handoff shim greps the code for an emitter of each; Sentry integration key `sentry-errors` is exempt) |
+| `needs_human_input` | metrics-author | `"true"`: the metrics author paused on a question only a human can answer (M14) — the walker halts the chain (`pendingInput`); answer in the manifest's `humanInput.answer`, then re-run |
+| `human_question` | metrics-author | short form of the M14 question, surfaced by the front ends (CLI message / PR comment / editor toast); the full question lives in the step output and the manifest's `humanInput.question` |
 | `sentry_guardrail` | metrics-author | `"true"` when a shared Sentry-backed LD metric was attached as the error killswitch — verifier checks for `launchdarklyContext` in the checkout (ADR 0014) |
 | `tests_last_run` | flag-testing | `pass`/`fail` — outcome of the last real `run_tests` execution (set automatically by `run_tests`; a `fail` at handoff mechanically fails the run) |
 | `risk_level` | code-reviewer | `low` / `medium` / `high`; categorical companion to `risk_score` (fallback mapping when the score is missing) |

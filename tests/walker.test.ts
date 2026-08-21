@@ -296,3 +296,70 @@ describe("walkGraph — approval gates", () => {
     assert.equal(r.runs.length, 4);
   });
 });
+
+describe("walkGraph — agent-initiated human-input pause (M14)", () => {
+  it("halts on needs_human_input=true with the question, before edge selection", async () => {
+    const r = await run({
+      flag: {
+        tags: {
+          flag_created: "true",
+          needs_human_input: "true",
+          human_question: "Does the OTel collector forward traces to LaunchDarkly?",
+        },
+      },
+    });
+    // The asking node completed; nothing downstream ran.
+    assert.deepEqual(
+      r.runs.map((x) => x.configKey),
+      ["research", "flag"],
+    );
+    assert.deepEqual(r.pendingInput, {
+      node: "flag",
+      question: "Does the OTel collector forward traces to LaunchDarkly?",
+    });
+    // A pause, not a stall — even though flag_created would have routed onward.
+    assert.equal(r.stalledAt, undefined);
+    assert.ok(r.skipped.includes("test") && r.skipped.includes("review"));
+  });
+
+  it("carries no question field when the human_question tag is absent", async () => {
+    const r = await run({ flag: { tags: { needs_human_input: "true" } } });
+    assert.deepEqual(r.pendingInput, { node: "flag" });
+  });
+
+  it("emits an 'awaiting-input' event for live UIs", async () => {
+    const events: Array<{ type: string; question?: string }> = [];
+    await walkGraph(
+      buildGraph(),
+      new FakeRunner({ flag: { tags: { needs_human_input: "true", human_question: "q?" } } }),
+      { PR_NUMBER: "1" },
+      undefined,
+      (e) => events.push(e as { type: string; question?: string }),
+    );
+    const evt = events.find((e) => e.type === "awaiting-input");
+    assert.ok(evt, `expected an awaiting-input event, got: ${events.map((e) => e.type).join(", ")}`);
+    assert.equal(evt?.question, "q?");
+  });
+
+  it("suppresses graph-level metrics on the pause (like an approval pause)", async () => {
+    const g = recordingGraphTracker();
+    await walkGraph(
+      buildGraph(),
+      new FakeRunner({ flag: { tags: { needs_human_input: "true" } } }),
+      { PR_NUMBER: "1" },
+      g.tracker,
+    );
+    assert.ok(!g.methods().includes("trackInvocationSuccess"), `got: ${g.methods().join(", ")}`);
+    assert.ok(!g.methods().includes("trackInvocationFailure"));
+    assert.ok(!g.methods().includes("trackPath"));
+  });
+
+  it("does not halt on needs_human_input=false or an unrelated value", async () => {
+    const r = await run({
+      flag: { tags: { flag_created: "true", needs_human_input: "false" } },
+      review: { tags: { review_approved: "approve" } },
+    });
+    assert.equal(r.pendingInput, undefined);
+    assert.equal(r.runs.length, 4);
+  });
+});

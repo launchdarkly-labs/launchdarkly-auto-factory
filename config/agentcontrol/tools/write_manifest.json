@@ -1,7 +1,7 @@
 {
   "key": "write_manifest",
   "name": "write_manifest",
-  "description": "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own — they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag — Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). The file is validated, written as schema 1.2, and committed to the PR branch automatically — do not also edit it with write_file/edit_file.",
+  "description": "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own — they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*, humanInput.question). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag — Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). humanInput carries a question you need a human to answer (a pause per your instructions): you may set humanInput.question; humanInput.answer is HUMAN-owned and always preserved — you can never write or clear it. The file is validated, written as schema 1.2, and committed to the PR branch automatically — do not also edit it with write_file/edit_file.",
   "schema": {
     "type": "object",
     "properties": {

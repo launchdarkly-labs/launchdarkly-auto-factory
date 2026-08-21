@@ -365,6 +365,8 @@ async function run(opts: CliOptions): Promise<number> {
         console.log(`⚠ ${describeStall(event.stall)}`);
       } else if (event.type === "awaiting-approval") {
         console.log(`⏸ approval gate: stopped before ${event.node}`);
+      } else if (event.type === "awaiting-input") {
+        console.log(`⏸ human input: ${event.node} paused with a question${event.question ? `: ${event.question}` : ""}`);
       }
     },
     gate,
@@ -390,6 +392,26 @@ async function run(opts: CliOptions): Promise<number> {
       ].join("\n"),
     );
     return EXIT.PENDING_APPROVAL;
+  }
+
+  // Halted on an agent's question (M14): the asking step deliberately created
+  // nothing, and downstream steps did not run. The question lives durably in
+  // the manifest's humanInput block; a human answers there and re-runs — the
+  // fresh walk finds the answer and completes the job.
+  if (walk.pendingInput) {
+    const { node, question } = walk.pendingInput;
+    const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
+    console.log(
+      [
+        "",
+        `⏸ '${node}' paused with a question for a human. Nothing was created for this or later steps.`,
+        ...(question ? [`Question: ${question}`] : []),
+        `Answer it by setting "humanInput": {"answer": "..."} in ${manifestPath} (the full`,
+        "question and the agent's analysis are in the step output above), then re-run:",
+        `  autofactory run --graph ${opts.graphKey}${opts.dryRun ? " --dry-run" : ""}${[...approvedSteps].map((s) => ` --approve ${s}`).join("")}`,
+      ].join("\n"),
+    );
+    return EXIT.PENDING_INPUT;
   }
 
   const verdict = interpretWalk(walk.tags);

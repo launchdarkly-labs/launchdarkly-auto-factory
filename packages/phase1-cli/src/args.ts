@@ -20,6 +20,12 @@ export const EXIT = {
   USAGE: 2,
   /** Halted before a gated step awaiting human approval — re-run with --approve. */
   PENDING_APPROVAL: 3,
+  /**
+   * An agent asked a human a question it could not answer from the repo (e.g.
+   * the metrics author's M14 trace-delivery pause). Answer by editing the
+   * release manifest's `humanInput.answer`, then re-run the same command.
+   */
+  PENDING_INPUT: 4,
 } as const;
 
 export interface CliOptions {
@@ -64,6 +70,7 @@ export function usage(): string {
     "  1  review rejected, chain incomplete, or a deterministic check failed",
     "  2  usage/configuration error, or nothing to process",
     "  3  paused at an approval gate — re-run with --approve <node> after a human approves",
+    "  4  paused on an agent's question — answer in the manifest's humanInput.answer, re-run",
   ].join("\n");
 }
 

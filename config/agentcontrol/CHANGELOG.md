@@ -15,6 +15,80 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-21 (observability-first metric backing + M14 human-input pause)
+
+### ✅ `autofactory-metrics-author`: Metric Backing priority rewritten (ADR 0017)
+
+- **Change (default + sentry variations, committed + live via `bridge upgrade`):**
+  decision order per category is now (1) **reuse existing data** — an existing
+  `track()` event, OR existing spans with attribution + delivery already verified
+  (defining a trace metric on them is code-free); (2) **ride the installed
+  observability stack** — LD o11y SDK (direct export, no delivery validation) or
+  generic OTel with the LD evaluation hook registered (hook-adding is encouraged,
+  code changes and all); (3) **instrument a new `track()` call** — the floor, and
+  the only backing when no telemetry stack exists. Installing a new o11y/OTel
+  package stays forbidden (M10) — ride what's there, record the gap.
+- **Trace metrics are no longer LD-o11y-only:** valid under ATTRIBUTION (an LD
+  evaluation hook — o11y plugin or the standalone OTel tracing hook — enriches
+  spans in the trace evaluating this flag) + DELIVERY (traces demonstrably reach
+  LaunchDarkly; `query_dependencies` edges are the evidence — hook presence in
+  code proves attribution, never delivery). Pre-aggregated OTel **metrics**
+  remain banned; the ban no longer smears onto span-level traces.
+- **M10 rewritten (footprint ≠ guardrail):** span coverage + flag attribution
+  wherever a telemetry stack exists, regardless of which backing gates the
+  release; hook/exporter init must degrade to a no-op, never crash startup.
+- **New M14 (pause and ask):** first-time hook wiring in a generic-OTel service
+  with unverifiable delivery → the agent STOPS before any instrumentation,
+  writes `humanInput.question` into the manifest, tags `needs_human_input=true`
+  + `human_question`, and the walker halts (`WalkResult.pendingInput`). The
+  human answers in the manifest's `humanInput.answer` (agent-unwritable,
+  structurally protected in `write_manifest`) and re-runs; the fresh walk finds
+  the answer and completes. Surfaces: CLI exit 4, PR comment +
+  `action_required` check run, editor toast. Same manifest-as-human-channel
+  pattern as releaseIntent (ADR 0009).
+- **Docs list extended:** `sdk/features/opentelemetry-server-side` /
+  `-client-side`, `sdk/features/observability-otel-collector`,
+  `home/metrics/autogen/opentelemetry`.
+- **Live A/B arms re-synced:** `composer-2-5` and `fable-5` had drifted (stale
+  pre-ADR-0013 M01 wording); PATCHed to the new default instructions so arms
+  again differ only by model. `vega-chain-copy` left untouched (preserved
+  legacy).
+- **Why:** the old rules conflated "pre-aggregated OTel metrics can't back a
+  guarded release" (true) with "only the LD o11y package can back trace
+  metrics" (false — the SDK hooks attribute spans in any OTel estate), and
+  framed track() as the default rather than the floor, under-investing in
+  estate-wide telemetry. The pause exists so an unverifiable trace guardrail is
+  never shipped as a silent no-op — surfacing to a human beats both guessing
+  and silently downgrading.
+
+### ✅ `autofactory-research-planner`: telemetry_inventory in the brief
+
+- Repo Conventions now require a `telemetry_inventory` (o11y packages, LD hooks
+  wired, track() calls, span coverage, `ld_trace_delivery`
+  verified/unverified/unknown via `query_dependencies`, advisory
+  `recommended_backing`). Evidence, not routing: the metrics author verifies it
+  and may override with a note. Per-telemetry-type config VARIATIONS were
+  considered and rejected (the decision needs checkout facts the deciding step
+  must verify anyway; near-identical instruction copies multiply maintenance).
+
+### ✅ Tags + tools + runtime
+
+- New registry tags `needs_human_input` (routing: halts the walker) and
+  `human_question` (informational: surfaced by front ends); README table +
+  check-configs updated.
+- `write_manifest` tool: new `humanInput` block — agents may set/update
+  `question`; `answer` is human-owned and survives every agent write (mirror of
+  the releaseIntent protection). Tool description updated (committed +
+  exported + live).
+- `create_metric` tool description updated for the two-condition trace-backing
+  rule; trimmed to LD's 1024-BYTE description limit (em dashes count as 3 —
+  discovered live when the upgrade 400'd at 1017 chars/1029 bytes).
+- Runtime (code repo, same commit): `WalkResult.pendingInput` +
+  `awaiting-input` walk event; CLI exit code 4 + resume message; Action PR
+  comment + `action_required` check; extension toast; Claude Code skill exit-4
+  contract. Graph-level metrics are suppressed on the pause (like approval
+  pauses — the post-answer re-run reports the complete invocation).
+
 ## 2026-08-18 (provider-aware routing on flag-testing)
 
 ### ✅ `autofactory-flag-testing`: run.provider rules added around the composer-2-5 arm

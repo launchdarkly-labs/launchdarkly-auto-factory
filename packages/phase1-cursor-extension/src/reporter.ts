@@ -29,6 +29,11 @@ export interface RunResult {
   provider: string;
   /** Set when the run stopped at an approval gate (the user declined to proceed). */
   pendingApproval?: { node: string };
+  /**
+   * Set when an agent paused the chain on a question for a human (M14).
+   * Answer lives in the release manifest's `humanInput.answer`; re-run after.
+   */
+  pendingInput?: { node: string; question?: string };
 }
 
 export interface RunReporter {

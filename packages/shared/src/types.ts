@@ -86,6 +86,23 @@ export interface ReleaseIntent {
   notes?: string;
 }
 
+/**
+ * A question an agent (today: the metrics author, rule M14) could not answer
+ * from the repo and paused the chain on, plus the human's answer. The agent
+ * writes `question` via write_manifest; the HUMAN writes `answer` by editing
+ * the file on the PR branch (on GitHub that push re-triggers the workflow).
+ * Resume is a fresh walk from the root (ADR 0009), so the manifest — the same
+ * channel as releaseIntent — is what carries human text across runs: on the
+ * re-run the agent finds `answer` present, treats it as authoritative, and
+ * never re-asks. `answer` is structurally protected in write_manifest —
+ * agents can never write or clear it.
+ */
+export interface HumanInput {
+  question?: string;
+  /** Human-authored; agents must never write or overwrite this. */
+  answer?: string;
+}
+
 /** The on-disk shape of a `.release-flags/*.json` file. */
 export interface ReleaseFlagFile {
   schemaVersion?: string;
@@ -105,6 +122,8 @@ export interface ReleaseFlagFile {
   releaseOverrides?: ReleasePlan;
   /** Human-authored intent (schema 1.1+). */
   releaseIntent?: ReleaseIntent;
+  /** Agent question + human answer across a paused chain (M14). */
+  humanInput?: HumanInput;
 }
 
 /** A release-flag file discovered during a deploy notification. */

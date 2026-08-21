@@ -79,6 +79,16 @@ export interface WalkResult {
    */
   pendingApproval?: { node: string };
   /**
+   * Set when a node ASKED FOR HUMAN INPUT (tag `needs_human_input=true`, e.g.
+   * the metrics author's M14 pause: trace delivery it cannot verify). The node
+   * itself completed — deliberately having created nothing — and the walk
+   * halted before edge selection, so downstream nodes did not run. Like
+   * pendingApproval this is a pause awaiting a human, not a stall or failure.
+   * The durable question/answer channel is the release manifest's `humanInput`
+   * block; `question` here is the short form from the `human_question` tag.
+   */
+  pendingInput?: { node: string; question?: string };
+  /**
    * Set when a deterministic handoff shim (see handoffVerifier.ts) FAILED
    * after a node: a claim the node handed off could not be re-derived from
    * primary evidence (LaunchDarkly state / the checkout). The chain halts at
@@ -117,7 +127,8 @@ export type WalkEvent =
   | { type: "node-complete"; configKey: string; index: number; run: NodeRun }
   | { type: "node-verified"; verification: HandoffVerification }
   | { type: "stalled"; stall: StallInfo }
-  | { type: "awaiting-approval"; node: string };
+  | { type: "awaiting-approval"; node: string }
+  | { type: "awaiting-input"; node: string; question?: string };
 
 /** All key/value pairs in `cond` are present and equal in `tags`. */
 function tagsMatch(tags: Record<string, string>, cond: Record<string, string>): boolean {
@@ -216,6 +227,7 @@ export async function walkGraph(
   let inboundHandoff: Record<string, unknown> | undefined;
   let stalledAt: StallInfo | undefined;
   let pendingApproval: { node: string } | undefined;
+  let pendingInput: { node: string; question?: string } | undefined;
   let verificationFailed: HandoffVerification | undefined;
 
   while (node && !visited.has(node.getKey())) {
@@ -315,6 +327,20 @@ export async function walkGraph(
       }
     }
 
+    // Agent-initiated pause (metrics author rule M14): the node hit a question
+    // only a human can answer (e.g. trace delivery it cannot verify) and
+    // deliberately created nothing. Halt before edge selection — a pause
+    // awaiting input, not a stall. The durable question/answer lives in the
+    // release manifest's humanInput block; the human_question tag is the short
+    // form the front ends surface. Resume = a fresh walk (same as approval
+    // gates): the re-run finds humanInput.answer in the manifest and proceeds.
+    if (result.tags.needs_human_input === "true") {
+      const question = result.tags.human_question;
+      pendingInput = { node: key, ...(question ? { question } : {}) };
+      onEvent?.({ type: "awaiting-input", node: key, ...(question ? { question } : {}) });
+      break;
+    }
+
     // Pick the next edge whose handoff conditions pass.
     let next: string | null = null;
     let nextHandoff: Record<string, unknown> | undefined;
@@ -375,12 +401,13 @@ export async function walkGraph(
   }
 
   // Graph-level ("global") metrics, alongside the per-node metrics recorded
-  // above. A pause at an approval gate is NOT a finished invocation — emit
-  // nothing graph-level for it: the post-approval re-run walks the chain on a
-  // fresh tracker (fresh runId) and reports the complete run. Likewise skip
-  // when nothing ran (e.g. a disabled graph): there is no invocation to score.
+  // above. A pause — at an approval gate, or on an agent's request for human
+  // input — is NOT a finished invocation; emit nothing graph-level for it: the
+  // post-answer re-run walks the chain on a fresh tracker (fresh runId) and
+  // reports the complete run. Likewise skip when nothing ran (e.g. a disabled
+  // graph): there is no invocation to score.
   // Defensive try/catch: metric emission must never fail the walk.
-  if (graphTracker && !pendingApproval && runs.length > 0) {
+  if (graphTracker && !pendingApproval && !pendingInput && runs.length > 0) {
     try {
       graphTracker.trackPath(runs.map((r) => r.configKey));
       graphTracker.trackDuration(Date.now() - startMs);
@@ -406,6 +433,7 @@ export async function walkGraph(
     skipped,
     ...(stalledAt ? { stalledAt } : {}),
     ...(pendingApproval ? { pendingApproval } : {}),
+    ...(pendingInput ? { pendingInput } : {}),
     ...(verificationFailed ? { verificationFailed } : {}),
   };
 }

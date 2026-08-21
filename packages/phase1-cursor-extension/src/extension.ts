@@ -175,7 +175,9 @@ async function runOnce(context: vscode.ExtensionContext, reason: string): Promis
         if (links.flag) output.appendLine(`Flag → ${links.flag.url}`);
         for (const m of links.metrics) output.appendLine(`Metric ${m.key} → ${m.url}`);
 
-        const verb = result.pendingApproval
+        const verb = result.pendingInput
+          ? `⏸ ${nodeTitle(result.pendingInput.node)} needs a human answer (see Output; reply in the manifest's humanInput.answer, then re-run)`
+          : result.pendingApproval
           ? `⏸ stopped before ${nodeTitle(result.pendingApproval.node)} (approval declined)`
           : result.decision.apply
               ? "✓ approved"

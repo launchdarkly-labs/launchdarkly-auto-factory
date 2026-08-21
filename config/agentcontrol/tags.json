@@ -157,6 +157,26 @@
       ],
       "description": "pass | fail — the outcome of the LAST real run_tests execution in a node's run. Set automatically by run_tests. The deterministic handoff shim fails the run if a node hands off with a red suite."
     },
+    "needs_human_input": {
+      "producedBy": "autofactory-metrics-author",
+      "production": "llm",
+      "role": "routing",
+      "edges": [],
+      "readBy": [
+        "walker"
+      ],
+      "description": "true when the metrics author paused on a question only a human can answer (rule M14, e.g. trace delivery it cannot verify). The graph walker halts the chain before edge selection (WalkResult.pendingInput) — a pause awaiting input, not a stall. The durable question/answer channel is the release manifest's humanInput block; the human answers there and the next run proceeds."
+    },
+    "human_question": {
+      "producedBy": "autofactory-metrics-author",
+      "production": "llm",
+      "role": "informational",
+      "edges": [],
+      "readBy": [
+        "walker"
+      ],
+      "description": "Short form (one or two sentences) of the M14 question, surfaced by the front ends (CLI message, PR comment, editor toast) when needs_human_input halts the walk. The full question + analysis live in the step output and the manifest's humanInput.question."
+    },
     "sentry_guardrail": {
       "producedBy": "autofactory-metrics-author",
       "production": "llm",

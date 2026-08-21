@@ -588,6 +588,37 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Halted on an agent's question (M14): the asking step deliberately created
+  // nothing and downstream steps did not run. The question was written to the
+  // manifest's humanInput block on the PR branch; the human answers by editing
+  // `humanInput.answer` there — that push re-triggers this workflow, and the
+  // fresh walk finds the answer and completes. Like an approval pause, this is
+  // an `action_required` check, not a red failure; the job exits 0.
+  if (walk.pendingInput) {
+    const { node, question } = walk.pendingInput;
+    const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
+    console.log(`::warning::AutoFactory: '${node}' paused with a question for a human${question ? `: ${question}` : ""}.`);
+    await postPrComment(
+      [
+        `## ⏸ AutoFactory needs a human answer`,
+        "",
+        `\`${node}\` paused the chain on a question it could not answer from the repo. Nothing was created for this or later steps.`,
+        "",
+        ...(question ? [`> ${question}`, ""] : []),
+        `**To answer:** edit \`${manifestPath}\` on this branch and set \`"humanInput": {"answer": "..."}\` (the agent's full analysis is in the run log). Pushing the edit re-runs the chain, which reads your answer and continues.`,
+      ].join("\n"),
+      { prNumber: context.PR_NUMBER, repo: context.REPO },
+    );
+    await postCheckRun({
+      repo: context.REPO,
+      headSha: context.HEAD_SHA,
+      conclusion: "action_required",
+      title: `Human answer needed by ${node}`,
+      summary: `The chain paused on a question from \`${node}\`${question ? `: ${question}` : ""}. Answer in \`${manifestPath}\` → \`humanInput.answer\` and push; the chain resumes on the next run.`,
+    });
+    return;
+  }
+
   // Gates were active and all cleared: post a `success` check under the same
   // name so it supersedes any earlier `action_required` on this head SHA.
   if (gate) {

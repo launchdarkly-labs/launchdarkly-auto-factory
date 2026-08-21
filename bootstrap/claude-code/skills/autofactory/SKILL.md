@@ -66,6 +66,7 @@ Other rules:
 | 1 | Review REJECTED, chain incomplete, or a deterministic check failed | Summarize; a rejection is a **review verdict, not a pipeline failure** |
 | 2 | Usage/configuration problem (missing env, nothing to process) | Fix or ask the user; don't retry blindly |
 | 3 | **Paused at an approval gate** | See below |
+| 4 | **Paused on an agent's question** (needs a human answer) | See below |
 
 ## Approval gates (exit 3)
 
@@ -79,6 +80,23 @@ command (`--approve <nodeKey>`, accumulating every previously approved step).
    with `--approve` resumes it.
 
 Never approve a gate yourself — that decision is the human's.
+
+## Agent questions (exit 4)
+
+An agent (the metrics author) paused the chain on a question it could not
+answer from the repo — typically "do this service's OpenTelemetry traces
+actually reach LaunchDarkly?" when wiring the LD evaluation hook for the first
+time. Nothing was created for that step or anything after it.
+
+1. Relay the question to the user VERBATIM (the CLI prints it; the agent's full
+   analysis is in the step output above it).
+2. When the user answers, write their answer into the release manifest the CLI
+   names (`.release-flags/pr-<N>.json`) as `"humanInput": {"answer": "<their
+   answer>"}` — keep the existing `question` field beside it.
+3. Re-run the same command. The fresh run reads the answer and completes.
+
+Never invent or assume the answer yourself — if the user says they don't know,
+suggest answering `use track()` (the agent then falls back to event metrics).
 
 ## Summarizing a finished run
 

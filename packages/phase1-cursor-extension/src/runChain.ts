@@ -132,6 +132,11 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
         reporter.log(`⚠ chain stalled at ${event.stall.node}: unmet handoff ${u}`);
       } else if (event.type === "awaiting-approval") {
         reporter.log(`⏸ approval gate: stopped before ${event.node}`);
+      } else if (event.type === "awaiting-input") {
+        reporter.log(
+          `⏸ human input: ${event.node} paused with a question${event.question ? `: ${event.question}` : ""} — ` +
+            `answer in the release manifest's humanInput.answer, then re-run`,
+        );
       }
     },
     gate,
@@ -150,6 +155,7 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
     tags: walk.tags,
     decision,
     ...(walk.pendingApproval ? { pendingApproval: walk.pendingApproval } : {}),
+    ...(walk.pendingInput ? { pendingInput: walk.pendingInput } : {}),
     mode: policy.mode,
     provider,
   };

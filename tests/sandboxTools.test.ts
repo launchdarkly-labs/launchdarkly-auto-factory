@@ -582,6 +582,50 @@ describe("SandboxToolExecutor — write_manifest", () => {
     assert.equal(e.isError, true);
   });
 
+  it("humanInput: agent sets the question; the answer is human-owned and preserved (M14)", async () => {
+    // Agent pauses: writes the question.
+    const r1 = await agent().execute("write_manifest", {
+      path: PATH,
+      manifest: { flagKey: "enable-x", humanInput: { question: "Does the collector forward traces to LD?" } },
+    });
+    assert.equal(r1.isError, undefined, r1.content);
+    assert.match(r1.content, /awaiting a human answer/);
+    assert.equal(readManifest().humanInput.question, "Does the collector forward traces to LD?");
+
+    // Simulate the human's answer.
+    const m = readManifest();
+    m.humanInput.answer = "yes — otel-collector.yaml exports to LD";
+    writeFileSync(join(root, PATH), JSON.stringify(m));
+
+    // A later agent write cannot clear or overwrite the answer — even when it
+    // passes its own humanInput (question updates, answer survives).
+    const r2 = await agent().execute("write_manifest", {
+      path: PATH,
+      manifest: { scope: "backend", humanInput: { question: "updated q", answer: "agent-forged answer" } },
+    });
+    assert.match(r2.content, /PRESERVED/);
+    const after = readManifest();
+    assert.equal(after.humanInput.question, "updated q");
+    assert.equal(after.humanInput.answer, "yes — otel-collector.yaml exports to LD");
+    assert.equal(after.scope, "backend");
+  });
+
+  it("humanInput survives unrelated agent writes untouched", async () => {
+    mkdirSync(join(root, ".release-flags"), { recursive: true });
+    writeFileSync(
+      join(root, PATH),
+      JSON.stringify({ flagKey: "x", humanInput: { question: "q?", answer: "use track()" } }),
+    );
+    const r = await agent().execute("write_manifest", {
+      path: PATH,
+      manifest: { releasePlan: { metricKeys: ["m1"] } },
+    });
+    assert.equal(r.isError, undefined, r.content);
+    const m = readManifest();
+    assert.deepEqual(m.humanInput, { question: "q?", answer: "use track()" });
+    assert.deepEqual(m.releasePlan.metricKeys, ["m1"]);
+  });
+
   it("reports intent issues informationally without blocking the write", async () => {
     mkdirSync(join(root, ".release-flags"), { recursive: true });
     writeFileSync(join(root, PATH), JSON.stringify({ flagKey: "x", releaseIntent: { action: "banana" } }));
