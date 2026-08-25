@@ -1,6 +1,6 @@
 ---
 name: autofactory
-description: Run LaunchDarkly AutoFactory Phase 1 on the current change set — create a feature flag (targeting off), wire the behavior behind it, add guarded-release metrics + instrumentation, flag-on/flag-off tests, a release manifest, and a review verdict. Use when the user says "run AutoFactory", "/autofactory", or asks to flag/instrument their current changes.
+description: Run LaunchDarkly AutoFactory Phase 1 on the current change set — create a feature flag (targeting off), wire the behavior behind it, add guarded-release metrics + instrumentation, flag-on/flag-off tests, a release manifest, and a review verdict. Use when the user says "run AutoFactory", "$autofactory", or asks to flag/instrument their current changes.
 ---
 
 # AutoFactory Phase 1 (via the `autofactory` CLI)
@@ -25,29 +25,33 @@ If `packages/phase1-cli/dist/cli.js` is missing, build it first:
 ## Running
 
 Run from the **tooling repo** (its `.env` holds the LaunchDarkly + model keys)
-with `--root` pointing at the user's repo — and run it **in the background**
-(Bash `run_in_background`), never as one long blocking call. The chain takes
-several minutes across 5–6 agents; your job is live narration, not a spinner.
+with `--root` pointing at the user's repo:
 
 ```bash
 cd "$AUTOFACTORY_HOME" && node packages/phase1-cli/dist/cli.js run --root "<absolute path to the user's repo>"
 ```
 
-**Progress relay loop:** check the background shell's new output (BashOutput)
-roughly every 30–60 seconds, and after each check tell the user — in one short
-sentence per event, not raw logs — anything new:
+This command **needs network access** (LaunchDarkly + model APIs) and runs
+from the tooling checkout **outside your workspace** — the default sandbox
+will block it. Request escalated/unsandboxed execution for this command with
+that justification; the user approves it once.
 
-- `▶ step N: <agent>` — an agent started ("Step 2: the flag implementer is
-  creating the flag and wiring the code…").
+Run it as **one foreground command and wait** — the chain takes several
+minutes across 5–6 agents and streams progress as it goes. Don't kill it for
+being slow, and don't impose a short timeout. When it finishes, relay the
+interesting events from the output — in one short sentence per event, not raw
+logs:
+
+- `▶ step N: <agent>` — an agent started ("Step 2: the flag implementer
+  created the flag and wired the code…").
 - `■ step N done: …` — it finished; surface the interesting tags (flag key,
   metric keys, review verdict), not the whole JSON.
-- `⛊` / `⛔` — a deterministic check passed/failed after a step (⛔ will end
+- `⛊` / `⛔` — a deterministic check passed/failed after a step (⛔ ends
   the run — explain what it re-derived and why it failed).
 - `⏸` — paused at an approval gate (see below).
 - `⚠` — warnings (config drift, knowledge-graph gaps): mention once, briefly.
 
-Nothing new to report → don't post filler; check again later. When the
-command exits, handle the exit code (below).
+Then handle the exit code (below).
 
 Other rules:
 

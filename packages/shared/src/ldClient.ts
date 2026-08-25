@@ -218,6 +218,19 @@ export class LdClient {
     });
   }
 
+  // --- Account members ------------------------------------------------------
+
+  /**
+   * Search account members (ACCOUNT-level endpoint — no project in the path).
+   * `query` matches name/email fuzzily; callers wanting an exact email must
+   * filter the returned items themselves.
+   */
+  findMembers<T = unknown>(query: string, limit = 20): Promise<LdResponse<T>> {
+    return this.request<T>({
+      path: `/api/v2/members?filter=${encodeURIComponent(`query:${query}`)}&limit=${limit}`,
+    });
+  }
+
   // --- Flags & metrics ------------------------------------------------------
 
   /** Create a feature flag. Returns status 409 (not throwing) when it exists. */

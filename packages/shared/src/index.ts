@@ -4,6 +4,7 @@ export * from "./types.js";
 export * from "./env.js";
 export * from "./config.js";
 export * from "./ldClient.js";
+export * from "./maintainer.js";
 export * from "./releaseAdapter.js";
 export * from "./releaseIntent.js";
 export * from "./configVersion.js";

@@ -281,7 +281,7 @@ async function setupGithubFrontEnd(input: GithubFrontEndInput): Promise<void> {
   console.log(`  ✓ setup PR ready: ${url}`);
 }
 
-// --- local front ends (Claude Code skill, Cursor automation) --------------------
+// --- local front ends (Claude Code / Codex skill, Cursor automation) ------------
 
 function installClaudeSkill(appRepoPath: string): void {
   const target = join(appRepoPath, ".claude", "skills", "autofactory");
@@ -289,6 +289,14 @@ function installClaudeSkill(appRepoPath: string): void {
   console.log(`  ✓ skill installed at ${target}`);
   console.log(`  → add to your shell profile:  export AUTOFACTORY_HOME="${process.cwd()}"`);
   console.log("  → then run /autofactory in a Claude Code session in that repo (see INSTALL-CLAUDE-CODE.md for the optional pre-push gate)");
+}
+
+function installCodexSkill(appRepoPath: string): void {
+  const target = join(appRepoPath, ".agents", "skills", "autofactory");
+  cpSync("bootstrap/codex/skills/autofactory", target, { recursive: true });
+  console.log(`  ✓ skill installed at ${target}`);
+  console.log(`  → add to your shell profile:  export AUTOFACTORY_HOME="${process.cwd()}"`);
+  console.log("  → then run $autofactory in a Codex session in that repo (see INSTALL-CODEX.md for the optional pre-push gate)");
 }
 
 function installCursorAutomation(appRepoPath: string, ldApiKey: string): void {
@@ -411,8 +419,16 @@ export async function init(args: string[]): Promise<void> {
   console.log("\nStep 5/5 — front end");
   let frontEnd = argValue(args, "front-end");
   if (!frontEnd) {
-    const answer = (await ask("Front end — [g]itHub Action (default), [c]laude Code skill, c[u]rsor automation, or [n]one", "g")).toLowerCase();
-    frontEnd = answer.startsWith("c") ? "claude-code" : answer.startsWith("u") ? "cursor-automation" : answer.startsWith("n") ? "none" : "github-action";
+    const answer = (await ask("Front end — [g]itHub Action (default), [c]laude Code skill, code[x] skill, c[u]rsor automation, or [n]one", "g")).toLowerCase();
+    frontEnd = answer.startsWith("x")
+      ? "codex"
+      : answer.startsWith("c")
+        ? "claude-code"
+        : answer.startsWith("u")
+          ? "cursor-automation"
+          : answer.startsWith("n")
+            ? "none"
+            : "github-action";
   }
 
   if (frontEnd === "github-action") {
@@ -434,6 +450,11 @@ export async function init(args: string[]): Promise<void> {
     const path = argValue(args, "app-repo-path") ?? (await ask("Local path to your app repo checkout"));
     if (!path || !existsSync(resolve(path))) throw new InitError("A valid local app repo path is required (--app-repo-path)");
     installClaudeSkill(resolve(path));
+    console.log("\nDone.");
+  } else if (frontEnd === "codex") {
+    const path = argValue(args, "app-repo-path") ?? (await ask("Local path to your app repo checkout"));
+    if (!path || !existsSync(resolve(path))) throw new InitError("A valid local app repo path is required (--app-repo-path)");
+    installCodexSkill(resolve(path));
     console.log("\nDone.");
   } else if (frontEnd === "cursor-automation") {
     const path = argValue(args, "app-repo-path") ?? (await ask("Local path to your app repo checkout"));

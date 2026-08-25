@@ -49,14 +49,14 @@ Design history: [docs/adr/](docs/adr/).
 | `packages/phase1-resource-factory/` | Phase 1 front end #1 (GitHub Action): code; its drop-in workflow lives in `bootstrap/github-action-template/` |
 | `packages/phase1-cursor-extension/` | Phase 1 front end #2 (Cursor/VS Code extension): working-tree edits from the editor, calls Anthropic directly |
 | `bootstrap/cursor-automation/` | Phase 1 front end #3 (native Cursor automation): a drop-in `.cursor/` rule + command + MCP config; runs in Cursor's own agent (local prototype) |
-| `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code skill that drives it lives in `bootstrap/claude-code/` |
+| `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code and Codex skills that drive it live in `bootstrap/claude-code/` and `bootstrap/codex/` |
 | `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor, optional Seer Autofix on revert) |
 | `packages/config-bridge/` | CLI that provisions/syncs the agent configs, graph, operational flags, and shared APP metrics between LD projects |
 | `config/agentcontrol/ai-configs/` | The six agent + two judge definitions (instructions live here and in LD) |
 | `config/agentcontrol/tools/` | The agents' tool definitions (descriptions + schemas), provisioned into LaunchDarkly's tools library and attached per variation — editable in the LD UI; execution stays in code (ADR 0011) |
 | `config/agentcontrol/graphs/` | The agent graph: chain order, routing conditions, per-agent write capabilities |
 | `config/agentcontrol/metrics/` | Shared APP-project metrics (Sentry-backed `sentry-errors-*` guardrails, ADR 0014) |
-| `bootstrap/` | One-command setup, plus the drop-in front-end templates (GitHub Action workflow, Cursor automation) |
+| `bootstrap/` | One-command setup, plus the drop-in front-end templates (GitHub Action workflow, Cursor automation, Claude Code + Codex skills/gates) |
 | `examples/demo-app/` | Local sandbox the agents run against in dry-run mode |
 | `docs/` | Pipeline overview, ADRs, design docs |
 
@@ -71,11 +71,14 @@ same release manifest — they differ only in trigger, output, and which models 
 | **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Bedrock / Vega / Cursor (flag-selected; model per agent from the AI config) | primary, verified path (Bedrock path not yet exercised live) |
 | **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API or Bedrock (Cursor can't expose its models to extensions) | working |
 | **Native Cursor automation** — [`bootstrap/cursor-automation`](bootstrap/cursor-automation/) | the `/autofactory` command in Cursor | edits left in your working tree | Cursor's own models (no API key) | local prototype; cloud (auto, PR-based) is a later phase |
-| **Headless CLI / Claude Code** — [`packages/phase1-cli`](packages/phase1-cli/), skill in [`bootstrap/claude-code/`](bootstrap/claude-code/) | `autofactory run` in a terminal, or `/autofactory` in Claude Code | edits left in your working tree | Anthropic API or Bedrock (model per agent from the AI config; the working-tree ceiling requires the sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
+| **Headless CLI / Claude Code / Codex** — [`packages/phase1-cli`](packages/phase1-cli/), skills in [`bootstrap/claude-code/`](bootstrap/claude-code/) and [`bootstrap/codex/`](bootstrap/codex/) | `autofactory run` in a terminal, `/autofactory` in Claude Code, or `$autofactory` in Codex | edits left in your working tree | Anthropic API or Bedrock (model per agent from the AI config; the working-tree ceiling requires the sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
 
 Setup for the GitHub Action is below; the extension, the automation, and the CLI each have their
-own README. For the Claude Code path there is a standalone install guide:
-[INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md).
+own README. For the Claude Code and Codex paths there are standalone install guides:
+[INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md) and [INSTALL-CODEX.md](INSTALL-CODEX.md).
+Locally-driven runs (CLI / Claude Code / Codex) set the developer as the created flag's
+**maintainer** in LaunchDarkly, resolved from `git config user.email`
+(override: `AUTOFACTORY_MAINTAINER_EMAIL`).
 
 ## Phase 1 setup (GitHub Action)
 

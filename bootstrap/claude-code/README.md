@@ -58,7 +58,8 @@ both.
 ## What you get
 
 The chain works from your branch's diff against its base (committed +
-uncommitted). On a flag-worthy change: a flag (targeting off) and three
+uncommitted). On a flag-worthy change: a flag (targeting off, **maintained by
+you** — resolved from your git email to your LaunchDarkly member) and three
 guarded-release metrics in the app project, the behavior wired behind the
 flag, metric instrumentation, flag-on/flag-off tests, and a release manifest
 under `.release-flags/` — all left **uncommitted in your working tree** to

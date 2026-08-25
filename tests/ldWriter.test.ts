@@ -86,6 +86,16 @@ describe("LdResourceWriter.createFlag (multivariate)", () => {
     });
   });
 
+  it("includes maintainerId when the writer is built with one, omits it otherwise", async () => {
+    const withMaintainer = fakeClient(201);
+    await new LdResourceWriter(withMaintainer.client, { maintainerId: "member-123" }).createFlag({ key: "k" });
+    assert.equal(withMaintainer.body()?.maintainerId, "member-123");
+
+    const without = fakeClient(201);
+    await new LdResourceWriter(without.client).createFlag({ key: "k" });
+    assert.equal(without.body()?.maintainerId, undefined);
+  });
+
   it("backend scope does not expose the flag to the client-side SDK", async () => {
     const { client, body, patch } = fakeClient(201);
     await new LdResourceWriter(client).createFlag({ key: "k", scope: "backend" });

@@ -2,26 +2,27 @@
 /**
  * PreToolUse gate: don't let a PR leave the machine before AutoFactory has run.
  *
- * Wired in .claude/settings.json against the Bash tool, this intercepts
- * `git push` and `gh pr create` and checks the run record the `autofactory`
- * CLI writes at `<git-dir>/autofactory-last-run.json` (dry runs don't write
- * one). Decisions:
+ * Codex sibling of bootstrap/claude-code/hooks/autofactory-gate.mjs — same
+ * stdin JSON, same `permissionDecision` output contract. Wired in
+ * .codex/hooks.json against the shell tool, this intercepts `git push` and
+ * `gh pr create` and checks the run record the `autofactory` CLI writes at
+ * `<git-dir>/autofactory-last-run.json` (dry runs don't write one). Decisions:
  *
  *   - AUTOFACTORY_REQUIRE_LABEL=true and the PR / create command is not
  *     labeled `autofactory` → allow (label-gated mode: bugfixes, chores,
- *     docs, etc. skip AutoFactory). Default is EVERY push — set the env var
- *     (e.g. in .claude/settings.json "env") to match a label-gated GitHub
- *     Action (AUTOFACTORY_REQUIRE_LABEL repo variable).
+ *     docs, etc. skip AutoFactory).
  *   - no record, or record from another branch → DENY, with the fix
- *     ("run /autofactory") fed back to Claude.
+ *     ("run $autofactory") fed back to the agent.
  *   - record says the review REJECTED the change (or a deterministic check
- *     failed) → ASK the human — a red verdict is a review opinion, not a
- *     pipeline failure, so the human may knowingly push anyway.
+ *     failed) → DENY unless the command carries AUTOFACTORY_ACK_RED=1.
+ *     Claude Code's gate ASKS the human here; Codex parses but does not yet
+ *     support permissionDecision "ask", so the human's override is explicit:
+ *     they confirm, and the push re-runs prefixed with AUTOFACTORY_ACK_RED=1.
  *   - otherwise → allow.
  *
  * Deliberately branch-granular, not content-granular: committing the agents'
  * edits (or small follow-ups) after a run must not re-trip the gate. "Re-run
- * after significant new changes" stays advisory, in CLAUDE.md.
+ * after significant new changes" stays advisory, in AGENTS.md.
  *
  * Standalone by design — no imports from the tooling repo, so it can be
  * committed to any app repo as-is. Fails OPEN on its own errors: a broken
@@ -95,11 +96,11 @@ try {
   }
 
   // Only outward-bound PR actions are gated: `git`/`gh` must sit at a command
-  // position (start, or after && ; | etc., optionally behind env assignments —
-  // `FOO=1 git push` must not slip past the gate), and `push` must be git's
-  // SUBCOMMAND (allowing global options like -C <dir> / --no-pager before
-  // it) — so `git stash push`, `echo git push`, and commit messages that
-  // mention pushing all pass through.
+  // position (start, or after && ; | etc., optionally behind env assignments
+  // like AUTOFACTORY_ACK_RED=1), and `push` must be git's SUBCOMMAND (allowing
+  // global options like -C <dir> / --no-pager before it) — so
+  // `git stash push`, `echo git push`, and commit messages that mention
+  // pushing all pass through.
   const cmdPos = String.raw`(?:^|[;&|(]\s*|\n\s*)(?:\w+=\S*\s+)*`;
   const isGitPush = new RegExp(`${cmdPos}git\\s+(?:-[cC]\\s+\\S+\\s+|--?\\S+\\s+)*push\\b`).test(command);
   const isPrCreate = new RegExp(`${cmdPos}gh\\s+pr\\s+create\\b`).test(command);
@@ -155,7 +156,7 @@ try {
   if (!existsSync(recordPath)) {
     decide(
       "deny",
-      `AutoFactory has not run on branch '${branch}'. Run /autofactory on the change set first (a dry run does not count), then push.`,
+      `AutoFactory has not run on branch '${branch}'. Run the autofactory skill on the change set first (a dry run does not count), then push.`,
     );
   }
   let record;
@@ -167,13 +168,22 @@ try {
   if (!record || record.branch !== branch) {
     decide(
       "deny",
-      `AutoFactory last ran on branch '${record?.branch ?? "(unknown)"}', not '${branch}'. Run /autofactory on this branch first, then push.`,
+      `AutoFactory last ran on branch '${record?.branch ?? "(unknown)"}', not '${branch}'. Run the autofactory skill on this branch first, then push.`,
     );
   }
   if (record.outcome === "rejected" || record.outcome === "verification-failed" || record.outcome === "incomplete") {
+    // Human override for a red verdict: an explicit env marker on the command
+    // itself (Codex has no "ask" decision — see header).
+    const acked =
+      process.env.AUTOFACTORY_ACK_RED === "1" || /(^|[;&|(]\s*|\s)AUTOFACTORY_ACK_RED=1(\s|$)/.test(command);
+    if (acked) {
+      decide("allow", `pushing '${branch}' despite '${record.outcome}' — human override (AUTOFACTORY_ACK_RED=1)`);
+    }
     decide(
-      "ask",
-      `AutoFactory's last run on '${branch}' ended '${record.outcome}' (${record.at}). A red verdict is a review opinion — push anyway, or fix and re-run /autofactory?`,
+      "deny",
+      `AutoFactory's last run on '${branch}' ended '${record.outcome}' (${record.at}). A red verdict is a review ` +
+        `opinion, not a pipeline failure — ask the human. If they choose to push anyway, re-run this exact ` +
+        `command prefixed with AUTOFACTORY_ACK_RED=1 (never add it without their explicit say-so).`,
     );
   }
   decide("allow", `AutoFactory ran on '${branch}': ${record.outcome}${record.flagKey ? ` (flag ${record.flagKey})` : ""}`);

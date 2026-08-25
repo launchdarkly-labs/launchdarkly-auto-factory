@@ -1,0 +1,17 @@
+{
+  "//": "Merge into your app repo's .codex/hooks.json (committed — every trusted Codex session in the repo gets the gate; users approve it once via /hooks). The hook script lives at .codex/hooks/autofactory-gate.mjs; the git rev-parse indirection makes the path work when a session starts in a subdirectory.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.codex/hooks/autofactory-gate.mjs\"",
+            "statusMessage": "AutoFactory push gate"
+          }
+        ]
+      }
+    ]
+  }
+}

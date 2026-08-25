@@ -77,7 +77,8 @@ The chain takes several minutes across 5–6 agents; Claude Code narrates progre
 as each agent finishes. For a read-only preview first, ask for a dry run ("run
 AutoFactory as a dry run") — no flags created, no files edited.
 
-When it finishes you'll have, for a flag-worthy change: a flag (targeting off)
+When it finishes you'll have, for a flag-worthy change: a flag (targeting off,
+maintained by **you** — your git email resolved to your LaunchDarkly member)
 and three guarded-release metrics in your app project, the behavior wired behind
 the flag, metric instrumentation, flag-on/flag-off tests, and a release manifest
 under `.release-flags/` — all uncommitted in your working tree. Review and
@@ -115,6 +116,7 @@ all of these (and prints the fix next to each failing check).
 | `Agent graph 'gha-auto-factory' is disabled or unavailable` | `LD_SDK_KEY` is usually the wrong project's key — it must be the **factory** project's server SDK key, not the app project's (`npm run doctor` verifies this exactly; `npm run init` fetches the right one). Also confirm provisioning completed. |
 | `nothing to process` (exit 2) | The branch has no commits ahead of the base and no working-tree changes. Make a change first, or pass a different base (`--base <ref>`). |
 | `⚠ knowledge graph: ld-find-code-refs binary not found on PATH` | Harmless — flag→code wrap-point edges are skipped, the run continues. Only appears when the `auto-factory-knowledge-graph` flag is on. To silence: `brew install launchdarkly/tap/ld-find-code-refs`, or grab a binary from [ld-find-code-refs releases](https://github.com/launchdarkly/ld-find-code-refs/releases). |
+| `⚠ flag maintainer: no LaunchDarkly member matches '<email>'` | Your git email isn't an LD member email. Set `AUTOFACTORY_MAINTAINER_EMAIL` in the tooling repo's `.env` to your LD member email; otherwise flags default to the API token's owner. |
 | `⚠ LaunchDarkly configs were provisioned from a different repo version` | Your LD configs pre-date this checkout. Run `npm run bridge -- upgrade` from the tooling repo (add `--dry-run` to preview). |
 | Chain pauses and exits with code 3 | Not an error — an approval gate held. Claude Code asks you whether to approve; on yes it re-runs past the gate. |
 

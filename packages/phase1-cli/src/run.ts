@@ -51,11 +51,13 @@ import {
   isGitRepo,
   loadDotEnv,
   loadRelatedRepos,
+  localMaintainerEmail,
   normalizeReleaseIntent,
   pipelineContext,
   readRepoState,
   resolveAiProvider,
   resolveApprovalPolicy,
+  resolveMaintainerId,
   targetConnection,
   walkGraph,
   withProvider,
@@ -74,7 +76,7 @@ function metricUrl(project: string, metricKey: string): string {
 }
 
 /** A writer for real flag/metric creation in the app project, or undefined (dry run). */
-function buildWriter(dryRun: boolean): LdResourceWriter | undefined {
+async function buildWriter(dryRun: boolean, root: string): Promise<LdResourceWriter | undefined> {
   if (dryRun) return undefined;
   if (!process.env.LD_API_KEY) {
     throw new UsageError("LD_API_KEY is not set (required to create flags/metrics; use --dry-run for read-only)");
@@ -86,7 +88,21 @@ function buildWriter(dryRun: boolean): LdResourceWriter | undefined {
       "LD_APP_PROJECT_KEY is not set — refusing to create flags in the factory project (use --dry-run for read-only)",
     );
   }
-  return new LdResourceWriter(new LdClient(appConnection()));
+  const ld = new LdClient(appConnection());
+  // Local runs attribute created flags to the developer, not the API token's
+  // owner: AUTOFACTORY_MAINTAINER_EMAIL, else the target repo's git identity.
+  // Fail-open — an unresolvable email keeps today's token-owner default.
+  const email = localMaintainerEmail(root);
+  let maintainerId: string | undefined;
+  if (email) {
+    maintainerId = await resolveMaintainerId(ld, email);
+    if (maintainerId) {
+      console.log(`Flag maintainer: ${email}.`);
+    } else {
+      console.log(`⚠ flag maintainer: no LaunchDarkly member matches '${email}' — new flags default to the API token's owner`);
+    }
+  }
+  return new LdResourceWriter(ld, maintainerId ? { maintainerId } : {});
 }
 
 
@@ -275,7 +291,7 @@ async function run(opts: CliOptions): Promise<number> {
     );
   }
 
-  const writer = buildWriter(opts.dryRun);
+  const writer = await buildWriter(opts.dryRun, root);
   console.log(`Flag/metric creation: ${writer ? `enabled → app project '${writer.projectKey}'` : "disabled (dry run)"}.`);
   console.log(`Code changes: ${opts.dryRun ? "disabled (dry run)" : "enabled (edits land in your working tree; nothing is pushed)"}.`);
 

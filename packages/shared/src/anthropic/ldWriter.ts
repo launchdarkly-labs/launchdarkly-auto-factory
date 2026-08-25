@@ -289,7 +289,11 @@ function resolveParentVariationId(parent: PrereqFlag, parentKey: string, env: st
 }
 
 export class LdResourceWriter {
-  constructor(private readonly ld: LdClient) {}
+  constructor(
+    private readonly ld: LdClient,
+    /** `maintainerId`: LD member to own created flags (local runs — see maintainer.ts). */
+    private readonly opts: { maintainerId?: string } = {},
+  ) {}
 
   get projectKey(): string {
     return this.ld.projectKey;
@@ -325,6 +329,8 @@ export class LdResourceWriter {
       ],
       // On = v1 (index 1); Off = control (index 0) — flag-off preserves existing behavior.
       defaults: { onVariation: 1, offVariation: 0 },
+      // New flags only — a 409 reuse below keeps the existing flag's maintainer.
+      ...(this.opts.maintainerId ? { maintainerId: this.opts.maintainerId } : {}),
       ...(clientSide
         ? { clientSideAvailability: { usingEnvironmentId: true, usingMobileKey: false } }
         : {}),

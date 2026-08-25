@@ -56,6 +56,7 @@ the flag control plane — leave them unset.
 | 1 | review rejected, chain incomplete/stalled, or a deterministic handoff check failed |
 | 2 | usage/configuration error, or nothing to process on this branch |
 | 3 | paused at an approval gate — re-run with `--approve <node>` |
+| 4 | paused on an agent's question (M14, ADR 0017) — answer in the manifest's `humanInput.answer`, then re-run |
 
 ## Fidelity notes
 
@@ -80,7 +81,13 @@ the flag control plane — leave them unset.
 - **Run record**: every completed non-dry run writes
   `<git-dir>/autofactory-last-run.json` in the target repo (branch, HEAD,
   outcome, flag, manifest) — inside `.git/` so it can't be committed or dirty
-  the tree. This is what the Claude Code pre-push gate
-  ([`bootstrap/claude-code/hooks/`](../../bootstrap/claude-code/hooks/))
-  checks before letting `git push` / `gh pr create` through. Approval pauses,
+  the tree. This is what the Claude Code and Codex pre-push gates
+  ([`bootstrap/claude-code/hooks/`](../../bootstrap/claude-code/hooks/),
+  [`bootstrap/codex/hooks/`](../../bootstrap/codex/hooks/))
+  check before letting `git push` / `gh pr create` through. Approval pauses,
   dry runs, and errors don't write one.
+- **Flag maintainer**: non-dry runs attribute created flags to the local
+  developer — `AUTOFACTORY_MAINTAINER_EMAIL`, else `git config user.email` in
+  the target repo, resolved to a LaunchDarkly member id. Fail-open: an email
+  matching no member logs a `⚠` and falls back to the API token's owner (the
+  LaunchDarkly default). New flags only; reused flags keep their maintainer.

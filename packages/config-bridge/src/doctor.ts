@@ -351,7 +351,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<DoctorReport> {
   } else if (!appRepo) {
     sections.push({
       title: "GitHub app repo",
-      checks: [skip("Skipped — no app repo configured (pass --app-repo owner/name or set AUTOFACTORY_APP_REPO in .env). Not needed for the Claude Code / CLI front end.")],
+      checks: [skip("Skipped — no app repo configured (pass --app-repo owner/name or set AUTOFACTORY_APP_REPO in .env). Not needed for the Claude Code / Codex / CLI front ends.")],
     });
   } else {
     sections.push({ title: `GitHub app repo (${appRepo})`, checks: githubChecks(appRepo) });
