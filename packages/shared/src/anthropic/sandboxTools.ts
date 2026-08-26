@@ -1429,13 +1429,20 @@ export class SandboxToolExecutor {
     const hasPyTests =
       has("pytest.ini") || has("pyproject.toml") || entries.some((f) => /^test_.+\.py$|_test\.py$/.test(f));
     if (has("requirements.txt") || hasPyTests) {
+      // Prefer a repo virtualenv over the PATH interpreter: a system python3
+      // (Homebrew/PEP 668) refuses `pip install`, which would poison the run
+      // with a dependency failure instead of a test verdict. Checked in the
+      // test dir first, then the sandbox root.
+      const python =
+        [resolve(cwd, ".venv/bin/python3"), resolve(this.root, ".venv/bin/python3")].find((p) => existsSync(p)) ??
+        "python3";
       const log: string[] = [];
       if (has("requirements.txt")) {
-        const i = this.sh("python3", ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
+        const i = this.sh(python, ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
         if (i.code !== 0) log.push(`[deps] pip install -r requirements.txt exited ${i.code}:\n${i.out.slice(-1200)}`);
       }
-      this.sh("python3", ["-m", "pip", "install", "-q", "pytest"], cwd);
-      const t = this.sh("python3", ["-m", "pytest", "-q"], cwd);
+      this.sh(python, ["-m", "pip", "install", "-q", "pytest"], cwd);
+      const t = this.sh(python, ["-m", "pytest", "-q"], cwd);
       const body = `${log.join("\n")}\n$ python3 -m pytest -q (in ${where})\n${t.out}`.trim();
       // pytest exit 5 = "no tests were collected": a missing suite, not a red one.
       if (t.code === 5) {
