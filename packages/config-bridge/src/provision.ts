@@ -235,18 +235,36 @@ async function attachTools(
   }
 }
 
-/** Resolve `copyFrom` references among a config's committed variations. */
-function resolveCopyFrom(cfg: AiConfigFile, result: ProvisionResult): AiVariation[] {
-  return (cfg.variations ?? []).map((v) => {
+/**
+ * Resolve `copyFrom` references among committed variations: source fields
+ * first, the variation's own declared fields on top. Exported so `upgrade`
+ * applies the same semantics when diffing live content against committed —
+ * otherwise a copyFrom variation (no literal `instructions`) never syncs.
+ */
+export function resolveCopyFromList<V extends { key: string; copyFrom?: string }>(
+  variations: V[],
+): { resolved: V[]; errors: string[] } {
+  const errors: string[] = [];
+  const resolved = variations.map((v) => {
     if (typeof v.copyFrom !== "string") return v;
-    const src = (cfg.variations ?? []).find((s) => s.key === v.copyFrom);
+    const src = variations.find((s) => s.key === v.copyFrom);
     if (!src) {
-      result.failures.push({ resource: `${cfg.key}/${v.key}`, status: 0, message: `copyFrom '${v.copyFrom}' names no committed variation` });
+      errors.push(`${v.key}: copyFrom '${v.copyFrom}' names no committed variation`);
       return v;
     }
     const { copyFrom: _copyFrom, ...own } = v;
-    return { ...src, ...own };
+    return { ...src, ...own } as V;
   });
+  return { resolved, errors };
+}
+
+/** Resolve `copyFrom` references among a config's committed variations. */
+function resolveCopyFrom(cfg: AiConfigFile, result: ProvisionResult): AiVariation[] {
+  const { resolved, errors } = resolveCopyFromList(cfg.variations ?? []);
+  for (const e of errors) {
+    result.failures.push({ resource: `${cfg.key}/${e.split(":")[0]}`, status: 0, message: e });
+  }
+  return resolved;
 }
 
 /**

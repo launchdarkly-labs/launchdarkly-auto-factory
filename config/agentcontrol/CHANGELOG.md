@@ -15,6 +15,30 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-26 (implementer W-rules + planner money-path risk floor)
+
+### ✅ `autofactory-flag-implementer`: variation-wiring mechanics (W01–W04)
+
+- **New "Wiring the variation (MANDATORY mechanics)" section** (default + openai
+  via copyFrom; live via `bridge upgrade`): W01 exact quoted string comparison
+  to the target variation (the `variation-wired-in-code` ⛔ re-derives this);
+  W02 boolean-helper trap — never evaluate a multivariate flag through
+  `is_enabled`/`useFlag`/`bool(variation(...))`; W03 extend a boolean-only
+  helper module with a variation-returning function mirroring its conventions;
+  W04 the lookup's fallback must be `"control"`. Driven by two identical live
+  ⛔ failures (claude-sonnet-4-6 on the React `useFlag` helper 2026-08-26 AM,
+  gpt-5.2 on the FastAPI `flags.is_enabled` helper 2026-08-26 PM) — the repo's
+  boolean convention beat the instructions on both providers.
+
+### ✅ `autofactory-research-planner`: money-path risk HARD FLOOR
+
+- Risk anchors extended: any change altering what a customer is charged or
+  shown as a price (pricing rules, discounts, totals math, checkout behavior)
+  is **at minimum ~0.5 and flag-worthy**, even when small and additive; score
+  blast radius, not line count. Driven by a live gpt-5.2 run scoring an
+  unconditional 10%-off-$150+ checkout discount `risk_score 0.2,
+  flag_worthy false` (a second run scored the same diff 0.55 — high variance).
+
 ## 2026-08-26 (surface-aware provider routing + OpenAI variations, ADR 0018)
 
 ### ✅ `auto-factory-ai-provider`: surface rules + `openai` variation

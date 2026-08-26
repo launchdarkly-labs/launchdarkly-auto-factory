@@ -25,7 +25,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeConfigHash, stampDescription, type LdApiError, type LdClient } from "@auto-factory/shared";
-import { provision, type ProvisionResult, type ToolFile } from "./provision.js";
+import { provision, resolveCopyFromList, type ProvisionResult, type ToolFile } from "./provision.js";
 
 interface CommittedVariation {
   key: string;
@@ -152,7 +152,11 @@ export async function upgrade(ld: LdClient, opts: UpgradeOptions): Promise<Upgra
       const live = await ld.getAiConfig<{ variations?: LiveVariation[] }>(cfg.key);
       if (live.status !== 200) continue; // creation failed in phase 1; already reported there
       const liveVars = new Map((live.data.variations ?? []).map((v) => [v.key, v]));
-      for (const v of cfg.variations ?? []) {
+      // copyFrom variations inherit their source's content — resolve before
+      // diffing, or they'd never sync (no literal `instructions` to compare).
+      const { resolved: committedVars, errors: copyErrors } = resolveCopyFromList(cfg.variations ?? []);
+      for (const e of copyErrors) result.failures.push({ resource: `ai-config ${cfg.key}`, message: e });
+      for (const v of committedVars) {
         const lv = liveVars.get(v.key);
         if (!lv) continue; // just created (or create failed) — content already committed-shaped
         const patch: Record<string, unknown> = {};
