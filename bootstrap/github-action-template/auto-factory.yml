@@ -87,6 +87,10 @@ jobs:
           # -risk-threshold / -approval-gates flags in the factory project.
           github_token: ${{ secrets.GITHUB_TOKEN }}
         env:
+          # Surface for provider/model targeting in LaunchDarkly (ADR 0018):
+          # GHA runs 50/50 anthropic/cursor by default. The action defaults
+          # this value too; set explicitly so workflow copies stay honest.
+          AUTOFACTORY_SURFACE: github-action
           # Optional: token able to read PRIVATE repos registered under relatedRepos
           # in .autofactory/services.yaml (cross-repo research). GITHUB_TOKEN covers
           # public/same-repo reads without this.

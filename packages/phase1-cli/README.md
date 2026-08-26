@@ -66,8 +66,11 @@ the flag control plane — leave them unset.
   uses. Same ground-truth property: the judge sees what changed, not what the
   agent claimed.
 - **Provider**: the CLI executes on the **sandboxed** runners only — `anthropic`
-  (default) or `bedrock` (the same tool loop on Claude via Amazon Bedrock;
-  needs `AWS_REGION` + AWS credentials instead of `ANTHROPIC_API_KEY`). `vega`
+  (default), `bedrock` (the same tool loop on Claude via Amazon Bedrock;
+  needs `AWS_REGION` + AWS credentials instead of `ANTHROPIC_API_KEY`), or
+  `openai` (the same agent contract on OpenAI Chat Completions; needs
+  `OPENAI_API_KEY` or `CODEX_API_KEY` — the Codex surface's default via the
+  provider flag's surface rules, ADR 0018). `vega`
   runs agents server-side and can't edit a local tree. `cursor` runs locally
   but a Cursor local agent carries its own native shell/git alongside our
   sandbox tools — in a live run it committed each step and pushed the branch,

@@ -82,12 +82,14 @@ past the gate with `--approve <nodeKey>`.
 
 ## Costs and caveats
 
-- Agent execution is billed to the tooling repo's `ANTHROPIC_API_KEY` (or AWS
-  on the Bedrock provider) — **not** to your ChatGPT/Codex subscription, and
-  never on OpenAI models: Codex is the chauffeur, the agents run on the
-  providers the LaunchDarkly `auto-factory-ai-provider` flag selects. The CLI
-  always runs the sandboxed runners (Anthropic/Bedrock) — the only providers
-  structurally unable to commit or push.
+- **Codex runs execute on OpenAI models by default** (ADR 0018): the
+  `auto-factory-ai-provider` flag routes the `codex` surface to the OpenAI
+  runner (`gpt-5.2` agents, `gpt-5-mini` judges), billed to
+  `OPENAI_API_KEY`/`CODEX_API_KEY` in the tooling repo's `.env` — separate
+  from your ChatGPT/Codex subscription. Retarget the flag in LaunchDarkly to
+  run the same chain on Anthropic/Bedrock instead. The CLI only ever runs the
+  sandboxed runners (Anthropic/Bedrock/OpenAI) — the providers structurally
+  unable to commit or push.
 - The run is a process Codex watches, not an agent you steer mid-run.
 - Judge evidence is the node-scoped working-tree diff (agents don't commit in
   this mode) — same ground-truth property as the Action's commit-scoped diff.

@@ -27,6 +27,8 @@ import {
   type JudgeHook,
   createAnthropicJudgeCompletion,
   createCursorJudgeCompletion,
+  createOpenAiJudgeCompletion,
+  OpenAiAgentRunner,
   createGitDiffEvidence,
   createJudgeHook,
   LdClient,
@@ -154,6 +156,12 @@ function createAgentRunner(provider: string, kg?: AssembledGraph): AgentRunner {
     });
   }
 
+  if (provider === "openai") {
+    // Same agent contract on OpenAI Chat Completions (ADR 0018). Key from
+    // OPENAI_API_KEY (or CODEX_API_KEY).
+    return new OpenAiAgentRunner(localOpts);
+  }
+
   // Anthropic (default).
   return new AnthropicAgentRunner({
     ...localOpts,
@@ -178,6 +186,9 @@ function createJudgeCompletion(provider: string): JudgeCompletion | undefined {
   }
   if (provider === "bedrock") {
     return createBedrockJudgeCompletion(process.env.AWS_REGION);
+  }
+  if (provider === "openai") {
+    return createOpenAiJudgeCompletion();
   }
   console.log(`Judges: no local judge execution on provider '${provider}' — attached judges are skipped.`);
   return undefined;
@@ -417,9 +428,23 @@ async function main(): Promise<void> {
 
   // Native LaunchDarkly: server SDK (flag eval) + AI SDK (graph + agent configs).
   const { ldClient, aiClient } = await getLdSdk();
+  // Surface for provider-flag targeting (ADR 0018): the workflow template sets
+  // AUTOFACTORY_SURFACE; default it here so older workflow copies still route.
+  process.env.AUTOFACTORY_SURFACE ||= "github-action";
   let ldContext = pipelineContext();
 
-  const provider = await resolveAiProvider(ldClient, ldContext);
+  let provider = await resolveAiProvider(ldClient, ldContext);
+  // Graceful degradation for key-less providers: the bootstrap-default GHA
+  // targeting is a 50/50 anthropic/cursor rollout (ADR 0018), and a repo that
+  // never configured the selected provider's key must fall back, not fail.
+  if (provider === "cursor" && !process.env.CURSOR_API_KEY) {
+    console.log("Provider flag selects 'cursor' but CURSOR_API_KEY is not set — falling back to Anthropic.");
+    provider = "anthropic";
+  }
+  if (provider === "openai" && !process.env.OPENAI_API_KEY && !process.env.CODEX_API_KEY) {
+    console.log("Provider flag selects 'openai' but OPENAI_API_KEY/CODEX_API_KEY is not set — falling back to Anthropic.");
+    provider = "anthropic";
+  }
   // Stamp the resolved provider on the run context so AI config targeting can
   // serve provider-compatible model variations (rules on `run.provider`).
   ldContext = withProvider(ldContext, provider);

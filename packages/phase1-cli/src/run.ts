@@ -29,6 +29,7 @@ import {
   KNOWLEDGE_GRAPH_FLAG_KEY,
   LdClient,
   LdResourceWriter,
+  OpenAiAgentRunner,
   type StallInfo,
   appConnection,
   assembleKnowledgeGraph,
@@ -40,6 +41,7 @@ import {
   createAnthropicJudgeCompletion,
   createBedrockJudgeCompletion,
   createJudgeHook,
+  createOpenAiJudgeCompletion,
   createPolicyGate,
   createWorkingTreeEvidence,
   decideApproval,
@@ -199,19 +201,24 @@ async function run(opts: CliOptions): Promise<number> {
   }
 
   const { ldClient, aiClient } = await getLdSdk();
+  // Surface for provider-flag targeting (ADR 0018): skills/workflows set
+  // AUTOFACTORY_SURFACE (claude-code | codex | github-action); a bare
+  // terminal run defaults to "cli".
+  process.env.AUTOFACTORY_SURFACE ||= "cli";
   let ldContext = pipelineContext();
+  console.log(`Surface: ${process.env.AUTOFACTORY_SURFACE}`);
 
-  // The CLI runs on the SANDBOXED runners only (Anthropic or Bedrock — the
-  // same tool loop over different transports). Vega executes agents
-  // server-side, so it can't edit this working tree. Cursor executes locally
-  // BUT its local agent carries native shell/git tools alongside our sandbox
-  // tools — in a live run (2026-07-20) it committed each step and pushed the
-  // branch itself, bypassing commit_and_push (the only place gitMode
-  // "workingTree" is enforced), and the SDK offers no tool-restriction API to
-  // prevent it. Only the sandbox-confined runners satisfy the CLI's "nothing
-  // is committed or pushed" contract.
+  // The CLI runs on the SANDBOXED runners only (Anthropic, Bedrock, or OpenAI
+  // — tool-loop runners whose only hands are our sandbox tools). Vega executes
+  // agents server-side, so it can't edit this working tree. Cursor executes
+  // locally BUT its local agent carries native shell/git tools alongside our
+  // sandbox tools — in a live run (2026-07-20) it committed each step and
+  // pushed the branch itself, bypassing commit_and_push (the only place
+  // gitMode "workingTree" is enforced), and the SDK offers no tool-restriction
+  // API to prevent it. Only the sandbox-confined runners satisfy the CLI's
+  // "nothing is committed or pushed" contract.
   let provider = await resolveAiProvider(ldClient, ldContext);
-  if (provider !== "anthropic" && provider !== "bedrock") {
+  if (provider !== "anthropic" && provider !== "bedrock" && provider !== "openai") {
     console.log(
       `Provider flag selects '${provider}', but the CLI's working-tree mode requires a sandboxed runner ` +
         `(${provider === "cursor" ? "Cursor local agents have native git and would commit/push" : "Vega runs server-side"}). Using Anthropic.`,
@@ -220,6 +227,9 @@ async function run(opts: CliOptions): Promise<number> {
   }
   if (provider === "anthropic" && !process.env.ANTHROPIC_API_KEY) {
     throw new UsageError("ANTHROPIC_API_KEY is not set (required on the Anthropic runner)");
+  }
+  if (provider === "openai" && !process.env.OPENAI_API_KEY && !process.env.CODEX_API_KEY) {
+    throw new UsageError("OPENAI_API_KEY (or CODEX_API_KEY) is not set (required on the OpenAI runner)");
   }
   // Stamp the EFFECTIVE provider (anthropic or bedrock here) on the run context
   // so AI config targeting serves only models this runner can execute (rules on
@@ -311,10 +321,12 @@ async function run(opts: CliOptions): Promise<number> {
           ...localOpts,
           ...(process.env.AWS_REGION ? { awsRegion: process.env.AWS_REGION } : {}),
         })
-      : new AnthropicAgentRunner({
-          ...localOpts,
-          ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
-        });
+      : provider === "openai"
+        ? new OpenAiAgentRunner(localOpts)
+        : new AnthropicAgentRunner({
+            ...localOpts,
+            ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
+          });
 
   // The approval policy (mode/threshold/gates flags) compiles into
   // pre-execution gates. The CLI's gate answer is non-blocking, like the
@@ -335,7 +347,9 @@ async function run(opts: CliOptions): Promise<number> {
   const judgeCompletion: JudgeCompletion | undefined =
     provider === "bedrock"
       ? createBedrockJudgeCompletion(process.env.AWS_REGION)
-      : createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
+      : provider === "openai"
+        ? createOpenAiJudgeCompletion()
+        : createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
   const baseJudgeHook = judgeCompletion
     ? createJudgeHook({
         aiClient,

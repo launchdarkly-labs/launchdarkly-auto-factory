@@ -30,8 +30,11 @@ with `--root` pointing at the user's repo — and run it **in the background**
 several minutes across 5–6 agents; your job is live narration, not a spinner.
 
 ```bash
-cd "$AUTOFACTORY_HOME" && node packages/phase1-cli/dist/cli.js run --root "<absolute path to the user's repo>"
+cd "$AUTOFACTORY_HOME" && AUTOFACTORY_SURFACE=claude-code node packages/phase1-cli/dist/cli.js run --root "<absolute path to the user's repo>"
 ```
+
+Always include `AUTOFACTORY_SURFACE=claude-code` — LaunchDarkly targets the
+execution provider and models by surface. Never set it to another value.
 
 **Progress relay loop:** check the background shell's new output (BashOutput)
 roughly every 30–60 seconds, and after each check tell the user — in one short

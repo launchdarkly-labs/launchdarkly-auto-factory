@@ -95,8 +95,36 @@ interface AiVariation {
   key: string;
   tools?: unknown;
   toolKeys?: unknown;
+  /**
+   * Copy every field from the named sibling committed variation (instructions,
+   * messages, tools, judgeConfiguration, …), then apply this variation's own
+   * declared fields on top. Keeps provider variations (e.g. `openai`) at one
+   * source of truth instead of duplicating 50KB instruction blocks per model.
+   */
+  copyFrom?: string;
   [k: string]: unknown;
 }
+
+/**
+ * Committed targeting rule, shared by flag files and AI-config files.
+ * `variation` names the served variation by VALUE (flags) or KEY (AI configs);
+ * the provisioner resolves it to an index / variation id at apply time.
+ * Applied on CREATE only — an existing resource's targeting is never touched
+ * (runtime state; same contract as the rest of provisioning).
+ */
+interface CommittedRule {
+  description?: string;
+  clauses: Array<{ contextKind?: string; attribute: string; op: string; values: unknown[]; negate?: boolean }>;
+  variation?: string;
+  /** Percentage rollout across variations (flags only), weights in 1/100,000ths. */
+  rollout?: { contextKind?: string; variations: Array<{ variation: string; weight: number }> };
+}
+interface CommittedTargeting {
+  on?: boolean;
+  fallthroughVariation?: string;
+  rules?: CommittedRule[];
+}
+
 interface AiConfigFile {
   key: string;
   name: string;
@@ -106,6 +134,8 @@ interface AiConfigFile {
   /** Required by the API for mode "judge" (e.g. "$ld:ai:judge:<config-key>"). */
   evaluationMetricKey?: string;
   variations?: AiVariation[];
+  /** Per-provider serving rules (e.g. run.provider=openai → openai variation). */
+  targeting?: CommittedTargeting;
 }
 interface AgentGraphFile {
   key: string;
@@ -121,6 +151,9 @@ interface AgentGraphFile {
 interface FlagFile {
   key: string;
   name: string;
+  variations?: Array<{ value: unknown }>;
+  /** Applied on create via JSON Patch (rules/fallthrough/on per environment). */
+  targeting?: CommittedTargeting;
   [k: string]: unknown;
 }
 
@@ -202,6 +235,62 @@ async function attachTools(
   }
 }
 
+/** Resolve `copyFrom` references among a config's committed variations. */
+function resolveCopyFrom(cfg: AiConfigFile, result: ProvisionResult): AiVariation[] {
+  return (cfg.variations ?? []).map((v) => {
+    if (typeof v.copyFrom !== "string") return v;
+    const src = (cfg.variations ?? []).find((s) => s.key === v.copyFrom);
+    if (!src) {
+      result.failures.push({ resource: `${cfg.key}/${v.key}`, status: 0, message: `copyFrom '${v.copyFrom}' names no committed variation` });
+      return v;
+    }
+    const { copyFrom: _copyFrom, ...own } = v;
+    return { ...src, ...own };
+  });
+}
+
+/**
+ * Apply committed targeting to a newly created AI config: one addRule per
+ * committed rule, in every environment. Create-path only — never runs against
+ * a pre-existing config, so live targeting edits are never clobbered.
+ */
+async function applyAiConfigTargeting(
+  ld: LdClient,
+  cfg: AiConfigFile,
+  result: ProvisionResult,
+  dryRun: boolean,
+): Promise<void> {
+  const rules = cfg.targeting?.rules ?? [];
+  if (rules.length === 0 || dryRun) return;
+  try {
+    const live = await ld.getAiConfigTargeting<{
+      variations?: Array<{ _id: string; value?: { _ldMeta?: { variationKey?: string } } }>;
+      environments?: Record<string, unknown>;
+    }>(cfg.key);
+    const idByKey = new Map(
+      (live.data.variations ?? [])
+        .filter((v) => v.value?._ldMeta?.variationKey)
+        .map((v) => [v.value?._ldMeta?.variationKey as string, v._id]),
+    );
+    const instructions = rules.map((r) => {
+      const variationId = r.variation ? idByKey.get(r.variation) : undefined;
+      if (!variationId) throw new Error(`rule serves unknown variation '${r.variation}'`);
+      return {
+        kind: "addRule",
+        variationId,
+        clauses: r.clauses.map((c) => ({ contextKind: c.contextKind ?? "user", attribute: c.attribute, op: c.op, values: c.values, negate: c.negate ?? false })),
+        ...(r.description ? { description: r.description } : {}),
+      };
+    });
+    for (const env of Object.keys(live.data.environments ?? {})) {
+      await ld.patchAiConfigTargeting(cfg.key, { environmentKey: env, instructions, comment: "provisioned targeting (bootstrap default)" });
+    }
+  } catch (e) {
+    const err = e as LdApiError;
+    result.failures.push({ resource: `${cfg.key} targeting`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
+  }
+}
+
 async function provisionAiConfig(
   ld: LdClient,
   cfg: AiConfigFile,
@@ -209,7 +298,7 @@ async function provisionAiConfig(
   dryRun: boolean,
   toolVersions?: Map<string, number>,
 ): Promise<void> {
-  const variations = cfg.variations ?? [];
+  const variations = resolveCopyFrom(cfg, result);
   const existing = await ld.getAiConfig<{ variations?: { key: string }[] }>(cfg.key);
 
   let existingVarKeys = new Set<string>();
@@ -264,6 +353,12 @@ async function provisionAiConfig(
       result.failures.push({ resource: `${cfg.key}/${v.key}`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
     }
   }
+
+  // Committed targeting rules land only on configs THIS provision created —
+  // an existing config's targeting is runtime state and never touched here.
+  if (existing.status !== 200) {
+    await applyAiConfigTargeting(ld, cfg, result, dryRun);
+  }
 }
 
 async function provisionGraph(
@@ -301,6 +396,52 @@ async function provisionGraph(
   }
 }
 
+/**
+ * Apply committed targeting to a newly created flag via JSON Patch: replace
+ * rules, fallthrough, and the on state in every environment. Variations are
+ * referenced by VALUE in the committed file and resolved to indexes here.
+ * Create-path only (see provisionFlag).
+ */
+async function applyFlagTargeting(ld: LdClient, flag: FlagFile, result: ProvisionResult): Promise<void> {
+  const t = flag.targeting;
+  if (!t) return;
+  try {
+    const idx = new Map((flag.variations ?? []).map((v, i) => [String(v.value), i]));
+    const byValue = (value: string | undefined, what: string): number => {
+      const i = value !== undefined ? idx.get(value) : undefined;
+      if (i === undefined) throw new Error(`${what} names unknown variation '${value}'`);
+      return i;
+    };
+    const rules = (t.rules ?? []).map((r) => ({
+      ...(r.description ? { description: r.description } : {}),
+      clauses: r.clauses.map((c) => ({ contextKind: c.contextKind ?? "user", attribute: c.attribute, op: c.op, values: c.values, negate: c.negate ?? false })),
+      ...(r.rollout
+        ? {
+            rollout: {
+              contextKind: r.rollout.contextKind ?? "user",
+              variations: r.rollout.variations.map((rv) => ({ variation: byValue(rv.variation, "rollout arm"), weight: rv.weight })),
+            },
+          }
+        : { variation: byValue(r.variation, "rule serve") }),
+      trackEvents: false,
+    }));
+    const live = await ld.getFlag<{ environments?: Record<string, unknown> }>(flag.key);
+    for (const env of Object.keys(live.data.environments ?? {})) {
+      const ops: unknown[] = [{ op: "replace", path: `/environments/${env}/rules`, value: rules }];
+      if (t.fallthroughVariation !== undefined) {
+        ops.push({ op: "replace", path: `/environments/${env}/fallthrough`, value: { variation: byValue(t.fallthroughVariation, "fallthrough") } });
+      }
+      if (t.on !== undefined) {
+        ops.push({ op: "replace", path: `/environments/${env}/on`, value: t.on });
+      }
+      await ld.patchFlagJson(flag.key, ops, "provisioned targeting (bootstrap default)");
+    }
+  } catch (e) {
+    const err = e as LdApiError;
+    result.failures.push({ resource: `flag ${flag.key} targeting`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
+  }
+}
+
 /** Create an operational flag if absent (idempotent; existing flag left untouched). */
 async function provisionFlag(ld: LdClient, flag: FlagFile, result: ProvisionResult, dryRun: boolean): Promise<void> {
   // 404-tolerant existence check, so an already-configured flag (and its
@@ -311,7 +452,13 @@ async function provisionFlag(ld: LdClient, flag: FlagFile, result: ProvisionResu
     return;
   }
   try {
-    if (!dryRun) await ld.createFlag(flag);
+    // `targeting` is a provisioner concept, not a create-body field — strip it
+    // and apply post-create.
+    const { targeting: _targeting, ...body } = flag;
+    if (!dryRun) {
+      await ld.createFlag(body);
+      await applyFlagTargeting(ld, flag, result);
+    }
     result.flagsCreated.push(flag.key);
   } catch (e) {
     const err = e as LdApiError;

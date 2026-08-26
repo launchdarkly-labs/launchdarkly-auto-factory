@@ -15,6 +15,30 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-26 (surface-aware provider routing + OpenAI variations, ADR 0018)
+
+### ✅ `auto-factory-ai-provider`: surface rules + `openai` variation
+
+- **New variation `openai`** (agents on OpenAI Chat Completions;
+  `OPENAI_API_KEY`/`CODEX_API_KEY`). **New committed `targeting` block**
+  (applied on create by provision; live project PATCHed the same day): flag ON,
+  rules on `run.surface` — `claude-code` → anthropic, `codex` → openai,
+  `github-action` → **50/50 anthropic/cursor rollout bucketed by run key**;
+  fallthrough anthropic. Surfaces stamp `AUTOFACTORY_SURFACE` (skills, GHA
+  workflow env, CLI default `cli`). Replaces the earlier 40/40/20 per-agent
+  model A/B with a run-level provider split. Runners fall back to anthropic
+  when the selected provider's key is absent.
+
+### ✅ All 8 AI configs: `openai` variation + provider-routing rule
+
+- Every agent config gains variation **`openai`** = `OpenAI.gpt-5.2` (judges:
+  `OpenAI.gpt-5-mini`), instructions/tools **copied from `default` via the new
+  committed `copyFrom` field** (one source of truth, no duplicated instruction
+  blocks). New committed `targeting` rule: `run.provider in ["openai"]` →
+  serve the `openai` variation (applied on create; live project PATCHed).
+  Registry note: LD's global model catalog has base gpt-5.x keys but no
+  `-codex` variants (probed live 2026-08-26).
+
 ## 2026-08-21 (observability-first metric backing + M14 human-input pause)
 
 ### ✅ `autofactory-metrics-author`: Metric Backing priority rewritten (ADR 0017)

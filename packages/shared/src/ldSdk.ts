@@ -151,13 +151,21 @@ export function withProvider(context: LDContext, provider: string): LDContext {
  */
 export function pipelineContext(extra: Record<string, unknown> = {}): LDContext {
   currentRunId = randomUUID();
+  // The SURFACE the run was launched from (claude-code | codex | github-action
+  // | extension | cli | …), from AUTOFACTORY_SURFACE — each front end sets it
+  // (the skills on their command line, the Action in its workflow env). The
+  // provider flag's rules key on `run.surface` to pick the execution backend
+  // per surface; the 50/50 GHA rollout buckets by the run key. Absent env →
+  // no attribute → surface rules don't match and the fallthrough serves.
+  const surface = process.env.AUTOFACTORY_SURFACE?.trim();
   return {
     kind: "multi",
     service: {
       key: process.env.LD_PIPELINE_CONTEXT_KEY ?? "auto-factory-phase1",
       name: "AutoFactory Phase 1",
+      ...(surface ? { surface } : {}),
       ...extra,
     },
-    run: { key: currentRunId },
+    run: { key: currentRunId, ...(surface ? { surface } : {}) },
   } as LDContext;
 }

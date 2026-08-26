@@ -190,6 +190,27 @@ export class LdClient {
     });
   }
 
+  /** Get an AI config's per-environment targeting (rules, variation ids). */
+  getAiConfigTargeting<T = unknown>(key: string): Promise<LdResponse<T>> {
+    return this.request<T>({
+      path: `/api/v2/projects/${this.conn.projectKey}/ai-configs/${key}/targeting`,
+      headers: BETA,
+    });
+  }
+
+  /** Semantic-patch an AI config's targeting in one environment (beta). */
+  patchAiConfigTargeting<T = unknown>(
+    key: string,
+    body: { environmentKey: string; instructions: unknown[]; comment?: string },
+  ): Promise<LdResponse<T>> {
+    return this.request<T>({
+      method: "PATCH",
+      path: `/api/v2/projects/${this.conn.projectKey}/ai-configs/${key}/targeting`,
+      headers: BETA,
+      body,
+    });
+  }
+
   /** Get an agent graph; returns status 404 (not throwing) when absent. */
   getAgentGraph<T = unknown>(key: string): Promise<LdResponse<T>> {
     return this.request<T>({

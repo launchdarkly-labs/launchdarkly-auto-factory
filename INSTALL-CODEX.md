@@ -10,8 +10,10 @@ is committed or pushed.
 
 Two pieces: this tooling repo (holds the CLI and your secrets) and a small
 skill you drop into your app repo. Setup is about 10 minutes. (Codex is the
-chauffeur only — the agents execute on the Anthropic API or Bedrock, resolved
-from LaunchDarkly, not on OpenAI models.)
+chauffeur; the agents themselves execute on the provider LaunchDarkly routes
+for the surface — **OpenAI models by default on Codex** (`gpt-5.2`, billed to
+`OPENAI_API_KEY`/`CODEX_API_KEY`), retargetable to Anthropic/Bedrock in the
+`auto-factory-ai-provider` flag.)
 
 ## Prerequisites
 

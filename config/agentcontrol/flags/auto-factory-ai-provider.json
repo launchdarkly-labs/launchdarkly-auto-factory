@@ -1,7 +1,7 @@
 {
   "key": "auto-factory-ai-provider",
   "name": "AutoFactory AI provider",
-  "description": "Selects the Phase 1 agent execution backend. Read natively by the runtime; defaults to 'anthropic' when this flag is absent. Provisioned off (serves 'anthropic'). Variations: 'bedrock' (same agents on Claude via Amazon Bedrock — needs AWS_REGION + AWS credentials), 'vega' (LaunchDarkly-hosted), and 'cursor' (Cursor agents via @cursor/sdk — needs CURSOR_API_KEY and the checkout+npm-ci workflow, not the plain drop-in template).",
+  "description": "Selects the Phase 1 agent execution backend. Read natively by the runtime; defaults to 'anthropic' when this flag is absent. Variations: 'bedrock' (same agents on Claude via Amazon Bedrock — needs AWS_REGION + AWS credentials), 'vega' (LaunchDarkly-hosted), 'cursor' (Cursor agents via @cursor/sdk — needs CURSOR_API_KEY and the checkout+npm-ci workflow, not the plain drop-in template), and 'openai' (agents on OpenAI Chat Completions — needs OPENAI_API_KEY or CODEX_API_KEY; the Codex surface's default). Provisioned ON with surface-aware rules (ADR 0018): claude-code → anthropic, codex → openai, github-action → 50/50 anthropic/cursor per run; fallthrough anthropic. Runners degrade to anthropic when the selected provider's key is absent.",
   "kind": "multivariate",
   "temporary": false,
   "tags": ["auto-factory"],
@@ -9,7 +9,35 @@
     { "value": "anthropic", "name": "Anthropic" },
     { "value": "vega", "name": "Vega" },
     { "value": "cursor", "name": "Cursor" },
-    { "value": "bedrock", "name": "Bedrock" }
+    { "value": "bedrock", "name": "Bedrock" },
+    { "value": "openai", "name": "OpenAI" }
   ],
-  "defaults": { "onVariation": 1, "offVariation": 0 }
+  "defaults": { "onVariation": 0, "offVariation": 0 },
+  "targeting": {
+    "on": true,
+    "fallthroughVariation": "anthropic",
+    "rules": [
+      {
+        "description": "Claude Code surface → Anthropic models",
+        "clauses": [{ "contextKind": "run", "attribute": "surface", "op": "in", "values": ["claude-code"] }],
+        "variation": "anthropic"
+      },
+      {
+        "description": "Codex surface → OpenAI models",
+        "clauses": [{ "contextKind": "run", "attribute": "surface", "op": "in", "values": ["codex"] }],
+        "variation": "openai"
+      },
+      {
+        "description": "GitHub Action → 50/50 Anthropic/Cursor, bucketed per run",
+        "clauses": [{ "contextKind": "run", "attribute": "surface", "op": "in", "values": ["github-action"] }],
+        "rollout": {
+          "contextKind": "run",
+          "variations": [
+            { "variation": "anthropic", "weight": 50000 },
+            { "variation": "cursor", "weight": 50000 }
+          ]
+        }
+      }
+    ]
+  }
 }

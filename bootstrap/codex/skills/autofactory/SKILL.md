@@ -28,8 +28,12 @@ Run from the **tooling repo** (its `.env` holds the LaunchDarkly + model keys)
 with `--root` pointing at the user's repo:
 
 ```bash
-cd "$AUTOFACTORY_HOME" && node packages/phase1-cli/dist/cli.js run --root "<absolute path to the user's repo>"
+cd "$AUTOFACTORY_HOME" && AUTOFACTORY_SURFACE=codex node packages/phase1-cli/dist/cli.js run --root "<absolute path to the user's repo>"
 ```
+
+Always include `AUTOFACTORY_SURFACE=codex` — LaunchDarkly targets the
+execution provider and models by surface (Codex runs route to OpenAI models).
+Never set it to another value.
 
 This command **needs network access** (LaunchDarkly + model APIs) and runs
 from the tooling checkout **outside your workspace** — the default sandbox
