@@ -74,6 +74,9 @@ jobs:
         env:
           LD_SDK_KEY:           ${{ secrets.LD_SDK_KEY }}
           CURSOR_API_KEY:       ${{ secrets.CURSOR_API_KEY }}
+          # The provider flag routes per surface/run (ADR 0018) — the GHA default is a
+          # 50/50 anthropic/cursor split, so the anthropic arm needs its key here too.
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
           LD_API_KEY:           ${{ secrets.LD_API_KEY }}
           LD_APP_PROJECT_KEY:   ${{ vars.LD_APP_PROJECT_KEY }}   # e.g. autofactory-demo
           GRAPH_KEY:            gha-auto-factory
