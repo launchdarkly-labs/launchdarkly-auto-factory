@@ -29,7 +29,16 @@ reinstall it mid-session.
 
 ## Running
 
-Run from the tooling directory with `--root` pointing at the repo workspace:
+**Preflight** — the sandbox checkout is shallow and has no base ref, which
+makes the CLI exit immediately with "nothing to process". Fix that first:
+
+```bash
+git -C "<absolute path to the repo checkout>" fetch --unshallow origin 2>/dev/null || true
+git -C "<absolute path to the repo checkout>" fetch origin main:refs/remotes/origin/main 2>/dev/null || true
+```
+
+Then run from the tooling directory with `--root` pointing at the repo
+workspace:
 
 ```bash
 cd "$HOME/autofactory-tooling" && AUTOFACTORY_SURFACE=copilot node packages/phase1-cli/dist/cli.js run --root "<absolute path to the repo checkout>"
@@ -45,10 +54,17 @@ write them anywhere. If the CLI exits 2 naming a missing variable, report
 which one and stop: a repo admin must add it under Settings → Secrets and
 variables → Agents.
 
-Run it as **one foreground command and wait** — the chain takes several
-minutes across 5–6 agents and streams progress. Don't kill it for being slow,
-and don't impose a short timeout. Relay the interesting events — one short
-sentence per event, not raw logs:
+**This command runs for 5–15 minutes across 5–6 agents.** Your bash tool
+backgrounds long commands and returns immediately — that is NOT completion.
+You MUST poll `read_bash` roughly every 30 seconds until the process has
+**exited** and you have read its exit code. "No new output yet" means it is
+still working — keep polling; the LaunchDarkly and model clients take a
+minute to initialize before the first `▶ step` line appears. While the CLI
+is running, do NOT review code, call report_progress, create the pull
+request, or end the session. Ending the session with the chain unfinished
+and unreported is a failed task — the whole point of this agent is that the
+chain governs the change. Relay the interesting events as they stream — one
+short sentence per event, not raw logs:
 
 - `▶ step N: <agent>` — an agent started.
 - `■ step N done: …` — it finished; surface the interesting tags (flag key,
@@ -143,3 +159,8 @@ summary block, verbatim where possible:
 - the fenced JSON verdict block as-is;
 - note that the AutoFactory artifacts are committed on this branch for the
   human to review as part of the PR.
+
+Whatever happened, the PR description MUST contain an `## AutoFactory`
+section: the verdict summary above, the pending gate/question, or — if the
+chain could not run or finish — the exact failure output. A PR with no
+AutoFactory section is never acceptable.
