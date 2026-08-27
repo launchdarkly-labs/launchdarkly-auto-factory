@@ -1,5 +1,14 @@
 # Install: AutoFactory in GitHub Copilot cloud agent
 
+> **Status (2026-08-27):** the infrastructure below is validated live, but
+> the in-session chain run is blocked by cloud-agent harness behavior (the
+> engine ends sessions on tool-free turns and the model won't poll a
+> backgrounded process — details in
+> [`bootstrap/copilot/README.md`](bootstrap/copilot/README.md)). Working
+> path today: the custom agent implements the change and opens the PR, and
+> the **GitHub Action front end runs the chain on that PR** (validated
+> live). Keep both installed.
+
 Run the full AutoFactory Phase 1 chain **inside Copilot's cloud sandbox**:
 assign an issue to Copilot with the `autofactory` custom agent (or start it
 from the Agents panel at github.com/copilot/agents), and Copilot implements

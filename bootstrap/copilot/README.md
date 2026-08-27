@@ -73,12 +73,66 @@ the manual checklist below. Standalone guide:
 - **Setup steps fail open** — if the tooling install fails, the agent says
   the chain didn't run instead of imitating it.
 
+## Known blocker: in-session chain execution (live-tested 2026-08-27)
+
+Three live sessions validated every piece of this front end's infrastructure
+— Agents secrets reached the shell, the firewall rules held, the setup steps
+built the CLI (~30s on a warm cache), the custom agent was selected, and the
+agent issued the exact right CLI invocation. **None of the three sessions
+ran the chain to completion.** The cause is a three-part interaction in the
+cloud-agent harness, all observed directly in session logs:
+
+1. **The bash tool is fire-and-forget.** Commands are spawned and return in
+   ~100ms; output is read via a separate `read_bash` tool. A multi-minute
+   chain run therefore needs the model to poll `read_bash` across dozens of
+   turns. No synchronous mode or timeout parameter is exposed.
+2. **The engine ends the session at the first tool-free message.** The
+   moment the model emits an assistant message with zero tool calls, the
+   engine logs `session.idle` → "Main session complete" — permanently. The
+   runner VM is torn down, killing any still-running chain process. Models
+   narrate by habit; here narration is fatal (attempt 2 died mid-plan,
+   before even launching the CLI).
+3. **The model is tuned to wrap up, and the engine reinforces it** (built-in
+   code-review/secret-scan/PR-summary steps pull toward completion).
+   Attempt 1 polled the running chain once at 3s then wandered off; attempt
+   3 — with a profile that states rule 2 explicitly and a three-part
+   definition of done — launched the chain, polled once, opened the PR at
+   13s *while the chain was running*, and idled out at 23s.
+
+Waiting out the chain means surviving ~20–40 consecutive disciplined polling
+turns where one tool-free message is game over — a harness-behavior problem,
+not an instruction-clarity problem, so prose iteration stopped at v3. The
+20-minute session timeout (`COPILOT_AGENT_TIMEOUT_MIN`) is a hard ceiling on
+implement+chain regardless.
+
+**Working today — the server-side backstop.** The GitHub Action front end
+runs the full chain on the PR the agent opens, deterministically: validated
+live (review APPROVED; flag, wiring, tests, and manifest committed onto the
+agent's branch). Two operational notes: Copilot-authored PRs park workflow
+runs in `action_required` (a label event does NOT bypass it — a human-actor
+push, e.g. an empty commit, or the "Approve and run workflows" click does),
+and the cursor-variant workflow must pass `ANTHROPIC_API_KEY` (fixed in the
+template 2026-08-27 — the anthropic arm of the 50/50 split failed without
+it).
+
+**Candidate fix — chain as an MCP tool (unbuilt).** MCP tool calls are
+synchronous: the harness itself blocks on the result, eliminating the
+polling loop and the idle window. A stdio MCP server wrapping the CLI,
+declared in this profile's `mcp-servers` frontmatter, would make "run the
+chain" one un-abandonable call — and the egress firewall doesn't apply to
+MCP servers, dropping the allowlist dependency too. Open questions before
+building: the engine's MCP tool timeout is undocumented (measure first — if
+it's short, the approach is dead), and MCP servers only see
+`COPILOT_MCP_*`-prefixed Agents secrets, so `LD_SDK_KEY`/`LD_API_KEY`/
+`ANTHROPIC_API_KEY` need duplicating under that prefix.
+
 ## Costs and caveats
 
 - Copilot cloud agent bills **Actions minutes + Copilot AI credits** for the
-  session itself; the chain's agents bill **Anthropic API** (the
-  `ANTHROPIC_API_KEY` Agents secret) as usual. Two meters, one run.
+  session itself (~$1 in credits per ~6-minute session observed); the
+  chain's agents bill **Anthropic API** (the `ANTHROPIC_API_KEY` Agents
+  secret) as usual. Two meters, one run.
 - Every session (including follow-ups) re-clones and rebuilds the tooling
   (~a few minutes). A `snapshot` cache in setup steps could cut this later.
-- Untested live as of 2026-08-27: needs a repo with Copilot cloud agent
-  enabled — see the checklist above and INSTALL-COPILOT.md.
+- The agent tasks REST API (`POST /agents/repos/{owner}/{repo}/tasks`,
+  public preview) accepts `custom_agent` — handy for scripted testing.
