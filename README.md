@@ -50,6 +50,7 @@ Design history: [docs/adr/](docs/adr/).
 | `packages/phase1-cursor-extension/` | Phase 1 front end #2 (Cursor/VS Code extension): working-tree edits from the editor, calls Anthropic directly |
 | `bootstrap/cursor-automation/` | Phase 1 front end #3 (native Cursor automation): a drop-in `.cursor/` rule + command + MCP config; runs in Cursor's own agent (local prototype) |
 | `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code and Codex skills that drive it live in `bootstrap/claude-code/` and `bootstrap/codex/` |
+| `bootstrap/copilot/` | Phase 1 front end #6 (GitHub Copilot cloud agent): a drop-in `.github/agents/` custom agent + `copilot-setup-steps.yml` that run the `autofactory` CLI inside Copilot's cloud sandbox |
 | `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor, optional Seer Autofix on revert) |
 | `packages/config-bridge/` | CLI that provisions/syncs the agent configs, graph, operational flags, and shared APP metrics between LD projects |
 | `config/agentcontrol/ai-configs/` | The six agent + two judge definitions (instructions live here and in LD) |
@@ -62,8 +63,8 @@ Design history: [docs/adr/](docs/adr/).
 
 ## Phase 1 front ends
 
-The same six-agent chain (one shared core in `packages/shared`) runs from four entry points;
-pick whichever fits where you work. All four create the same flag/metrics/tests and write the
+The same six-agent chain (one shared core in `packages/shared`) runs from six entry points;
+pick whichever fits where you work. All of them create the same flag/metrics/tests and write the
 same release manifest — they differ only in trigger, output, and which models run the agents.
 
 | Front end | Trigger | Output | Models | Status |
@@ -72,10 +73,12 @@ same release manifest — they differ only in trigger, output, and which models 
 | **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API or Bedrock (Cursor can't expose its models to extensions) | working |
 | **Native Cursor automation** — [`bootstrap/cursor-automation`](bootstrap/cursor-automation/) | the `/autofactory` command in Cursor | edits left in your working tree | Cursor's own models (no API key) | local prototype; cloud (auto, PR-based) is a later phase |
 | **Headless CLI / Claude Code / Codex** — [`packages/phase1-cli`](packages/phase1-cli/), skills in [`bootstrap/claude-code/`](bootstrap/claude-code/) and [`bootstrap/codex/`](bootstrap/codex/) | `autofactory run` in a terminal, `/autofactory` in Claude Code, or `$autofactory` in Codex | edits left in your working tree | Anthropic, Bedrock, or OpenAI — routed per surface (ADR 0018: Claude Code → Anthropic, Codex → OpenAI; the working-tree ceiling requires a sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
+| **GitHub Copilot cloud agent** — [`bootstrap/copilot/`](bootstrap/copilot/) | a Copilot cloud-agent session using the `autofactory` custom agent (agents panel, issue assignment, or `@copilot` on a PR) | commits to the session's PR branch | Anthropic (ADR 0018: `copilot` surface → Anthropic; the cloud sandbox needs a sandbox-confined runner) | new; untested live — needs Copilot cloud agent enabled on the repo |
 
 Setup for the GitHub Action is below; the extension, the automation, and the CLI each have their
-own README. For the Claude Code and Codex paths there are standalone install guides:
-[INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md) and [INSTALL-CODEX.md](INSTALL-CODEX.md).
+own README. For the Claude Code, Codex, and Copilot paths there are standalone install guides:
+[INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md), [INSTALL-CODEX.md](INSTALL-CODEX.md), and
+[INSTALL-COPILOT.md](INSTALL-COPILOT.md).
 Locally-driven runs (CLI / Claude Code / Codex) set the developer as the created flag's
 **maintainer** in LaunchDarkly, resolved from `git config user.email`
 (override: `AUTOFACTORY_MAINTAINER_EMAIL`).

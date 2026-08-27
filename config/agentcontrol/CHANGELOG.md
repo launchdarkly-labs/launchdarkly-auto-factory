@@ -15,6 +15,21 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-08-27 (Copilot cloud agent surface)
+
+### ✅ `auto-factory-ai-provider`: `copilot` surface rule (production + test)
+- **Change:** Added a targeting rule `run.surface in ["copilot"] → anthropic` to both
+  environments (live PATCH + the committed flag definition), ahead of the GitHub Action
+  50/50 rule. Front end #6 (Copilot cloud agent, `bootstrap/copilot/`) stamps
+  `AUTOFACTORY_SURFACE=copilot`; the chain runs inside Copilot's Actions-based sandbox
+  in working-tree mode, which requires a sandbox-confined runner — hence Anthropic, not
+  a Copilot-native provider (a Copilot SDK runner is a planned follow-up, same seam as
+  ADR 0006/0018).
+- **Why:** ADR 0018 puts surface→provider routing in flag targeting, not code — adding a
+  front end must not need a core change, and it didn't: no new provider, no new
+  variation, one rule.
+
+
 ## 2026-08-26 (implementer W-rules + planner money-path risk floor)
 
 ### ✅ `autofactory-flag-implementer`: variation-wiring mechanics (W01–W04)

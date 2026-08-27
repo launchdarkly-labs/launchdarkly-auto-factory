@@ -1,7 +1,7 @@
 {
   "key": "auto-factory-ai-provider",
   "name": "AutoFactory AI provider",
-  "description": "Selects the Phase 1 agent execution backend. Read natively by the runtime; defaults to 'anthropic' when this flag is absent. Variations: 'bedrock' (same agents on Claude via Amazon Bedrock — needs AWS_REGION + AWS credentials), 'vega' (LaunchDarkly-hosted), 'cursor' (Cursor agents via @cursor/sdk — needs CURSOR_API_KEY and the checkout+npm-ci workflow, not the plain drop-in template), and 'openai' (agents on OpenAI Chat Completions — needs OPENAI_API_KEY or CODEX_API_KEY; the Codex surface's default). Provisioned ON with surface-aware rules (ADR 0018): claude-code → anthropic, codex → openai, github-action → 50/50 anthropic/cursor per run; fallthrough anthropic. Runners degrade to anthropic when the selected provider's key is absent.",
+  "description": "Selects the Phase 1 agent execution backend. Read natively by the runtime; defaults to 'anthropic' when this flag is absent. Variations: 'bedrock' (same agents on Claude via Amazon Bedrock — needs AWS_REGION + AWS credentials), 'vega' (LaunchDarkly-hosted), 'cursor' (Cursor agents via @cursor/sdk — needs CURSOR_API_KEY and the checkout+npm-ci workflow, not the plain drop-in template), and 'openai' (agents on OpenAI Chat Completions — needs OPENAI_API_KEY or CODEX_API_KEY; the Codex surface's default). Provisioned ON with surface-aware rules (ADR 0018): claude-code → anthropic, codex → openai, copilot → anthropic (Copilot cloud agent sandbox; sandbox-confined runner required for working-tree mode), github-action → 50/50 anthropic/cursor per run; fallthrough anthropic. Runners degrade to anthropic when the selected provider's key is absent.",
   "kind": "multivariate",
   "temporary": false,
   "tags": ["auto-factory"],
@@ -26,6 +26,11 @@
         "description": "Codex surface → OpenAI models",
         "clauses": [{ "contextKind": "run", "attribute": "surface", "op": "in", "values": ["codex"] }],
         "variation": "openai"
+      },
+      {
+        "description": "Copilot cloud agent surface → Anthropic models (sandbox-confined runner for working-tree mode)",
+        "clauses": [{ "contextKind": "run", "attribute": "surface", "op": "in", "values": ["copilot"] }],
+        "variation": "anthropic"
       },
       {
         "description": "GitHub Action → 50/50 Anthropic/Cursor, bucketed per run",

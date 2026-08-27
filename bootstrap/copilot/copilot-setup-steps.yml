@@ -1,0 +1,41 @@
+# Pre-installs the AutoFactory tooling into GitHub Copilot cloud agent's
+# ephemeral environment, so the `autofactory` custom agent
+# (.github/agents/autofactory.agent.md) can drive the headless CLI.
+#
+# Contract (see GitHub docs "Customize the agent environment"):
+#   - file must live at .github/workflows/copilot-setup-steps.yml on the
+#     DEFAULT branch, and the single job must be named `copilot-setup-steps`;
+#   - it re-runs at the start of EVERY session (including @copilot follow-ups);
+#   - files installed here persist into the agent's session; $GITHUB_ENV /
+#     $GITHUB_PATH do NOT — which is why the tooling goes to a fixed path
+#     ($HOME/autofactory-tooling) that the agent profile hardcodes;
+#   - steps fail OPEN (the agent still starts) — the agent profile checks the
+#     CLI exists before claiming to run the chain;
+#   - the chain's own credentials come from Agents secrets/variables
+#     (Settings → Secrets and variables → Agents), which reach the agent's
+#     shell as environment variables. Never set APPROVAL_MODE there.
+#
+# The tooling is cloned OUTSIDE the workspace on purpose: the chain processes
+# the repo's working tree, and a nested checkout would show up as a change.
+
+name: "Copilot Setup Steps"
+
+on:
+  workflow_dispatch: # lets you validate the job from the Actions tab
+  push:
+    paths: [".github/workflows/copilot-setup-steps.yml"]
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Install AutoFactory tooling (outside the workspace)
+        run: |
+          git clone --depth 1 https://github.com/launchdarkly-labs/launchdarkly-auto-factory.git "$HOME/autofactory-tooling"
+          cd "$HOME/autofactory-tooling"
+          npm ci
+          npm run build
+          test -f packages/phase1-cli/dist/cli.js

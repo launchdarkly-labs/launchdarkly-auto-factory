@@ -25,7 +25,7 @@
  *
  *   bridge init [--yes] [--provider anthropic|bedrock|cursor]
  *               [--factory-project <key>] [--app-project <key>] [--ld-env <key>]
- *               [--front-end github-action|claude-code|codex|cursor-automation|none]
+ *               [--front-end github-action|claude-code|codex|cursor-automation|copilot|none]
  *               [--app-repo <owner/name>] [--app-repo-path <dir>]
  *               [--tool-repo <owner/name>] [--no-pr] [--base-url <url>]
  *       Guided first-time setup: create/confirm the LD projects, fetch the SDK
