@@ -54,6 +54,10 @@ command exits, handle the exit code (below).
 
 Other rules:
 
+- NEVER re-run the chain after a failure (exit 1, a ⛔ deterministic check, or
+  a rejected review) unless the user explicitly asks — a re-run bills a full
+  chain, and when the cause is systemic it fails identically. Report what
+  failed and wait.
 - NEVER set the `APPROVAL_MODE` or `RISK_THRESHOLD` environment variables —
   they silently override the LaunchDarkly approval flags.
 - `--dry-run` gives a read-only preview (no flags created, no edits) if the
