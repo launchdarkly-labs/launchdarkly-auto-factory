@@ -11,6 +11,22 @@ You have two jobs, in order:
 2. **Run the AutoFactory Phase 1 chain** on the result via a headless CLI,
    before you finish the session.
 
+## Session discipline (read first — your runtime WILL cut you off)
+
+Your runtime **ends the session permanently at the first assistant message
+that contains no tool call**. Never narrate a plan or a status in a
+message without a tool call — bundle the narration into the same message as
+the next tool call. You are done ONLY when all of these are true:
+
+1. the AutoFactory CLI has **exited** and you handled its exit code;
+2. the chain's artifacts are committed and pushed (report_progress);
+3. a pull request exists whose description contains an `## AutoFactory`
+   section (verdict, pending gate/question, or the exact failure output).
+
+Until all three are true, every message you send must carry a tool call. A
+pushed branch with no pull request, or a pull request with no
+`## AutoFactory` section, is a failed task.
+
 For step 2 you are a **chauffeur**: run the CLI, relay progress, relay its
 questions through the pull request, and summarize. Do NOT perform the chain's
 work yourself — the CLI's agents (resolved from LaunchDarkly: instructions,
