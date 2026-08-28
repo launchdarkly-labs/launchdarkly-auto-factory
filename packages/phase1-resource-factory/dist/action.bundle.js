@@ -72084,6 +72084,22 @@ var LdClient = class {
       body
     });
   }
+  /** Get an AI config's per-environment targeting (rules, variation ids). */
+  getAiConfigTargeting(key) {
+    return this.request({
+      path: `/api/v2/projects/${this.conn.projectKey}/ai-configs/${key}/targeting`,
+      headers: BETA
+    });
+  }
+  /** Semantic-patch an AI config's targeting in one environment (beta). */
+  patchAiConfigTargeting(key, body) {
+    return this.request({
+      method: "PATCH",
+      path: `/api/v2/projects/${this.conn.projectKey}/ai-configs/${key}/targeting`,
+      headers: BETA,
+      body
+    });
+  }
   /** Get an agent graph; returns status 404 (not throwing) when absent. */
   getAgentGraph(key) {
     return this.request({
@@ -72107,6 +72123,17 @@ var LdClient = class {
       path: `/api/v2/projects/${this.conn.projectKey}/agent-graphs/${key}`,
       headers: BETA,
       body
+    });
+  }
+  // --- Account members ------------------------------------------------------
+  /**
+   * Search account members (ACCOUNT-level endpoint — no project in the path).
+   * `query` matches name/email fuzzily; callers wanting an exact email must
+   * filter the returned items themselves.
+   */
+  findMembers(query, limit2 = 20) {
+    return this.request({
+      path: `/api/v2/members?filter=${encodeURIComponent(`query:${query}`)}&limit=${limit2}`
     });
   }
   // --- Flags & metrics ------------------------------------------------------
@@ -74501,14 +74528,16 @@ function withProvider(context, provider) {
 }
 function pipelineContext(extra = {}) {
   currentRunId = randomUUID2();
+  const surface = process.env.AUTOFACTORY_SURFACE?.trim();
   return {
     kind: "multi",
     service: {
       key: process.env.LD_PIPELINE_CONTEXT_KEY ?? "auto-factory-phase1",
       name: "AutoFactory Phase 1",
+      ...surface ? { surface } : {},
       ...extra
     },
-    run: { key: currentRunId }
+    run: { key: currentRunId, ...surface ? { surface } : {} }
   };
 }
 
@@ -74735,6 +74764,7 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
   let inboundHandoff;
   let stalledAt;
   let pendingApproval;
+  let pendingInput;
   let verificationFailed;
   while (node && !visited.has(node.getKey())) {
     const key = node.getKey();
@@ -74806,6 +74836,12 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
         console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
       }
     }
+    if (result.tags.needs_human_input === "true") {
+      const question = result.tags.human_question;
+      pendingInput = { node: key, ...question ? { question } : {} };
+      onEvent?.({ type: "awaiting-input", node: key, ...question ? { question } : {} });
+      break;
+    }
     let next = null;
     let nextHandoff;
     for (const edge of node.getEdges()) {
@@ -74859,7 +74895,7 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     node = next ? graphDef.getNode(next) : null;
     inboundHandoff = nextHandoff;
   }
-  if (graphTracker && !pendingApproval && runs.length > 0) {
+  if (graphTracker && !pendingApproval && !pendingInput && runs.length > 0) {
     try {
       graphTracker.trackPath(runs.map((r6) => r6.configKey));
       graphTracker.trackDuration(Date.now() - startMs);
@@ -74882,6 +74918,7 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     skipped,
     ...stalledAt ? { stalledAt } : {},
     ...pendingApproval ? { pendingApproval } : {},
+    ...pendingInput ? { pendingInput } : {},
     ...verificationFailed ? { verificationFailed } : {}
   };
 }
@@ -75269,7 +75306,7 @@ var VegaAgentRunner = class {
 // ../shared/dist/providerFlag.js
 var PROVIDER_FLAG_KEY = "auto-factory-ai-provider";
 var DEFAULT_PROVIDER = "anthropic";
-var KNOWN_PROVIDERS = /* @__PURE__ */ new Set(["anthropic", "bedrock", "vega", "cursor"]);
+var KNOWN_PROVIDERS = /* @__PURE__ */ new Set(["anthropic", "bedrock", "vega", "cursor", "openai"]);
 async function resolveAiProvider(ldClient, context, flagKey = PROVIDER_FLAG_KEY) {
   const value = await ldClient.variation(flagKey, context, DEFAULT_PROVIDER);
   return KNOWN_PROVIDERS.has(value) ? value : DEFAULT_PROVIDER;
@@ -75771,8 +75808,10 @@ function resolveParentVariationId(parent, parentKey, env2, variation) {
 }
 var LdResourceWriter = class {
   ld;
-  constructor(ld) {
+  opts;
+  constructor(ld, opts = {}) {
     this.ld = ld;
+    this.opts = opts;
   }
   get projectKey() {
     return this.ld.projectKey;
@@ -75808,6 +75847,8 @@ var LdResourceWriter = class {
       ],
       // On = v1 (index 1); Off = control (index 0) — flag-off preserves existing behavior.
       defaults: { onVariation: 1, offVariation: 0 },
+      // New flags only — a 409 reuse below keeps the existing flag's maintainer.
+      ...this.opts.maintainerId ? { maintainerId: this.opts.maintainerId } : {},
       ...clientSide ? { clientSideAvailability: { usingEnvironmentId: true, usingMobileKey: false } } : {}
     };
     const res = await this.ld.createFlag(body);
@@ -76255,7 +76296,7 @@ var USE_EXISTING_FLAG_TOOL = {
 };
 var CREATE_METRIC_TOOL = {
   name: "create_metric",
-  description: "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) \u2014 pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, \u2026)` call on the path the flag wraps, via edit_file) so the metric has data once live \u2014 EXCEPTION: event_key `sentry-errors` is fed by the LD\u2194Sentry integration (no track() emitter). Prefer reusing provisioned `sentry-errors-binary` / `sentry-errors-count` via list_metrics when Sentry is present (ADR 0014). (2) TRACE-backed \u2014 pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span \u2014 see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
+  description: 'Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) \u2014 pass event_key; FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, \u2026)` call on the path the flag wraps, via edit_file) so the metric has data once live. EXCEPTION: event_key `sentry-errors` is fed by the LD\u2194Sentry integration (no track() emitter) \u2014 prefer reusing provisioned `sentry-errors-binary`/`sentry-errors-count` via list_metrics when Sentry is present. (2) TRACE-backed \u2014 pass trace_query (a span filter, e.g. service_name=x AND span_name="GET /api/y") INSTEAD of event_key; valid ONLY when a LaunchDarkly evaluation hook (o11y plugin or OTel tracing hook) enriches spans in the matched trace AND those traces reach LaunchDarkly \u2014 see your Metric Backing rules. Latency-category trace metrics measure span duration (override with trace_value_location). Idempotent: re-creating a key is a no-op; on success the metrics_created/metric_keys tags update.',
   input_schema: {
     type: "object",
     properties: {
@@ -76451,7 +76492,7 @@ var QUERY_RELATED_REPOS_TOOL = {
 };
 var WRITE_MANIFEST_TOOL = {
   name: "write_manifest",
-  description: "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own \u2014 they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag \u2014 Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). The file is validated, written as schema 1.2, and committed to the PR branch automatically \u2014 do not also edit it with write_file/edit_file.",
+  description: "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own \u2014 they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*, humanInput.question). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag \u2014 Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). humanInput carries a question you need a human to answer (a pause per your instructions): you may set humanInput.question; humanInput.answer is HUMAN-owned and always preserved \u2014 you can never write or clear it. The file is validated, written as schema 1.2, and committed to the PR branch automatically \u2014 do not also edit it with write_file/edit_file.",
   input_schema: {
     type: "object",
     properties: {
@@ -77097,6 +77138,19 @@ ${verdicts.join("\n")}` : "")
         isError: true
       };
     }
+    const existingHuman = existing.humanInput;
+    const incHuman = inc.humanInput && typeof inc.humanInput === "object" && !Array.isArray(inc.humanInput) ? inc.humanInput : void 0;
+    let humanInput;
+    let humanNote = "";
+    if (incHuman) {
+      humanInput = {
+        ...typeof incHuman.question === "string" && incHuman.question.trim() ? { question: incHuman.question } : typeof existingHuman?.question === "string" ? { question: existingHuman.question } : {},
+        ...existingHuman?.answer !== void 0 ? { answer: existingHuman.answer } : {}
+      };
+      humanNote = existingHuman?.answer !== void 0 ? "; humanInput.question set (existing human answer PRESERVED \u2014 you cannot write it)" : "; humanInput.question set (awaiting a human answer in the manifest)";
+    } else if (existingHuman) {
+      humanInput = existingHuman;
+    }
     const existingIntent = existing.releaseIntent;
     let intent;
     let intentNote;
@@ -77113,14 +77167,15 @@ ${verdicts.join("\n")}` : "")
       intent = intentSkeleton();
       intentNote = "releaseIntent initialized (human-editable skeleton)";
     }
-    const { releasePlan: _ip, releaseOverrides: _io, releaseIntent: _ii, schemaVersion: _iv, ...incRest } = inc;
-    const { releasePlan: _ep, releaseOverrides: _eo, releaseIntent: _ei2, schemaVersion: _ev, ...existRest } = existing;
+    const { releasePlan: _ip, releaseOverrides: _io, releaseIntent: _ii, humanInput: _ih, schemaVersion: _iv, ...incRest } = inc;
+    const { releasePlan: _ep, releaseOverrides: _eo, releaseIntent: _ei2, humanInput: _eh, schemaVersion: _ev, ...existRest } = existing;
     const manifest = {
       schemaVersion: "1.2",
       ...existRest,
       ...incRest,
       releasePlan: mergedPlan,
-      releaseIntent: intent
+      releaseIntent: intent,
+      ...humanInput && Object.keys(humanInput).length > 0 ? { humanInput } : {}
     };
     const { issues } = normalizeReleaseIntent(intent);
     mkdirSync(dirname(abs), { recursive: true });
@@ -77151,7 +77206,7 @@ ${verdicts.join("\n")}` : "")
       }
     }
     return {
-      content: `${existed ? "Updated" : "Created"} ${rel} (schema 1.2); ${intentNote}; ${commitNote}.` + (issues.length ? ` Intent issues (informational): ${issues.join("; ")}` : "")
+      content: `${existed ? "Updated" : "Created"} ${rel} (schema 1.2); ${intentNote}${humanNote}; ${commitNote}.` + (issues.length ? ` Intent issues (informational): ${issues.join("; ")}` : "")
     };
   }
   writeFile(rel, content) {
@@ -77270,15 +77325,16 @@ ${s2.slice(-15e3)}` : s2;
     const where = dir || ".";
     const hasPyTests = has2("pytest.ini") || has2("pyproject.toml") || entries.some((f6) => /^test_.+\.py$|_test\.py$/.test(f6));
     if (has2("requirements.txt") || hasPyTests) {
+      const python = [resolve2(cwd, ".venv/bin/python3"), resolve2(this.root, ".venv/bin/python3")].find((p3) => existsSync2(p3)) ?? "python3";
       const log = [];
       if (has2("requirements.txt")) {
-        const i6 = this.sh("python3", ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
+        const i6 = this.sh(python, ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
         if (i6.code !== 0)
           log.push(`[deps] pip install -r requirements.txt exited ${i6.code}:
 ${i6.out.slice(-1200)}`);
       }
-      this.sh("python3", ["-m", "pip", "install", "-q", "pytest"], cwd);
-      const t = this.sh("python3", ["-m", "pytest", "-q"], cwd);
+      this.sh(python, ["-m", "pip", "install", "-q", "pytest"], cwd);
+      const t = this.sh(python, ["-m", "pytest", "-q"], cwd);
       const body = `${log.join("\n")}
 $ python3 -m pytest -q (in ${where})
 ${t.out}`.trim();
@@ -77716,6 +77772,8 @@ function runFindCodeRefs(opts) {
     };
   }
   const outDir = mkdtempSync(join6(tmpdir(), "af-coderefs-"));
+  const rawBranch = process.env.PR_BRANCH || spawnSync2("git", ["-C", opts.sandboxRoot, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", timeout: 15e3 }).stdout?.trim();
+  const branch = (rawBranch && rawBranch !== "HEAD" ? rawBranch : "pr-checkout").replace(/[^A-Za-z0-9._-]+/g, "-");
   try {
     const run = spawnSync2("ld-find-code-refs", [
       "--dir",
@@ -77724,6 +77782,8 @@ function runFindCodeRefs(opts) {
       opts.projectKey,
       "--repoName",
       opts.repoName ?? "pr-checkout",
+      "--branch",
+      branch,
       "--dryRun",
       "--outDir",
       outDir
@@ -79114,6 +79174,212 @@ var BedrockAgentRunner = class {
   }
 };
 
+// ../shared/dist/openai/openaiAgentRunner.js
+var DEFAULT_MODEL2 = "gpt-5.2";
+var DEFAULT_BASE_URL = "https://api.openai.com/v1";
+var DEFAULT_MAX_TURNS2 = 100;
+var MAX_COMPLETION_TOKENS = 32e3;
+var TRANSIENT_RETRIES2 = 3;
+var TRANSIENT_BACKOFF_MS2 = [5e3, 15e3, 45e3];
+var OpenAiApiError = class extends Error {
+  status;
+  constructor(status, body) {
+    super(`OpenAI API ${status}: ${body.slice(0, 500)}`);
+    this.status = status;
+  }
+};
+function isTransient(e6) {
+  if (e6 instanceof OpenAiApiError)
+    return e6.status === 408 || e6.status === 429 || e6.status >= 500;
+  return e6 instanceof TypeError || e6 instanceof Error && e6.name === "AbortError";
+}
+async function openaiChat(apiKey, baseUrl, body, label) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const text = await res.text();
+      if (!res.ok)
+        throw new OpenAiApiError(res.status, text);
+      return JSON.parse(text);
+    } catch (e6) {
+      if (!isTransient(e6) || attempt >= TRANSIENT_RETRIES2)
+        throw e6;
+      const delay = TRANSIENT_BACKOFF_MS2[attempt] ?? 45e3;
+      console.warn(`[node] ${label} transient OpenAI error (${e6 instanceof Error ? e6.message : e6}) \u2014 retry ${attempt + 1}/${TRANSIENT_RETRIES2} in ${delay / 1e3}s`);
+      await new Promise((r6) => setTimeout(r6, delay));
+    }
+  }
+}
+function openaiApiKey(explicit) {
+  return explicit || process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY;
+}
+var OpenAiAgentRunner = class {
+  opts;
+  apiKey;
+  baseUrl;
+  constructor(opts) {
+    this.opts = opts;
+    const key = openaiApiKey(opts.apiKey);
+    if (!key)
+      throw new Error("OpenAI provider requires OPENAI_API_KEY (or CODEX_API_KEY) to be set");
+    this.apiKey = key;
+    this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+  }
+  async runNode(req) {
+    const { grant, source } = resolveGrant(req.configKey, req.capabilities);
+    const caps = {
+      createFlag: grant.createFlag && this.opts.writer !== void 0,
+      flagState: grant.flagState === true && this.opts.writer !== void 0,
+      createMetric: grant.createMetric && this.opts.writer !== void 0,
+      editFiles: grant.editFiles && this.opts.codeChangesEnabled === true,
+      writeManifest: grant.writeManifest === true && this.opts.codeChangesEnabled === true,
+      stewardManifest: grant.stewardManifest === true && this.opts.codeChangesEnabled === true,
+      queryGraph: grant.queryGraph === true && this.opts.knowledgeGraph !== void 0,
+      querySentry: grant.querySentry === true,
+      readDocs: grant.readDocs === true,
+      queryRepos: grant.queryRepos === true && (this.opts.relatedRepos?.length ?? 0) > 0 && Boolean(this.opts.githubToken ?? process.env.GITHUB_TOKEN)
+    };
+    console.log(`[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} editFiles=${grant.editFiles} \u2192 effective createFlag=${caps.createFlag} editFiles=${caps.editFiles} (openai)`);
+    const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
+    const model = openaiModelId(req.model);
+    console.log(`[node] ${req.configKey} openai model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
+    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true);
+    if (caps.queryGraph && this.opts.knowledgeGraph) {
+      executor.provideKnowledgeGraph(this.opts.knowledgeGraph, this.opts.changedFiles ?? []);
+    }
+    if (caps.queryRepos && this.opts.relatedRepos) {
+      executor.provideRelatedRepos(new RelatedReposClient(this.opts.relatedRepos, this.opts.githubToken ?? process.env.GITHUB_TOKEN ?? ""));
+    }
+    const overlay = applyLdToolOverlay(buildSandboxTools(caps), req.ldTools);
+    if (overlay.unknown.length > 0) {
+      console.warn(`[node] ${req.configKey} LD variation attaches tool(s) with no local implementation: ${overlay.unknown.join(", ")} \u2014 ignored`);
+    }
+    const tools = overlay.tools.map((t) => ({
+      type: "function",
+      function: { name: t.name, description: t.description, parameters: t.input_schema }
+    }));
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const system = (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
+    const toolCallsUsed = /* @__PURE__ */ new Set();
+    const maxTurns = req.maxTurns ?? DEFAULT_MAX_TURNS2;
+    const messages = [
+      { role: "system", content: system },
+      { role: "user", content: req.prompt }
+    ];
+    let finalText = "";
+    let status = "completed";
+    let inputTokens = 0;
+    let outputTokens = 0;
+    const started = Date.now();
+    const span = startAiSpan(`chat ${req.configKey}`, { op: "gen_ai.chat" });
+    const executeCalls = async (calls) => {
+      const results = [];
+      for (const c6 of calls) {
+        toolCallsUsed.add(c6.function.name);
+        let input = {};
+        try {
+          input = JSON.parse(c6.function.arguments || "{}");
+        } catch {
+        }
+        const r6 = await executor.execute(c6.function.name, input);
+        results.push({
+          role: "tool",
+          tool_call_id: c6.id,
+          // Chat Completions has no is_error flag on tool results — prefix so
+          // the model can't mistake a failure payload for success.
+          content: r6.isError ? `ERROR: ${r6.content}` : r6.content
+        });
+      }
+      return results;
+    };
+    try {
+      for (let turn = 0; turn < maxTurns; turn++) {
+        const resp = await openaiChat(this.apiKey, this.baseUrl, { model, max_completion_tokens: MAX_COMPLETION_TOKENS, messages, tools }, req.configKey);
+        inputTokens += resp.usage?.prompt_tokens ?? 0;
+        outputTokens += resp.usage?.completion_tokens ?? 0;
+        const choice = resp.choices[0];
+        if (!choice)
+          break;
+        messages.push(choice.message);
+        finalText = choice.message.content?.trim() || finalText;
+        if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls?.length)
+          break;
+        messages.push(...await executeCalls(choice.message.tool_calls));
+        if (turn === maxTurns - 1)
+          status = "stopped";
+      }
+      const missing = missingRequiredTags(req.configKey, executor.tags);
+      if (missing.length > 0) {
+        try {
+          messages.push({
+            role: "user",
+            content: `Before finishing you MUST record your routing decision. You have not set the required tag(s): ${missing.join(", ")}. Call \`tag_conversation\` now with a \`tags\` object, choosing the correct value(s) per your instructions.`
+          });
+          const forced = await openaiChat(this.apiKey, this.baseUrl, {
+            model,
+            max_completion_tokens: MAX_COMPLETION_TOKENS,
+            messages,
+            tools,
+            tool_choice: { type: "function", function: { name: "tag_conversation" } }
+          }, req.configKey);
+          inputTokens += forced.usage?.prompt_tokens ?? 0;
+          outputTokens += forced.usage?.completion_tokens ?? 0;
+          const calls = forced.choices[0]?.message.tool_calls ?? [];
+          if (forced.choices[0])
+            messages.push(forced.choices[0].message);
+          await executeCalls(calls);
+          const stillMissing = missingRequiredTags(req.configKey, executor.tags);
+          console.log(`[node] ${req.configKey} forced tag_conversation for missing [${missing.join(", ")}] \u2192 now ${stillMissing.length ? `still missing [${stillMissing.join(", ")}]` : "all present"}`);
+        } catch (e6) {
+          console.warn(`[node] ${req.configKey} forced tag call failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+        }
+      }
+      req.tracker?.trackSuccess();
+    } catch (e6) {
+      status = "failed";
+      finalText = e6 instanceof Error ? e6.message : String(e6);
+      req.tracker?.trackError();
+      span.recordException(e6);
+    } finally {
+      req.tracker?.trackDuration(Date.now() - started);
+      if (toolCallsUsed.size > 0) {
+        try {
+          req.tracker?.trackToolCalls([...toolCallsUsed]);
+        } catch {
+        }
+      }
+      if (inputTokens || outputTokens) {
+        req.tracker?.trackTokens({ input: inputTokens, output: outputTokens, total: inputTokens + outputTokens });
+      }
+      span.setGenAi({
+        provider: "openai",
+        requestModel: model,
+        agentName: req.configKey,
+        ...req.tracker ? { tracker: req.tracker } : {},
+        prompt: req.prompt,
+        output: finalText,
+        ...inputTokens || outputTokens ? { usage: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens } } : {}
+      });
+      span.end(status === "completed" ? "ok" : "error");
+    }
+    return {
+      status,
+      messages: [{ role: "assistant", content: finalText, isFinal: true }],
+      tags: { ...executor.tags }
+    };
+  }
+};
+function openaiModelId(name) {
+  if (!name)
+    return DEFAULT_MODEL2;
+  const id = name.trim().replace(/^openai\./i, "");
+  return id.trim() || DEFAULT_MODEL2;
+}
+
 // ../shared/dist/cursor/cursorModel.js
 function normalizeModelName(name) {
   return name.trim().toLowerCase().replace(/^[a-z]{2}\./, "").replace(/^(anthropic|bedrock|openai|google|cursor)\./, "").replace(/[-_]v\d+(:\d+)?$/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -79640,6 +79906,59 @@ Respond with ONLY a single JSON object matching this schema (no prose, no code f
   };
 }
 
+// ../shared/dist/openai/judgeCompletion.js
+var MAX_COMPLETION_TOKENS2 = 16e3;
+function createOpenAiJudgeCompletion(apiKey, baseUrl = "https://api.openai.com/v1") {
+  const key = openaiApiKey(apiKey);
+  if (!key)
+    throw new OpenAiApiError(0, "OpenAI judge requires OPENAI_API_KEY (or CODEX_API_KEY)");
+  return async (req) => {
+    const resp = await openaiChat(key, baseUrl.replace(/\/+$/, ""), {
+      model: openaiModelId(req.model),
+      max_completion_tokens: MAX_COMPLETION_TOKENS2,
+      messages: [
+        { role: "system", content: req.system },
+        { role: "user", content: req.input }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "record_evaluation",
+            description: "Record the evaluation result for the response under review.",
+            parameters: req.schema
+          }
+        }
+      ],
+      tool_choice: { type: "function", function: { name: "record_evaluation" } }
+    }, "judge");
+    const choice = resp.choices[0];
+    const call = choice?.message.tool_calls?.[0];
+    const truncated = choice?.finish_reason === "length";
+    if (truncated) {
+      console.warn(`[judge] completion hit max_completion_tokens (${MAX_COMPLETION_TOKENS2}) \u2014 evaluation discarded as truncated`);
+    }
+    let parsed;
+    if (call && !truncated) {
+      try {
+        parsed = JSON.parse(call.function.arguments || "{}");
+      } catch {
+      }
+    }
+    const ok = parsed !== void 0;
+    return {
+      ...ok ? { parsed } : {},
+      content: truncated ? `judge output truncated at max_completion_tokens=${MAX_COMPLETION_TOKENS2}; partial: ${call?.function.arguments ?? null}` : call?.function.arguments ?? "null",
+      success: ok,
+      tokens: {
+        input: resp.usage?.prompt_tokens ?? 0,
+        output: resp.usage?.completion_tokens ?? 0,
+        total: (resp.usage?.prompt_tokens ?? 0) + (resp.usage?.completion_tokens ?? 0)
+      }
+    };
+  };
+}
+
 // src/checkRun.ts
 var CHECK_NAME = "AutoFactory \u2014 Approval gate";
 async function postCheckRun(opts) {
@@ -79873,6 +80192,9 @@ function createAgentRunner(provider, kg) {
       ...process.env.AWS_REGION ? { awsRegion: process.env.AWS_REGION } : {}
     });
   }
+  if (provider === "openai") {
+    return new OpenAiAgentRunner(localOpts);
+  }
   return new AnthropicAgentRunner({
     ...localOpts,
     ...process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}
@@ -79890,6 +80212,9 @@ function createJudgeCompletion(provider) {
   }
   if (provider === "bedrock") {
     return createBedrockJudgeCompletion(process.env.AWS_REGION);
+  }
+  if (provider === "openai") {
+    return createOpenAiJudgeCompletion();
   }
   console.log(`Judges: no local judge execution on provider '${provider}' \u2014 attached judges are skipped.`);
   return void 0;
@@ -80052,8 +80377,17 @@ async function main() {
   const context = assemblePrContext();
   await initFactorySentry({ serviceName: "auto-factory-phase1-gha" });
   const { ldClient, aiClient } = await getLdSdk();
+  process.env.AUTOFACTORY_SURFACE ||= "github-action";
   let ldContext = pipelineContext();
-  const provider = await resolveAiProvider(ldClient, ldContext);
+  let provider = await resolveAiProvider(ldClient, ldContext);
+  if (provider === "cursor" && !process.env.CURSOR_API_KEY) {
+    console.log("Provider flag selects 'cursor' but CURSOR_API_KEY is not set \u2014 falling back to Anthropic.");
+    provider = "anthropic";
+  }
+  if (provider === "openai" && !process.env.OPENAI_API_KEY && !process.env.CODEX_API_KEY) {
+    console.log("Provider flag selects 'openai' but OPENAI_API_KEY/CODEX_API_KEY is not set \u2014 falling back to Anthropic.");
+    provider = "anthropic";
+  }
   ldContext = withProvider(ldContext, provider);
   const graphKey = process.env.GRAPH_KEY ?? "gha-auto-factory";
   const graphDef = await aiClient.agentGraph(graphKey, ldContext, buildVariables(context));
@@ -80154,6 +80488,30 @@ async function main() {
       conclusion: "action_required",
       title: `Approval required before ${node}`,
       summary: `The AutoFactory chain paused before \`${node}\`. Nothing was created for this or later steps. Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
+    });
+    return;
+  }
+  if (walk2.pendingInput) {
+    const { node, question } = walk2.pendingInput;
+    const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
+    console.log(`::warning::AutoFactory: '${node}' paused with a question for a human${question ? `: ${question}` : ""}.`);
+    await postPrComment(
+      [
+        `## \u23F8 AutoFactory needs a human answer`,
+        "",
+        `\`${node}\` paused the chain on a question it could not answer from the repo. Nothing was created for this or later steps.`,
+        "",
+        ...question ? [`> ${question}`, ""] : [],
+        `**To answer:** edit \`${manifestPath}\` on this branch and set \`"humanInput": {"answer": "..."}\` (the agent's full analysis is in the run log). Pushing the edit re-runs the chain, which reads your answer and continues.`
+      ].join("\n"),
+      { prNumber: context.PR_NUMBER, repo: context.REPO }
+    );
+    await postCheckRun({
+      repo: context.REPO,
+      headSha: context.HEAD_SHA,
+      conclusion: "action_required",
+      title: `Human answer needed by ${node}`,
+      summary: `The chain paused on a question from \`${node}\`${question ? `: ${question}` : ""}. Answer in \`${manifestPath}\` \u2192 \`humanInput.answer\` and push; the chain resumes on the next run.`
     });
     return;
   }
