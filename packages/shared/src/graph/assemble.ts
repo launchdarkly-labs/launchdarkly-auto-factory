@@ -111,6 +111,13 @@ export function runFindCodeRefs(opts: {
     };
   }
   const outDir = mkdtempSync(join(tmpdir(), "af-coderefs-"));
+  // The binary embeds the branch name in its CSV filename, so a branch with a
+  // "/" (e.g. Copilot's copilot/* branches) makes the write fail with ENOENT.
+  // Pass an explicit slash-free --branch instead of letting it auto-detect.
+  const rawBranch =
+    process.env.PR_BRANCH ||
+    spawnSync("git", ["-C", opts.sandboxRoot, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", timeout: 15_000 }).stdout?.trim();
+  const branch = (rawBranch && rawBranch !== "HEAD" ? rawBranch : "pr-checkout").replace(/[^A-Za-z0-9._-]+/g, "-");
   try {
     const run = spawnSync(
       "ld-find-code-refs",
@@ -118,6 +125,7 @@ export function runFindCodeRefs(opts: {
         "--dir", opts.sandboxRoot,
         "--projKey", opts.projectKey,
         "--repoName", opts.repoName ?? "pr-checkout",
+        "--branch", branch,
         "--dryRun",
         "--outDir", outDir,
       ],
