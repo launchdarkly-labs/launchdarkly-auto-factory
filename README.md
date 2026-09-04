@@ -247,6 +247,31 @@ The check is green when the code reviewer approves and red when it rejects. A re
 review verdict, not a pipeline failure. PRs that do not need a flag (docs, dependency bumps,
 config changes) short-circuit after the first agent.
 
+### Optional: start from an issue instead of a PR (intake)
+
+The chain can also start one step earlier, at a GitHub issue (ADR 0019). The
+**issue coder** — an AgentControl agent like the rest — implements the issue on
+a branch `autofactory/issue-<n>`, pushes, and opens the PR; the regular chain
+then runs on that PR exactly as above. The two runs share the issue as their
+join key (the PR body carries an intent marker the Action reads into
+`TICKET_ID` and onto the run context), so tokens spent coding and tokens spent
+flagging roll up to the same ticket.
+
+From a clean checkout of the app repo, with the tooling repo's `.env`:
+
+```bash
+node packages/phase1-cli/dist/cli.js intake --issue 42 --root /path/to/app-repo
+```
+
+Requires a GitHub token that can push and open PRs (`GITHUB_TOKEN`,
+`AUTOFACTORY_INTAKE_TOKEN`, or a logged-in `gh`). Add `--dry-run` to have the
+coder reason about the issue without branching or editing, `--draft` for a
+draft PR, `--pr-label autofactory` for label-gated repos. To run it from
+Actions on `issues: labeled`, copy `bootstrap/github-action-template/auto-factory-intake.yml`
+(it needs a PAT: PRs opened with the workflow's own token don't trigger
+`pull_request` workflows). The canonical PR-triggered run is unchanged; the
+coder never executes on a PR.
+
 ### Behavior toggles
 
 | Input | Default | Effect |

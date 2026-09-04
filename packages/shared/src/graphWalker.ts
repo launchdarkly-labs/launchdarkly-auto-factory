@@ -159,9 +159,12 @@ function handoffStringArray(handoff: Record<string, unknown> | undefined, field:
  * full brief (the downstream agent's instructions tell it to parse this).
  */
 function buildPrompt(hasInbound: boolean, ctx: Record<string, unknown>): string {
+  // Issue-shaped context (the intake entry point, ADR 0019) has no PR yet:
+  // the header names the issue and the branch the work lands on instead.
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
-    ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER ? `Issue: #${ctx.ISSUE_NUMBER}` : ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER && ctx.PR_BRANCH ? `Working branch: ${ctx.PR_BRANCH}` : "",
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : "",
   ]
     .filter(Boolean)
@@ -191,6 +194,57 @@ function allNodeKeys(graphDef: AgentGraphDefinition): string[] {
   return [...keys];
 }
 
+/**
+ * Node keys that are INTAKE nodes: sources of an edge whose handoff declares
+ * `intake: true`. An intake node sits "left" of the chain's regular entry (e.g.
+ * the issue coder that produces the PR the rest of the chain then processes).
+ * It is the graph's root — the LaunchDarkly AI SDK requires every node to be
+ * reachable from the root — but PR-triggered runs enter the graph AFTER it.
+ */
+export function intakeNodeKeys(graphDef: AgentGraphDefinition): Set<string> {
+  const raw = graphDef.getConfig();
+  const keys = new Set<string>();
+  for (const [source, edges] of Object.entries(raw.edges ?? {})) {
+    if (edges.some((e) => e.handoff?.intake === true)) keys.add(source);
+  }
+  return keys;
+}
+
+/**
+ * The node a REGULAR (PR-shaped) run should start at: the root, unless the root
+ * is an intake node — then follow the intake edge(s) forward to the first node
+ * that isn't one. Lets the intake entry point be added to a graph without
+ * changing what every existing front end runs (ADR 0019).
+ */
+export function defaultEntryNode(graphDef: AgentGraphDefinition): AgentGraphNode {
+  const intake = intakeNodeKeys(graphDef);
+  let node = graphDef.rootNode();
+  const seen = new Set<string>();
+  while (node && intake.has(node.getKey()) && !seen.has(node.getKey())) {
+    seen.add(node.getKey());
+    const forward = node.getEdges().find((e) => e.handoff?.intake === true);
+    const next = forward ? graphDef.getNode(forward.key) : null;
+    if (!next) break;
+    node = next;
+  }
+  return node;
+}
+
+export interface WalkOptions {
+  /**
+   * Node key to start the walk at instead of the graph root. Unset → the
+   * regular entry (`defaultEntryNode`: the root, skipping past intake nodes).
+   * Set explicitly to an intake node's key to run the intake entry point.
+   */
+  startAt?: string;
+  /**
+   * Node keys after which the walk STOPS cleanly (no edge selection, no stall):
+   * the intake run executes only its entry node — the hand-off to the rest of
+   * the chain happens out-of-band (the PR it opens triggers a regular run).
+   */
+  stopAfter?: string[];
+}
+
 export async function walkGraph(
   graphDef: AgentGraphDefinition,
   runner: AgentRunner,
@@ -211,6 +265,7 @@ export async function walkGraph(
    * (WalkResult.verificationFailed) — unlike judges, these are gates.
    */
   verifier?: HandoffVerifier,
+  options?: WalkOptions,
 ): Promise<WalkResult> {
   const runs: NodeRun[] = [];
   const accumulatedTags: Record<string, string> = {};
@@ -222,8 +277,15 @@ export async function walkGraph(
   // tracker's summary after its run (the runner records tokens on the tracker).
   const totalTokens: LDTokenUsage = { total: 0, input: 0, output: 0 };
 
-  let node: AgentGraphNode | null = graphDef.rootNode();
-  // Handoff of the edge we traversed INTO the current node (root has none).
+  let node: AgentGraphNode | null;
+  if (options?.startAt) {
+    node = graphDef.getNode(options.startAt);
+    if (!node) throw new Error(`walkGraph: start node '${options.startAt}' is not in the graph`);
+  } else {
+    node = defaultEntryNode(graphDef);
+  }
+  const stopAfter = new Set(options?.stopAfter ?? []);
+  // Handoff of the edge we traversed INTO the current node (an entry node has none).
   let inboundHandoff: Record<string, unknown> | undefined;
   let stalledAt: StallInfo | undefined;
   let pendingApproval: { node: string } | undefined;
@@ -341,6 +403,9 @@ export async function walkGraph(
       break;
     }
 
+    // Intentional stop (WalkOptions.stopAfter): the caller hands off out-of-band.
+    if (stopAfter.has(key)) break;
+
     // Pick the next edge whose handoff conditions pass.
     let next: string | null = null;
     let nextHandoff: Record<string, unknown> | undefined;
@@ -425,7 +490,10 @@ export async function walkGraph(
   }
 
   const reached = new Set(runs.map((r) => r.configKey));
-  const skipped = allNodeKeys(graphDef).filter((k) => !reached.has(k));
+  // Intake nodes sit before the regular entry; a run that entered past them
+  // didn't "skip" them any more than it skipped the PR being opened.
+  const intake = intakeNodeKeys(graphDef);
+  const skipped = allNodeKeys(graphDef).filter((k) => !reached.has(k) && !intake.has(k));
 
   return {
     runs,

@@ -51,6 +51,31 @@ describe("autofactory CLI args", () => {
     assert.ok("help" in parseArgs(["run", "-h"], {}));
   });
 
+  it("intake: requires --issue, accepts its options, and reports as { intake }", () => {
+    const parsed = parseArgs(["intake", "--issue", "#12", "--repo", "o/r", "--draft", "--pr-label", "autofactory", "--no-pr", "--base", "dev"], {});
+    assert.ok("intake" in parsed);
+    assert.equal(parsed.intake.command, "intake");
+    assert.equal(parsed.intake.issue, 12);
+    assert.equal(parsed.intake.repo, "o/r");
+    assert.equal(parsed.intake.node, "autofactory-issue-coder");
+    assert.equal(parsed.intake.graphKey, "gha-auto-factory");
+    assert.equal(parsed.intake.base, "dev");
+    assert.equal(parsed.intake.draft, true);
+    assert.equal(parsed.intake.prLabel, "autofactory");
+    assert.equal(parsed.intake.noPr, true);
+    assert.equal(parsed.intake.dryRun, false);
+
+    const fromEnv = parseArgs(["intake", "--issue", "3"], { INTAKE_NODE: "my-coder", GRAPH_KEY: "g" });
+    assert.ok("intake" in fromEnv);
+    assert.equal(fromEnv.intake.node, "my-coder");
+    assert.equal(fromEnv.intake.graphKey, "g");
+
+    for (const argv of [["intake"], ["intake", "--issue"], ["intake", "--issue", "0"], ["intake", "--issue", "x"], ["intake", "--issue", "1", "--repo", "bad"], ["intake", "--issue", "1", "--yolo"]]) {
+      assert.ok("error" in parseArgs(argv, {}), `expected error for: ${argv.join(" ")}`);
+    }
+    assert.ok("help" in parseArgs(["intake", "-h"], {}));
+  });
+
   it("exit codes are distinct and pendingApproval is 3 (the skill contract)", () => {
     assert.equal(EXIT.PENDING_APPROVAL, 3);
     assert.equal(new Set(Object.values(EXIT)).size, Object.values(EXIT).length);

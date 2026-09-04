@@ -620,6 +620,14 @@ export class SandboxToolExecutor {
     private readonly allowWriteManifest = false,
     /** Steward grade: `write_manifest` may also update an existing releaseIntent. */
     private readonly stewardManifest = false,
+    /**
+     * Append `[skip ci]` to `commit_and_push` commits (default). The PR chain
+     * pushes onto an EXISTING PR, so its commits must not re-trigger the
+     * workflow. The intake entry point (ADR 0019) is the opposite: its push
+     * creates the branch whose PR must trigger the regular chain, and GitHub
+     * suppresses `pull_request` runs when the head commit says [skip ci].
+     */
+    private readonly skipCi = true,
   ) {}
 
   /** Resolve a repo-relative path and reject anything escaping the sandbox root. */
@@ -1523,7 +1531,7 @@ export class SandboxToolExecutor {
       // skips ALL workflows on the agent commit, not just AutoFactory — acceptable
       // because the agents already run tests in-chain and the human's own pushes
       // (and the post-merge deploy) still trigger CI normally.
-      const ciSafeMessage = /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}\n\n[skip ci]`;
+      const ciSafeMessage = !this.skipCi || /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}\n\n[skip ci]`;
       this.runGit(["commit", "-m", ciSafeMessage]);
       const branch = this.prBranch ?? process.env.PR_BRANCH;
       this.runGit(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);

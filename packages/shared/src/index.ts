@@ -60,3 +60,4 @@ export * from "./openai/judgeCompletion.js";
 export * from "./graph/index.js";
 // Cross-repo research for split-repo estates (query_related_repos).
 export * from "./github/relatedRepos.js";
+export * from "./github/intake.js";

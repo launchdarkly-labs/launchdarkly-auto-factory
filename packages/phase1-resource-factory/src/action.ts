@@ -45,7 +45,9 @@ import {
   decideApproval,
   extractConfigStamp,
   getLdSdk,
+  intentTicketId,
   interpretWalk,
+  parseIntentMarker,
   intentIsDefault,
   initFactorySentry,
   loadRelatedRepos,
@@ -56,6 +58,7 @@ import {
   targetConnection,
   walkGraph,
   withProvider,
+  withRunAttributes,
 } from "@auto-factory/shared";
 import { postCheckRun } from "./checkRun.js";
 import { postPrComment } from "./comment.js";
@@ -342,7 +345,9 @@ function buildVariables(ctx: PrContext): Record<string, unknown> {
     PR_BODY: ctx.PR_BODY ?? "",
     REPO: ctx.REPO ?? "",
     PR_BRANCH: process.env.PR_BRANCH ?? "",
-    TICKET_ID: process.env.TICKET_ID ?? "",
+    // The intent marker in the PR body (issue intake, ADR 0019) supplies the
+    // ticket when the workflow doesn't set one — the join key for both runs.
+    TICKET_ID: process.env.TICKET_ID ?? intentTicketId(ctx.PR_BODY) ?? "",
     LAUNCHDARKLY_PROJECT: process.env.LD_APP_PROJECT_KEY ?? "autofactory-demo",
   };
 }
@@ -432,6 +437,19 @@ async function main(): Promise<void> {
   // AUTOFACTORY_SURFACE; default it here so older workflow copies still route.
   process.env.AUTOFACTORY_SURFACE ||= "github-action";
   let ldContext = pipelineContext();
+  // Join keys on the run context (ADR 0019): the PR, the repo, and the intent
+  // (ticket) when the PR body carries an intake marker or TICKET_ID is set —
+  // so this run's agent telemetry joins the intake run's and the flag's.
+  const intentMarker = parseIntentMarker(context.PR_BODY);
+  const ticketId = process.env.TICKET_ID || intentMarker?.intent;
+  ldContext = withRunAttributes(ldContext, {
+    entry: "pr",
+    pr: context.PR_NUMBER,
+    repo: context.REPO,
+    ticket: ticketId,
+    intake_run: intentMarker?.intakeRun,
+  });
+  if (ticketId) console.log(`Intent: ${ticketId}${intentMarker?.intakeRun ? ` (opened by intake run ${intentMarker.intakeRun})` : ""}`);
 
   let provider = await resolveAiProvider(ldClient, ldContext);
   // Graceful degradation for key-less providers: the bootstrap-default GHA

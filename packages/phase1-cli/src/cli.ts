@@ -8,6 +8,7 @@
  */
 
 import { EXIT, parseArgs, usage } from "./args.js";
+import { runIntake } from "./intake.js";
 import { runCli } from "./run.js";
 
 const parsed = parseArgs(process.argv.slice(2));
@@ -18,6 +19,10 @@ if ("help" in parsed) {
   console.error(`autofactory: ${parsed.error}\n`);
   console.error(usage());
   process.exitCode = EXIT.USAGE;
+} else if ("intake" in parsed) {
+  runIntake(parsed.intake).then((code) => {
+    process.exitCode = code;
+  });
 } else {
   runCli(parsed.options).then((code) => {
     process.exitCode = code;

@@ -1,87 +1,103 @@
 {
-  "key": "gha-auto-factory",
-  "name": "GHA AutoFactory",
-  "description": "Agent graph that represents the chain of agents in the GHA version of AutoFactory",
-  "rootConfigKey": "autofactory-research-planner",
-  "edges": [
-    {
-      "key": "edge-autofactory-research-planner-autofactory-manifest-steward",
-      "sourceConfig": "autofactory-research-planner",
-      "targetConfig": "autofactory-manifest-steward",
-      "handoff": {
-        "max_turns": 100,
-        "request_type": "Fix",
-        "capabilities": [
-          "steward_manifest"
-        ],
-        "skip_if_tags": {
-          "skip_flagging": "true"
-        }
-      }
-    },
-    {
-      "key": "edge-autofactory-manifest-steward-autofactory-flag-implementer",
-      "sourceConfig": "autofactory-manifest-steward",
-      "targetConfig": "autofactory-flag-implementer",
-      "handoff": {
-        "max_turns": 100,
-        "request_type": "Fix",
-        "capabilities": [
-          "create_flag",
-          "flag_state",
-          "edit_files",
-          "write_manifest",
-          "read_docs",
-          "query_repos"
-        ]
-      }
-    },
-    {
-      "key": "edge-autofactory-flag-testing-autofactory-code-reviewer",
-      "sourceConfig": "autofactory-flag-testing",
-      "targetConfig": "autofactory-code-reviewer",
-      "handoff": {
-        "max_turns": 100,
-        "request_type": "Fix",
-        "capabilities": [
-          "read_docs"
-        ]
-      }
-    },
-    {
-      "key": "edge-autofactory-metrics-author-autofactory-flag-testing",
-      "sourceConfig": "autofactory-metrics-author",
-      "targetConfig": "autofactory-flag-testing",
-      "handoff": {
-        "max_turns": 100,
-        "request_type": "Fix",
-        "capabilities": [
-          "edit_files"
-        ],
-        "require_tags": {
-          "needs_tests": "true"
-        }
-      }
-    },
-    {
-      "key": "edge-autofactory-flag-implementer-autofactory-metrics-author",
-      "sourceConfig": "autofactory-flag-implementer",
-      "targetConfig": "autofactory-metrics-author",
-      "handoff": {
-        "max_turns": 100,
-        "request_type": "Fix",
-        "capabilities": [
-          "create_metric",
-          "edit_files",
-          "write_manifest",
-          "read_docs",
-          "query_graph",
-          "query_sentry"
-        ],
-        "require_tags": {
-          "flag_ready": "true"
-        }
-      }
+ "key": "gha-auto-factory",
+ "name": "GHA AutoFactory",
+ "description": "Agent graph that represents the chain of agents in the GHA version of AutoFactory Root = the INTAKE entry point (issue coder, ADR 0019): PR-triggered runs enter at the research planner (the intake edge is marked handoff.intake=true); `autofactory intake --issue <n>` runs the coder alone and hands off via the PR it opens.",
+ "rootConfigKey": "autofactory-issue-coder",
+ "edges": [
+  {
+   "key": "edge-autofactory-issue-coder-autofactory-research-planner",
+   "sourceConfig": "autofactory-issue-coder",
+   "targetConfig": "autofactory-research-planner",
+   "handoff": {
+    "intake": true,
+    "max_turns": 100,
+    "request_type": "Fix",
+    "capabilities": [
+     "flag_state",
+     "write_manifest",
+     "query_graph",
+     "query_repos"
+    ]
+   }
+  },
+  {
+   "key": "edge-autofactory-research-planner-autofactory-manifest-steward",
+   "sourceConfig": "autofactory-research-planner",
+   "targetConfig": "autofactory-manifest-steward",
+   "handoff": {
+    "max_turns": 100,
+    "request_type": "Fix",
+    "capabilities": [
+     "steward_manifest"
+    ],
+    "skip_if_tags": {
+     "skip_flagging": "true"
     }
-  ]
+   }
+  },
+  {
+   "key": "edge-autofactory-manifest-steward-autofactory-flag-implementer",
+   "sourceConfig": "autofactory-manifest-steward",
+   "targetConfig": "autofactory-flag-implementer",
+   "handoff": {
+    "max_turns": 100,
+    "request_type": "Fix",
+    "capabilities": [
+     "create_flag",
+     "flag_state",
+     "edit_files",
+     "write_manifest",
+     "read_docs",
+     "query_repos"
+    ]
+   }
+  },
+  {
+   "key": "edge-autofactory-flag-testing-autofactory-code-reviewer",
+   "sourceConfig": "autofactory-flag-testing",
+   "targetConfig": "autofactory-code-reviewer",
+   "handoff": {
+    "max_turns": 100,
+    "request_type": "Fix",
+    "capabilities": [
+     "read_docs"
+    ]
+   }
+  },
+  {
+   "key": "edge-autofactory-metrics-author-autofactory-flag-testing",
+   "sourceConfig": "autofactory-metrics-author",
+   "targetConfig": "autofactory-flag-testing",
+   "handoff": {
+    "max_turns": 100,
+    "request_type": "Fix",
+    "capabilities": [
+     "edit_files"
+    ],
+    "require_tags": {
+     "needs_tests": "true"
+    }
+   }
+  },
+  {
+   "key": "edge-autofactory-flag-implementer-autofactory-metrics-author",
+   "sourceConfig": "autofactory-flag-implementer",
+   "targetConfig": "autofactory-metrics-author",
+   "handoff": {
+    "max_turns": 100,
+    "request_type": "Fix",
+    "capabilities": [
+     "create_metric",
+     "edit_files",
+     "write_manifest",
+     "read_docs",
+     "query_graph",
+     "query_sentry"
+    ],
+    "require_tags": {
+     "flag_ready": "true"
+    }
+   }
+  }
+ ]
 }

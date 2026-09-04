@@ -144,6 +144,7 @@ async function detectConfigDrift(graphKey: string): Promise<string | undefined> 
  * keys (renamed agents, custom graphs) fall back to the key itself.
  */
 const NODE_TITLES: Record<string, string> = {
+  "autofactory-issue-coder": "Implement issue",
   "autofactory-research-planner": "Research & plan",
   "autofactory-flag-implementer": "Flag implementation",
   "autofactory-metrics-author": "Metrics & instrumentation",
@@ -152,12 +153,12 @@ const NODE_TITLES: Record<string, string> = {
   "autofactory-code-reviewer": "Code review",
 };
 
-function nodeTitle(configKey: string): string {
+export function nodeTitle(configKey: string): string {
   const t = NODE_TITLES[configKey];
   return t ? `${t} (${configKey})` : configKey;
 }
 
-function describeStall(stall: StallInfo): string {
+export function describeStall(stall: StallInfo): string {
   const edges = stall.unmet
     .map((u) => `edge → ${u.target} requires ${Object.entries(u.requireMissing).map(([k, v]) => `${k}=${v}`).join(", ")} (never produced)`)
     .join("; ");

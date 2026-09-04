@@ -36,6 +36,24 @@ Build once (`npm install && npm run build` at the repo root), then either run
 `npx autofactory run --root <app-repo>` from this repo, or
 `node <this-repo>/packages/phase1-cli/dist/cli.js run --root <app-repo>`.
 
+## Issue intake (`autofactory intake`)
+
+The optional entry point one step left of the PR (ADR 0019):
+
+```bash
+autofactory intake --issue <n> [--repo owner/name] [--root <dir>] [--base main] [--draft] [--pr-label <name>] [--no-pr] [--dry-run]
+```
+
+Unlike `run`, intake **pushes**: it checks out `autofactory/issue-<n>` from the
+base (or resumes it), runs only the graph's intake node (the issue coder) with
+`commit_and_push` in push mode and no `[skip ci]`, verifies from git that
+commits reached `origin`, and opens the PR (coder summary + `Closes #<n>` + an
+intent marker). The regular chain runs on that PR. Needs a clean working tree
+and a GitHub token (`AUTOFACTORY_INTAKE_TOKEN`, `GITHUB_TOKEN`, or `gh auth
+token`). Exit 0 = PR opened (or reused / `--no-pr` pushed), 1 = the coder
+failed or nothing reached the remote, 2 = usage. No approval gates or judges on
+the intake run.
+
 ## Approval gates (exit code 3)
 
 The three approval flags compile into pre-execution gates exactly as in the

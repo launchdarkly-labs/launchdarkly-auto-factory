@@ -146,6 +146,10 @@ function isTransientApiError(e: unknown): boolean {
  * silently misses renamed agents; the per-node log makes that diagnosable).
  */
 const NODE_CAPABILITIES: Record<string, ToolCapabilities> = {
+  // INTAKE entry node (ADR 0019): implements a GitHub issue on a fresh branch
+  // and pushes it — code edits, tests, docs, cross-repo reads. No flag/metric
+  // powers: the PR it opens goes through the regular chain, which owns those.
+  "autofactory-issue-coder": { createFlag: false, createMetric: false, editFiles: true, readDocs: true, queryRepos: true },
   // ROOT node: edges can't grant capabilities to it (grants ride inbound
   // handoffs), so the research planner's narrow manifest-write power lives here.
   // queryGraph: the planner's blast-radius input (ADR 0010) — only offered when
@@ -283,6 +287,12 @@ export interface AnthropicAgentRunnerOptions {
    */
   gitMode?: GitMode;
   /**
+   * Append `[skip ci]` to agent commits (default true — the PR chain must not
+   * re-trigger itself). The intake entry point sets false: its push creates
+   * the branch whose PR has to trigger the regular chain (ADR 0019).
+   */
+  skipCi?: boolean;
+  /**
    * Composed knowledge graph for this run (ADR 0010). Presence is the global
    * enable for `query_dependencies`: the front end only composes a graph when
    * the `auto-factory-knowledge-graph` flag serves true, so a granted node on
@@ -375,6 +385,7 @@ export class AnthropicAgentRunner implements AgentRunner {
       this.opts.gitMode ?? "push",
       caps.writeManifest === true && this.opts.codeChangesEnabled === true,
       caps.stewardManifest === true && this.opts.codeChangesEnabled === true,
+      this.opts.skipCi ?? true,
     );
     if (caps.queryGraph && this.opts.knowledgeGraph) {
       executor.provideKnowledgeGraph(this.opts.knowledgeGraph, this.opts.changedFiles ?? []);

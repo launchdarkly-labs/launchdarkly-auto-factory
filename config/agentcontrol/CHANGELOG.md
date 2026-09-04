@@ -15,6 +15,45 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-09-04 (issue intake entry point — ADR 0019)
+
+### ✅ New AI config `autofactory-issue-coder` (step 0, intake)
+- **Change:** Added the Issue Coder agent: implements a GitHub issue on a fresh
+  branch (`autofactory/issue-<n>`) with tests, `run_tests`, `commit_and_push`,
+  then a PR-ready summary. Tools: the read-only set + `write_file`/`edit_file`/
+  `run_tests`/`commit_and_push`/`read_ld_docs`/`query_related_repos`. NO flag,
+  metric, or manifest tools — the PR it produces goes through the regular chain,
+  which owns those. Informational tags `code_changed`, `tests_run` (not routed;
+  the CLI verifies the push from git, not from tags). Default model
+  `Anthropic.claude-sonnet-4-6`; no judges yet.
+- **Why:** Extend the factory "left" of the PR so the coding step's tokens,
+  model, and configuration are recorded by AgentControl and joinable to the PR,
+  the flag, and the release outcome (cost per issue; config vs. regressions).
+
+### ✅ `gha-auto-factory`: re-rooted on the intake node
+- **Change:** `rootConfigKey` → `autofactory-issue-coder`; new first edge
+  `autofactory-issue-coder → autofactory-research-planner` with
+  `handoff.intake: true` (plus the planner's usual capability grant, for
+  documentation — the edge is never traversed in-process). All other edges
+  unchanged.
+- **Why:** The LaunchDarkly AI SDK disables a graph whose nodes aren't all
+  reachable from the root, so an optional entry point must BE the root. The
+  walker's default entry (`defaultEntryNode`) skips past intake nodes, so every
+  PR-triggered run (Action, extension, `autofactory run`) still starts at the
+  research planner with no behavior change; `autofactory intake --issue <n>`
+  starts at the coder and stops after it. The intake run's commits carry no
+  `[skip ci]` so the PR it opens triggers the regular chain.
+- **Runtime:** ships with the walker change (`startAt`/`stopAfter`, intake-aware
+  default entry) — provision the graph only AFTER deploying the code that
+  understands `handoff.intake` (the action bundle is rebuilt in the same commit).
+- **Join keys:** both runs stamp `ticket` (`issue-<n>`), `repo`, and `entry`
+  (`issue` | `pr`) on the `run` context; the PR-triggered run also stamps `pr`
+  and `intake_run`, read from the intent marker in the PR body, and defaults
+  `TICKET_ID` to the intent — so the implementer's `{{TICKET_ID}}` flag tag
+  now carries the issue id automatically.
+
+---
+
 ## 2026-08-27 (Copilot cloud agent surface)
 
 ### ✅ `auto-factory-ai-provider`: `copilot` surface rule (production + test)

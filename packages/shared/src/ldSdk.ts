@@ -135,6 +135,24 @@ export function withProvider(context: LDContext, provider: string): LDContext {
 }
 
 /**
+ * Return a copy of the pipeline context with extra attributes on the `run`
+ * kind — the join keys that let a run's agent telemetry be tied to the work it
+ * did: `ticket` (issue / intent id), `pr`, `repo`, `entry` (issue | pr). Never
+ * touches `key` (bucketing), drops empty values, and passes non-multi contexts
+ * through unchanged. Additive: projects with no rules on these attributes
+ * fall through exactly as before.
+ */
+export function withRunAttributes(context: LDContext, attrs: Record<string, unknown>): LDContext {
+  const multi = context as { kind?: string; run?: Record<string, unknown> };
+  if (multi.kind !== "multi" || !multi.run) return context;
+  const clean = Object.fromEntries(
+    Object.entries(attrs).filter(([k, v]) => k !== "key" && v !== undefined && v !== null && v !== ""),
+  );
+  if (Object.keys(clean).length === 0) return context;
+  return { ...multi, run: { ...multi.run, ...clean } } as unknown as LDContext;
+}
+
+/**
  * The LaunchDarkly targeting context for a pipeline run. A MULTI-context:
  *
  *  - `service` (static): stable across runs — flag evaluation, env scoping, and

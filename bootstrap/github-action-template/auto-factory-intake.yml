@@ -1,0 +1,70 @@
+# Drop this into your app repo at .github/workflows/auto-factory-intake.yml
+#
+# ISSUE INTAKE (ADR 0019): label an issue `autofactory` and the AutoFactory issue
+# coder implements it on a branch `autofactory/issue-<n>`, pushes, and opens a PR.
+# The regular Phase 1 workflow (auto-factory.yml) then runs on that PR exactly as
+# it does for a human-authored one. Two runs, joined by the issue number.
+#
+# REQUIRED: a PAT in the AUTOFACTORY_INTAKE_TOKEN secret with `repo` scope (fine-
+# grained: contents + pull requests write). PRs opened with the workflow's own
+# GITHUB_TOKEN do NOT trigger `pull_request` workflows, so the chain would never
+# see the PR. The same token pushes the branch.
+#
+# The coder runs on the Anthropic API by default (the auto-factory-ai-provider
+# flag may select Bedrock or OpenAI; Cursor/Vega can't edit a checkout here).
+
+name: LaunchDarkly Auto-Factory — issue intake
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read         # the PAT does the writes
+  issues: write          # optional: comments on the issue
+
+jobs:
+  intake:
+    if: github.event.label.name == 'autofactory' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the app repo
+        uses: actions/checkout@v4
+        with:
+          path: app
+          fetch-depth: 0
+          token: ${{ secrets.AUTOFACTORY_INTAKE_TOKEN }}   # so the coder's push carries the PAT
+
+      # The tool: the AutoFactory CLI. Replace <owner> with the org or user
+      # hosting the auto-factory repo.
+      - name: Check out the AutoFactory tool
+        uses: actions/checkout@v4
+        with:
+          repository: <owner>/launchdarkly-auto-factory
+          ref: main
+          path: tool
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the AutoFactory CLI
+        working-directory: tool
+        run: npm ci && npm run build
+
+      - name: Run the issue coder and open the PR
+        working-directory: app
+        run: node "$GITHUB_WORKSPACE/tool/packages/phase1-cli/dist/cli.js" intake --issue "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --base "${{ github.event.repository.default_branch }}"
+        env:
+          # --- LaunchDarkly factory project (configs / graph / provider flag) ---
+          LD_SDK_KEY:               ${{ secrets.LD_SDK_KEY }}
+          LD_PROJECT_KEY:           ${{ vars.LD_PROJECT_KEY }}
+          GRAPH_KEY:                gha-auto-factory
+          # --- app project key (interpolated into the coder's context only) ---
+          LD_APP_PROJECT_KEY:       ${{ vars.LD_APP_PROJECT_KEY }}
+          # --- execution backend ---
+          ANTHROPIC_API_KEY:        ${{ secrets.ANTHROPIC_API_KEY }}
+          # --- GitHub: PAT for the push + PR open (see header) ---
+          AUTOFACTORY_INTAKE_TOKEN: ${{ secrets.AUTOFACTORY_INTAKE_TOKEN }}
+          # Surface for provider/model targeting in LaunchDarkly (ADR 0018).
+          AUTOFACTORY_SURFACE:      github-action

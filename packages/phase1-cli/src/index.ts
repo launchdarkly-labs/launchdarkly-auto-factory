@@ -2,3 +2,4 @@
 
 export * from "./args.js";
 export { runCli, UsageError } from "./run.js";
+export { runIntake } from "./intake.js";

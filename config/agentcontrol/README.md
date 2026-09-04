@@ -11,10 +11,11 @@ without touching code.
 
 One JSON file per agent, in the shape `provision` consumes
 (`key`, `name`, `description`, `mode`, `tags`, `variations`). These are the
-canonical public copies of the six agents:
+canonical public copies of the six chain agents plus the optional intake entry point:
 
 | File | Chain position | Role |
 |------|----------------|------|
+| `autofactory-issue-coder.json` | 0 (intake, optional) | the ISSUE entry point (ADR 0019): implement a GitHub issue on a fresh branch with tests, push, and hand off via the PR `autofactory intake` opens — no flag/metric/manifest powers; PR-triggered runs never execute it |
 | `autofactory-research-planner.json` | 1 | classify the PR, research the flag landscape (existence + targeting/released-ness), decide the `flag_action`, produce the implementation brief, create the release manifest (+ intent skeleton) |
 | `autofactory-manifest-steward.json` | 2 | normalize human `releaseIntent` edits (notes → structured fields), carry holds forward on iteration PRs; pass the brief through |
 | `autofactory-flag-implementer.json` | 3 | execute the flag action (create multivariate flag / add vN variation / verify ride-existing / child flag w/ prerequisite), wire the code, correct the manifest flagKey + targetVariation |
@@ -56,7 +57,14 @@ tools but never grant powers the graph's `capabilities` don't.
 ## graphs/
 
 `auto-factory.json` defines the chain: root config, edge order, routing
-conditions, and per-agent write capabilities. Note that the **action resolves
+conditions, and per-agent write capabilities. The **root is the intake node**
+(`autofactory-issue-coder`, ADR 0019) and its edge into the research planner is
+marked `handoff.intake: true`: the LaunchDarkly AI SDK requires every node to be
+reachable from the root, so the optional entry point has to sit at the root —
+but the walker's default entry skips past intake nodes, so PR-triggered runs
+(Action, extension, `autofactory run`) still start at the planner. Only
+`autofactory intake --issue <n>` starts at the coder (and stops after it; the
+hand-off is the PR it opens). Note that the **action resolves
 the graph live from LaunchDarkly at run time**; this file is what gets
 provisioned, not what gets executed, so graph changes must be made in LD (or
 re-provisioned into a fresh project) to take effect.
@@ -106,7 +114,12 @@ the registry, the graph, and the instructions all agree.
 ## Handoff fields the walker honors
 
 Each graph edge's `handoff` object may carry: `require_tags`, `skip_if_tags`,
-`max_turns`, `request_type`, and `capabilities`.
+`max_turns`, `request_type`, `capabilities`, and `intake`.
+
+`intake: true` marks the **source** node as an intake entry point (ADR 0019):
+regular runs enter the graph at the edge's target instead of the root, and the
+walker never lists an intake node as "skipped". The edge itself is not traversed
+in-process — the intake run stops after its node and hands off via the PR.
 
 `capabilities` is a string array granting the **target** node tool access on the
 Anthropic provider:

@@ -12,14 +12,14 @@ describe("pipelineContext surface attribute (ADR 0018)", () => {
 
   it("stamps AUTOFACTORY_SURFACE on the run and service contexts", () => {
     process.env.AUTOFACTORY_SURFACE = "codex";
-    const ctx = pipelineContext() as { run: { surface?: string }; service: { surface?: string } };
+    const ctx = pipelineContext() as unknown as { run: { surface?: string }; service: { surface?: string } };
     assert.equal(ctx.run.surface, "codex");
     assert.equal(ctx.service.surface, "codex");
   });
 
   it("omits the attribute when the env var is unset", () => {
     delete process.env.AUTOFACTORY_SURFACE;
-    const ctx = pipelineContext() as { run: { surface?: string } };
+    const ctx = pipelineContext() as unknown as { run: { surface?: string } };
     assert.equal(ctx.run.surface, undefined);
   });
 });

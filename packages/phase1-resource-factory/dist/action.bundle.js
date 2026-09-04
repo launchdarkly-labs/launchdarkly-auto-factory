@@ -74526,6 +74526,15 @@ function withProvider(context, provider) {
     return context;
   return { ...multi, run: { ...multi.run, provider } };
 }
+function withRunAttributes(context, attrs) {
+  const multi = context;
+  if (multi.kind !== "multi" || !multi.run)
+    return context;
+  const clean = Object.fromEntries(Object.entries(attrs).filter(([k6, v]) => k6 !== "key" && v !== void 0 && v !== null && v !== ""));
+  if (Object.keys(clean).length === 0)
+    return context;
+  return { ...multi, run: { ...multi.run, ...clean } };
+}
 function pipelineContext(extra = {}) {
   currentRunId = randomUUID2();
   const surface = process.env.AUTOFACTORY_SURFACE?.trim();
@@ -74722,7 +74731,8 @@ function handoffStringArray(handoff, field) {
 function buildPrompt(hasInbound, ctx) {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
-    ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER ? `Issue: #${ctx.ISSUE_NUMBER}` : ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER && ctx.PR_BRANCH ? `Working branch: ${ctx.PR_BRANCH}` : "",
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
   ].filter(Boolean).join("\n");
   if (!hasInbound) {
@@ -74752,7 +74762,30 @@ function allNodeKeys(graphDef) {
   }
   return [...keys];
 }
-async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate, judgeHook, verifier) {
+function intakeNodeKeys(graphDef) {
+  const raw = graphDef.getConfig();
+  const keys = /* @__PURE__ */ new Set();
+  for (const [source, edges] of Object.entries(raw.edges ?? {})) {
+    if (edges.some((e6) => e6.handoff?.intake === true))
+      keys.add(source);
+  }
+  return keys;
+}
+function defaultEntryNode(graphDef) {
+  const intake = intakeNodeKeys(graphDef);
+  let node = graphDef.rootNode();
+  const seen = /* @__PURE__ */ new Set();
+  while (node && intake.has(node.getKey()) && !seen.has(node.getKey())) {
+    seen.add(node.getKey());
+    const forward = node.getEdges().find((e6) => e6.handoff?.intake === true);
+    const next = forward ? graphDef.getNode(forward.key) : null;
+    if (!next)
+      break;
+    node = next;
+  }
+  return node;
+}
+async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate, judgeHook, verifier, options) {
   const runs = [];
   const accumulatedTags = {};
   const ctx = { ...context };
@@ -74760,7 +74793,15 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
   const visited = /* @__PURE__ */ new Set();
   const startMs = Date.now();
   const totalTokens = { total: 0, input: 0, output: 0 };
-  let node = graphDef.rootNode();
+  let node;
+  if (options?.startAt) {
+    node = graphDef.getNode(options.startAt);
+    if (!node)
+      throw new Error(`walkGraph: start node '${options.startAt}' is not in the graph`);
+  } else {
+    node = defaultEntryNode(graphDef);
+  }
+  const stopAfter = new Set(options?.stopAfter ?? []);
   let inboundHandoff;
   let stalledAt;
   let pendingApproval;
@@ -74842,6 +74883,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
       onEvent?.({ type: "awaiting-input", node: key, ...question ? { question } : {} });
       break;
     }
+    if (stopAfter.has(key))
+      break;
     let next = null;
     let nextHandoff;
     for (const edge of node.getEdges()) {
@@ -74911,7 +74954,8 @@ async function walkGraph(graphDef, runner, context, graphTracker, onEvent, gate,
     }
   }
   const reached = new Set(runs.map((r6) => r6.configKey));
-  const skipped = allNodeKeys(graphDef).filter((k6) => !reached.has(k6));
+  const intake = intakeNodeKeys(graphDef);
+  const skipped = allNodeKeys(graphDef).filter((k6) => !reached.has(k6) && !intake.has(k6));
   return {
     runs,
     tags: accumulatedTags,
@@ -76588,6 +76632,7 @@ var SandboxToolExecutor = class {
   gitMode;
   allowWriteManifest;
   stewardManifest;
+  skipCi;
   tags = {};
   knowledgeGraph;
   changedFiles = [];
@@ -76610,7 +76655,7 @@ var SandboxToolExecutor = class {
   provideRelatedRepos(client) {
     this.relatedRepos = client;
   }
-  constructor(root6, writer, allowEdits = false, prBranch, prBaseRef, gitMode = "push", allowWriteManifest = false, stewardManifest = false) {
+  constructor(root6, writer, allowEdits = false, prBranch, prBaseRef, gitMode = "push", allowWriteManifest = false, stewardManifest = false, skipCi = true) {
     this.root = root6;
     this.writer = writer;
     this.allowEdits = allowEdits;
@@ -76619,6 +76664,7 @@ var SandboxToolExecutor = class {
     this.gitMode = gitMode;
     this.allowWriteManifest = allowWriteManifest;
     this.stewardManifest = stewardManifest;
+    this.skipCi = skipCi;
   }
   /** Resolve a repo-relative path and reject anything escaping the sandbox root. */
   safeResolve(rel) {
@@ -77404,7 +77450,7 @@ ${t.out}`), isError: t.code !== 0, ran: true };
       const staged = this.runGit(["diff", "--cached", "--name-only"]).trim();
       if (!staged)
         return { content: "commit_and_push: no changes to commit" };
-      const ciSafeMessage = /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}
+      const ciSafeMessage = !this.skipCi || /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}
 
 [skip ci]`;
       this.runGit(["commit", "-m", ciSafeMessage]);
@@ -78073,6 +78119,10 @@ function isTransientApiError(e6) {
   return false;
 }
 var NODE_CAPABILITIES = {
+  // INTAKE entry node (ADR 0019): implements a GitHub issue on a fresh branch
+  // and pushes it — code edits, tests, docs, cross-repo reads. No flag/metric
+  // powers: the PR it opens goes through the regular chain, which owns those.
+  "autofactory-issue-coder": { createFlag: false, createMetric: false, editFiles: true, readDocs: true, queryRepos: true },
   // ROOT node: edges can't grant capabilities to it (grants ride inbound
   // handoffs), so the research planner's narrow manifest-write power lives here.
   // queryGraph: the planner's blast-radius input (ADR 0010) — only offered when
@@ -78190,7 +78240,7 @@ var AnthropicAgentRunner = class {
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
     const model = this.modelId(req.model);
     console.log(`[node] ${req.configKey} ${this.providerName} model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
-    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true);
+    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true, this.opts.skipCi ?? true);
     if (caps.queryGraph && this.opts.knowledgeGraph) {
       executor.provideKnowledgeGraph(this.opts.knowledgeGraph, this.opts.changedFiles ?? []);
     }
@@ -79247,7 +79297,7 @@ var OpenAiAgentRunner = class {
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
     const model = openaiModelId(req.model);
     console.log(`[node] ${req.configKey} openai model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
-    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true);
+    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true, this.opts.skipCi ?? true);
     if (caps.queryGraph && this.opts.knowledgeGraph) {
       executor.provideKnowledgeGraph(this.opts.knowledgeGraph, this.opts.changedFiles ?? []);
     }
@@ -79959,6 +80009,31 @@ function createOpenAiJudgeCompletion(apiKey, baseUrl = "https://api.openai.com/v
   };
 }
 
+// ../shared/dist/github/intake.js
+var MARKER_OPEN = "<!-- autofactory-intent ";
+var MARKER_CLOSE = " -->";
+function parseIntentMarker(body) {
+  if (!body)
+    return void 0;
+  const start = body.indexOf(MARKER_OPEN);
+  if (start === -1)
+    return void 0;
+  const end2 = body.indexOf(MARKER_CLOSE, start + MARKER_OPEN.length);
+  if (end2 === -1)
+    return void 0;
+  try {
+    const parsed = JSON.parse(body.slice(start + MARKER_OPEN.length, end2));
+    if (!parsed || typeof parsed.intent !== "string" || !parsed.intent)
+      return void 0;
+    return parsed;
+  } catch {
+    return void 0;
+  }
+}
+function intentTicketId(body) {
+  return parseIntentMarker(body)?.intent;
+}
+
 // src/checkRun.ts
 var CHECK_NAME = "AutoFactory \u2014 Approval gate";
 async function postCheckRun(opts) {
@@ -80314,7 +80389,9 @@ function buildVariables(ctx) {
     PR_BODY: ctx.PR_BODY ?? "",
     REPO: ctx.REPO ?? "",
     PR_BRANCH: process.env.PR_BRANCH ?? "",
-    TICKET_ID: process.env.TICKET_ID ?? "",
+    // The intent marker in the PR body (issue intake, ADR 0019) supplies the
+    // ticket when the workflow doesn't set one — the join key for both runs.
+    TICKET_ID: process.env.TICKET_ID ?? intentTicketId(ctx.PR_BODY) ?? "",
     LAUNCHDARKLY_PROJECT: process.env.LD_APP_PROJECT_KEY ?? "autofactory-demo"
   };
 }
@@ -80379,6 +80456,16 @@ async function main() {
   const { ldClient, aiClient } = await getLdSdk();
   process.env.AUTOFACTORY_SURFACE ||= "github-action";
   let ldContext = pipelineContext();
+  const intentMarker = parseIntentMarker(context.PR_BODY);
+  const ticketId = process.env.TICKET_ID || intentMarker?.intent;
+  ldContext = withRunAttributes(ldContext, {
+    entry: "pr",
+    pr: context.PR_NUMBER,
+    repo: context.REPO,
+    ticket: ticketId,
+    intake_run: intentMarker?.intakeRun
+  });
+  if (ticketId) console.log(`Intent: ${ticketId}${intentMarker?.intakeRun ? ` (opened by intake run ${intentMarker.intakeRun})` : ""}`);
   let provider = await resolveAiProvider(ldClient, ldContext);
   if (provider === "cursor" && !process.env.CURSOR_API_KEY) {
     console.log("Provider flag selects 'cursor' but CURSOR_API_KEY is not set \u2014 falling back to Anthropic.");
