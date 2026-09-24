@@ -8,6 +8,7 @@
   "judge"
  ],
  "evaluationMetricKey": "$ld:ai:judge:autofactory-judge-implementation-quality",
+ "isInverted": false,
  "variations": [
   {
    "key": "default",
