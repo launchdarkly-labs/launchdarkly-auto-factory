@@ -71947,17 +71947,40 @@ var BETA = { "LD-API-Version": "beta" };
 var RATE_LIMIT_RETRIES = 6;
 var MIN_BACKOFF_MS = 500;
 var MAX_BACKOFF_MS = 15e3;
+var SERVER_ERROR_RETRIES = 2;
+var LOGGED_BODY_CHARS = 2e3;
 var sleep = (ms) => new Promise((r6) => setTimeout(r6, ms));
+function retryAfterMs(res) {
+  const raw = res.headers.get("retry-after")?.trim();
+  if (!raw)
+    return void 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds))
+    return seconds > 0 ? seconds * 1e3 : void 0;
+  const at = Date.parse(raw);
+  return Number.isNaN(at) ? void 0 : Math.max(at - Date.now(), 0);
+}
 function backoffMs(res) {
-  const retryAfter = Number(res.headers.get("retry-after"));
-  if (Number.isFinite(retryAfter) && retryAfter > 0) {
-    return Math.min(retryAfter * 1e3, MAX_BACKOFF_MS);
+  const retryAfter = retryAfterMs(res);
+  if (retryAfter !== void 0) {
+    return Math.min(retryAfter, MAX_BACKOFF_MS);
   }
   const reset = Number(res.headers.get("x-ratelimit-reset"));
   if (Number.isFinite(reset) && reset > 0) {
     return Math.min(Math.max(reset - Date.now(), MIN_BACKOFF_MS), MAX_BACKOFF_MS);
   }
   return 2e3;
+}
+function serverErrorBackoffMs(res, retry) {
+  const retryAfter = retryAfterMs(res);
+  if (retryAfter !== void 0) {
+    return Math.min(retryAfter, MAX_BACKOFF_MS);
+  }
+  return 1e3 * 2 ** retry;
+}
+function isRetryableOnServerError(opts) {
+  const method = (opts.method ?? "GET").toUpperCase();
+  return method === "GET" || method === "POST" && (opts.okStatuses?.includes(409) ?? false);
 }
 var LdClient = class {
   conn;
@@ -71969,7 +71992,11 @@ var LdClient = class {
   }
   async request(opts) {
     let res;
-    for (let attempt = 0; ; attempt++) {
+    let rateLimitRetries = 0;
+    let serverErrorRetries = 0;
+    let attempts = 0;
+    for (; ; ) {
+      attempts += 1;
       res = await fetch(`${this.conn.baseUrl}${opts.path}`, {
         method: opts.method ?? "GET",
         headers: {
@@ -71980,9 +72007,17 @@ var LdClient = class {
         },
         body: opts.body !== void 0 ? JSON.stringify(opts.body) : void 0
       });
-      if (res.status !== 429 || attempt >= RATE_LIMIT_RETRIES)
-        break;
-      await sleep(backoffMs(res));
+      if (res.status === 429 && rateLimitRetries < RATE_LIMIT_RETRIES) {
+        await sleep(backoffMs(res));
+        rateLimitRetries += 1;
+        continue;
+      }
+      if (res.status >= 500 && serverErrorRetries < SERVER_ERROR_RETRIES && isRetryableOnServerError(opts)) {
+        await sleep(serverErrorBackoffMs(res, serverErrorRetries));
+        serverErrorRetries += 1;
+        continue;
+      }
+      break;
     }
     const text = await res.text();
     let data = text;
@@ -71994,7 +72029,12 @@ var LdClient = class {
     }
     const ok = res.ok || (opts.okStatuses?.includes(res.status) ?? false);
     if (!ok) {
-      throw new LdApiError(opts.method ?? "GET", opts.path, res.status, data);
+      const method = opts.method ?? "GET";
+      if (res.status >= 500) {
+        const sent = opts.body === void 0 ? "(none)" : JSON.stringify(opts.body).slice(0, LOGGED_BODY_CHARS);
+        console.warn(`[ld-api] ${method} ${opts.path} \u2192 HTTP ${res.status} after ${attempts} attempt(s). Response: ${text.slice(0, LOGGED_BODY_CHARS) || "(empty)"} Request body: ${sent}`);
+      }
+      throw new LdApiError(method, opts.path, res.status, data, attempts);
     }
     return { status: res.status, ok, data };
   }
@@ -72190,12 +72230,14 @@ var LdApiError = class extends Error {
   path;
   status;
   responseBody;
-  constructor(method, path6, status, responseBody) {
-    super(`LD API ${method} ${path6} failed: HTTP ${status} \u2014 ${JSON.stringify(responseBody)}`);
+  attempts;
+  constructor(method, path6, status, responseBody, attempts = 1) {
+    super(`LD API ${method} ${path6} failed: HTTP ${status}${attempts > 1 ? ` (after ${attempts} attempts)` : ""} \u2014 ${JSON.stringify(responseBody)}`);
     this.method = method;
     this.path = path6;
     this.status = status;
     this.responseBody = responseBody;
+    this.attempts = attempts;
     this.name = "LdApiError";
   }
 };
