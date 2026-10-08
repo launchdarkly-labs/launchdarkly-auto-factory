@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@auto-factory/shared": "*",
+    "@aws-sdk/client-s3": "^3.1147.0",
     "express": "^4.19.2",
     "yaml": "^2.5.0"
   },

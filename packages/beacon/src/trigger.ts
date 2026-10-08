@@ -689,6 +689,17 @@ export async function triggerRelease(
       note: `releaseIntent asks for segment serving [${intent.segments.join(", ")}] — not yet auto-executable${intentContext ? ` (${intentContext})` : ""}`,
     };
   }
+  if (intent.releaseWith && intent.releaseWith.length > 0) {
+    // Coordinated multi-flag releases are recorded but not yet executable
+    // (ADR 0009: "`segments`/`releaseWith` → held and recorded" — LD-native
+    // multi-phase releases will own this). Same fail-closed shape as segments:
+    // releasing just one leg of a stated pair is a guess about the rest.
+    return {
+      flagKey: flag.flagKey,
+      method: "held",
+      note: `releaseIntent asks for a coordinated release with [${intent.releaseWith.join(", ")}] — not yet auto-executable${intentContext ? ` (${intentContext})` : ""}`,
+    };
+  }
 
   const { data } = await ld.getFlag<FlagVariations>(flag.flagKey, `?env=${encodeURIComponent(environmentKey)}`);
   const variations = data.variations ?? [];
@@ -862,6 +873,40 @@ export async function triggerRelease(
   // and turn this flag ON serving treatment. It then releases exactly when its
   // parents do; no automated release is started.
   if (intent.prerequisites && intent.prerequisites.length > 0) {
+    // ARMED ON-BEHIND-PARENT ONLY WHILE THE PREREQUISITE IS UNMET (ADR 0013:
+    // "the prerequisite attaches but the child stays dark for its own release
+    // — arming there would put it live the moment its code deploys"). A parent
+    // that ALREADY serves the pinned variation therefore gets the ADR's letter
+    // outcome: the prerequisite still attaches (one `addPrerequisite` per
+    // parent, nothing else in the patch — no `turnFlagOn`, no fallthrough
+    // move), the flag stays DARK for its own release, and the manifest is
+    // HELD: its release half is moot until the parents move past the pin.
+    // Covers ANY pin, not just "on": a satisfied "off" pin arms the same way.
+    // The comparison is the same resolution `parentPinVariation` makes at wire
+    // time (what the parent serves now vs what the pin would serve when live).
+    let satisfiedPin: { flagKey: string; value: unknown } | null = null;
+    for (const p of intent.prerequisites) {
+      const want = p.variation ?? "on";
+      let parentData: FlagVariations;
+      try {
+        parentData = (await ld.getFlag<FlagVariations>(p.flagKey, `?env=${encodeURIComponent(environmentKey)}`)).data;
+      } catch {
+        parentData = undefined as unknown as FlagVariations;
+      }
+      if (parentData === undefined) {
+        return {
+          flagKey: flag.flagKey,
+          method: "held",
+          note: `releaseIntent prerequisite '${p.flagKey}' could not be read — held (fail-closed)${intentContext ? ` (${intentContext})` : ""}`,
+        };
+      }
+      const pinned = parentPinVariation(parentData, environmentKey, want);
+      const servedNow = servedVariation(parentData.variations ?? [], parentData.environments?.[environmentKey]);
+      if (pinned && servedNow && pinned._id === servedNow._id) {
+        satisfiedPin = { flagKey: p.flagKey, value: servedNow.value };
+        break;
+      }
+    }
     const instructions: Array<Record<string, unknown>> = [];
     for (const p of intent.prerequisites) {
       let parent: { data: FlagVariations };
@@ -883,6 +928,24 @@ export async function triggerRelease(
         };
       }
       instructions.push({ kind: "addPrerequisite", key: p.flagKey, variationId: parentVar._id });
+    }
+    if (satisfiedPin !== null) {
+      // ADR 0013's letter, satisfied: ATTACH the prerequisite, arm nothing.
+      // The wiring decision on a met prerequisite stays with the manifest's
+      // own release — send the prerequisite patch alone and hold the release
+      // half; the ledger re-checks it on every later deploy (idempotent:
+      // the prerequisite patch repeats the same addPrerequisite value).
+      await ld.patchFlagSemantic(
+        flag.flagKey,
+        environmentKey,
+        instructions,
+        "auto-factory: attach prerequisite only (parent already serves the pinned variation)",
+      );
+      return {
+        flagKey: flag.flagKey,
+        method: "held",
+        note: `releaseIntent prerequisite '${satisfiedPin.flagKey}' already serves '${String(satisfiedPin.value)}' — the prerequisite ATTACHES and the flag stays DARK for its own release (ADR 0013: arming behind a met prerequisite takes it live instantly)${intentContext ? ` (${intentContext})` : ""}`,
+      };
     }
     instructions.push({ kind: "turnFlagOn" }, { kind: "updateFallthroughVariationOrRollout", variationId: targetVar._id });
     // CLASSIFIED LIKE THE RELEASE-START PATCH, and it was the known gap the previous round
