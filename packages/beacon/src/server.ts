@@ -42,7 +42,7 @@ import { repointDependentPrerequisites } from "./repoint.js";
 import { FilePendingStore, recordOutcome, type PendingEntry, type PendingStore } from "./pending.js";
 import { parseRailwayWebhook } from "./railway.js";
 import { decideScope } from "./scope.js";
-import { FileDeployStateStore, resolvePreviousSha, type DeployStateStore } from "./state.js";
+import { FileDeployStateStore, deployStateStore, resolvePreviousSha, type DeployStateStore } from "./state.js";
 import { triggerRelease, type TriggerResult } from "./trigger.js";
 
 interface FlagOutcome {
@@ -276,7 +276,16 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
         ` (previousSha=${previousSha ?? "none"} from ${previousShaSource})` +
         (discovered.length ? ` → ${discovered.map((f) => f.flagKey).join(", ")}` : ""),
     );
-    store.record(n.service, n.environment, n.sha);
+    // The record IS the durable-history ack: only AFTER the store's own write
+    // has landed does the response below acknowledge the SHA. A record that
+    // could not reach the backend leaves the SHA unrecorded and answers the
+    // async-throw class (R-B-4's 500), never a green ack over lost history.
+    try {
+      await store.record(n.service, n.environment, n.sha);
+    } catch (e) {
+      console.warn(`[beacon] deploy-state record failed for ${n.service}@${n.sha}: ${String(e)}`);
+      return { status: 500, body: { error: "deploy-state record failed", detail: String(e) } };
+    }
 
     const outcomes: FlagOutcome[] = [];
     // Set ONLY when the idempotency check could not be verified: the one case where we
@@ -1128,10 +1137,14 @@ export function createApp(cfg: BeaconConfig, ld: LdClient, deps: BeaconDeps = {}
 }
 
 /** Entry point when run directly (e.g. in a container). */
-function main(): void {
+async function main(): Promise<void> {
   const cfg = loadBeaconConfig();
   const ld = new LdClient(targetConnection());
-  const app = createApp(cfg, ld);
+  // The store's boot load is async (S3 boot reads every deploy-state object
+  // and REFUSES to start on an unreadable one), so it happens before createApp
+  // serves any webhook — the same fail-at-boot discipline the file store's
+  // constructor follows synchronously.
+  const app = createApp(cfg, ld, { store: await deployStateStore(cfg.stateFile) });
   const port = Number(process.env.PORT) || 8080;
   app.listen(port, () => console.log(`Beacon listening on :${port}`));
 }
