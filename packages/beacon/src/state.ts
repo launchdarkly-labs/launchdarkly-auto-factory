@@ -276,7 +276,11 @@ export class S3DeployStateStore extends MemoryDeployStateStore {
             Key: objKey,
             Body: JSON.stringify(next, null, 2),
             ContentType: "application/json",
-            ...(etag ? { IfMatch: etag } : {}),
+            // The CAS: an existing object is conditioned on its ETag; a NIL
+            // object conditions on `IfNoneMatch: "*"` (S3's atomic-existence
+            // check) — two first-writers then replay into a merge instead of
+            // one of them silently winning the object.
+            ...(etag ? { IfMatch: etag } : { IfNoneMatch: "*" }),
           }),
         );
         this.states.set(k, next);
