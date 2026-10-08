@@ -689,6 +689,17 @@ export async function triggerRelease(
       note: `releaseIntent asks for segment serving [${intent.segments.join(", ")}] — not yet auto-executable${intentContext ? ` (${intentContext})` : ""}`,
     };
   }
+  if (intent.releaseWith && intent.releaseWith.length > 0) {
+    // Coordinated multi-flag releases are recorded but not yet executable
+    // (ADR 0009: "`segments`/`releaseWith` → held and recorded" — LD-native
+    // multi-phase releases will own this). Same fail-closed shape as segments:
+    // releasing just one leg of a stated pair is a guess about the rest.
+    return {
+      flagKey: flag.flagKey,
+      method: "held",
+      note: `releaseIntent asks for a coordinated release with [${intent.releaseWith.join(", ")}] — not yet auto-executable${intentContext ? ` (${intentContext})` : ""}`,
+    };
+  }
 
   const { data } = await ld.getFlag<FlagVariations>(flag.flagKey, `?env=${encodeURIComponent(environmentKey)}`);
   const variations = data.variations ?? [];
@@ -862,6 +873,41 @@ export async function triggerRelease(
   // and turn this flag ON serving treatment. It then releases exactly when its
   // parents do; no automated release is started.
   if (intent.prerequisites && intent.prerequisites.length > 0) {
+    // ARMED ON-BEHIND-PARENT ONLY WHILE THE PREREQUISITE IS UNMET (ADR 0013:
+    // "the child stays dark for its own release — arming there would put it
+    // live the moment its code deploys"). A parent that ALREADY serves the
+    // pinned variation would make the turnFlagOn + fallthrough below take
+    // 100% of traffic instantly, with no rollout and no monitoring, so
+    // nothing is written and the wiring decision is HELD for a human: the
+    // prerequisite still attaches on the child's own later release, which the
+    // ledger re-checks. The pin that counts is what the parent SERVES now,
+    // compared against what the pin would serve when live — the same
+    // resolution `parentPinVariation` makes at wire time.
+    for (const p of intent.prerequisites) {
+      if ((p.variation ?? "on") !== "on") continue;
+      let parentData: FlagVariations;
+      try {
+        parentData = (await ld.getFlag<FlagVariations>(p.flagKey, `?env=${encodeURIComponent(environmentKey)}`)).data;
+      } catch {
+        parentData = undefined as unknown as FlagVariations;
+      }
+      if (parentData === undefined) {
+        return {
+          flagKey: flag.flagKey,
+          method: "held",
+          note: `releaseIntent prerequisite '${p.flagKey}' could not be read — held (fail-closed)${intentContext ? ` (${intentContext})` : ""}`,
+        };
+      }
+      const pinned = parentPinVariation(parentData, environmentKey, "on");
+      const servedNow = servedVariation(parentData.variations ?? [], parentData.environments?.[environmentKey]);
+      if (pinned && servedNow && pinned._id === servedNow._id) {
+        return {
+          flagKey: flag.flagKey,
+          method: "held",
+          note: `releaseIntent prerequisite '${p.flagKey}' already serves '${String(servedNow.value)}' — the flag stays DARK for its own release (ADR 0013: arming behind a met prerequisite takes it live instantly); satisfied-prerequisite wiring is held${intentContext ? ` (${intentContext})` : ""}`,
+        };
+      }
+    }
     const instructions: Array<Record<string, unknown>> = [];
     for (const p of intent.prerequisites) {
       let parent: { data: FlagVariations };
