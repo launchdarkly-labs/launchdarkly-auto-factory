@@ -66,3 +66,4 @@ PLAN-structured-intent.md
 
 # Design plans in progress (local-only until they graduate to ADRs)
 docs/plans/
+infra/beacon-state/.terraform/
